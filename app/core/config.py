@@ -18,7 +18,11 @@ class Settings(BaseSettings):
     embedding_model: str = "mock-embed"
     ai_api_key: str | None = None
 
-    upload_dir: str = "./storage/uploads"
+    s3_endpoint_url: str = "http://s3.applyforge-seaweedfs-ff59a1-191-101-80-174.traefik.me"
+    s3_access_key: str = "admin"
+    s3_secret_key: str = "xnwbtw0csn7ob4pa"
+    s3_bucket: str = "applyforge-uploads"
+    s3_region: str = "us-east-1"
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
