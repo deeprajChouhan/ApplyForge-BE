@@ -1,5 +1,8 @@
+from fastapi import HTTPException
 from sqlalchemy.orm import Session
+
 from app.models.models import ApplicationChat, ApplicationChatMessage
+from app.services.ai.exceptions import AIProviderError
 from app.services.ai.factory import get_llm_provider
 from app.services.rag.service import RAGService
 
@@ -23,7 +26,10 @@ class ChatService:
         chat = self._get_chat(application_id)
         self.db.add(ApplicationChatMessage(chat_id=chat.id, sender_role="user", content=content))
         evidence = "\n".join(c.content for c, _ in RAGService(self.db, self.user_id).search(content, top_k=4))
-        reply = self.llm.generate("Answer grounded only.", f"Q:{content}\nEvidence:{evidence}")
+        try:
+            reply = self.llm.generate("Answer grounded only.", f"Q:{content}\nEvidence:{evidence}")
+        except AIProviderError as exc:
+            raise HTTPException(status_code=503, detail="Chat provider is temporarily unavailable") from exc
         self.db.add(ApplicationChatMessage(chat_id=chat.id, sender_role="assistant", content=reply))
         self.db.commit()
 
