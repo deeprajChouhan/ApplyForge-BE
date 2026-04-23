@@ -2,10 +2,16 @@ from logging.config import fileConfig
 from sqlalchemy import engine_from_config, pool
 from alembic import context
 
+from app.core.config import settings
 from app.db.base import Base
 import app.models.models  # noqa
 
 config = context.config
+
+db_url = str(settings.database_url)
+if db_url.startswith("mysql://"):
+    db_url = db_url.replace("mysql://", "mysql+pymysql://")
+config.set_main_option("sqlalchemy.url", db_url.replace("%", "%%"))
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 

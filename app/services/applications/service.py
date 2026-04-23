@@ -1,4 +1,5 @@
 import json
+from typing import List
 from sqlalchemy.orm import Session
 from fastapi import HTTPException
 
@@ -69,7 +70,7 @@ class ApplicationService:
         self.db.commit()
         return result
 
-    def generate_docs(self, app_id: int, doc_types: list) -> list[GeneratedDocument]:
+    def generate_docs(self, app_id: int, doc_types: List) -> List[GeneratedDocument]:
         app = self.get(app_id)
         rag = RAGService(self.db, self.user_id)
         evidence = "\n".join(c.content for c, _ in rag.search(app.job_description, top_k=6))
