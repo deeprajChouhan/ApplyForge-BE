@@ -1,5 +1,33 @@
-from datetime import date
-from pydantic import BaseModel
+from datetime import date, datetime
+import re
+from pydantic import BaseModel, field_validator
+
+
+def parse_flexible_date(v: any) -> date | None:
+    if not v:
+        return None
+    if isinstance(v, date):
+        if isinstance(v, datetime):
+            return v.date()
+        return v
+    if isinstance(v, str):
+        v_lower = v.strip().lower()
+        if v_lower in ("present", "now", "current", ""):
+            return None
+        
+        v_clean = re.sub(r'(\d+)(st|nd|rd|th)', r'\1', v.strip())
+        formats = [
+            "%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", 
+            "%B %d %Y", "%b %d %Y", "%B %Y", "%b %Y", "%Y"
+        ]
+        for fmt in formats:
+            try:
+                return datetime.strptime(v_clean, fmt).date()
+            except ValueError:
+                pass
+        # Fallback to None if unparseable
+        return None
+    return v
 
 
 class UserProfileUpsert(BaseModel):
@@ -22,6 +50,11 @@ class ExperienceIn(BaseModel):
     start_date: date | None = None
     end_date: date | None = None
 
+    @field_validator('start_date', 'end_date', mode='before')
+    @classmethod
+    def parse_date_fields(cls, v):
+        return parse_flexible_date(v)
+
 
 class ExperienceOut(ExperienceIn):
     id: int
@@ -35,6 +68,11 @@ class EducationIn(BaseModel):
     field_of_study: str | None = None
     start_date: date | None = None
     end_date: date | None = None
+
+    @field_validator('start_date', 'end_date', mode='before')
+    @classmethod
+    def parse_date_fields(cls, v):
+        return parse_flexible_date(v)
 
 
 class EducationOut(EducationIn):
@@ -70,6 +108,11 @@ class CertificationIn(BaseModel):
     name: str
     issuer: str | None = None
     issue_date: date | None = None
+
+    @field_validator('issue_date', mode='before')
+    @classmethod
+    def parse_date_fields(cls, v):
+        return parse_flexible_date(v)
 
 
 class CertificationOut(CertificationIn):
