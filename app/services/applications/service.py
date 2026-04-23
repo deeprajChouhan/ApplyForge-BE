@@ -5,6 +5,7 @@ from fastapi import HTTPException
 
 from app.models.models import ApplicationStatusHistory, GeneratedDocument, JobApplication
 from app.models.enums import ApplicationStatus
+from app.services.ai.exceptions import AIProviderError
 from app.services.ai.factory import get_llm_provider
 from app.services.rag.service import RAGService
 
@@ -78,7 +79,10 @@ class ApplicationService:
         for dt in doc_types:
             prior = self.db.query(GeneratedDocument).filter_by(application_id=app.id, doc_type=dt).count()
             prompt = f"Generate {dt.value} using ONLY evidence:\n{evidence}\nJD:\n{app.job_description}"
-            text = self.llm.generate("Truthful generation only", prompt)
+            try:
+                text = self.llm.generate("Truthful generation only", prompt)
+            except AIProviderError as exc:
+                raise HTTPException(status_code=503, detail="Document generation provider is unavailable") from exc
             row = GeneratedDocument(
                 user_id=self.user_id,
                 application_id=app.id,

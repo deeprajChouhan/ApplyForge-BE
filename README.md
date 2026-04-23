@@ -53,3 +53,9 @@ pytest
 
 ## Frontend API contract
 - See `backend/API_CONTRACT.md` for a full endpoint-by-endpoint request/response reference.
+
+## AI provider runtime configuration
+- Runtime defaults use OpenAI providers (`LLM_PROVIDER=openai`, `EMBEDDING_PROVIDER=openai`).
+- Mock providers are now gated and only available when `AI_ALLOW_MOCK_PROVIDERS=true` (intended for tests/local development).
+- Required runtime env: `AI_API_KEY`, plus optional reliability controls: `AI_REQUEST_TIMEOUT_SECONDS`, `AI_MAX_RETRIES`, `AI_RETRY_BACKOFF_SECONDS`.
+- Misconfiguration now fails fast during provider construction instead of silently falling back to mocks.
