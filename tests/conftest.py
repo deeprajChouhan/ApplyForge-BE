@@ -1,5 +1,9 @@
 import os
+
 os.environ["DATABASE_URL"] = "sqlite:///./test.db"
+os.environ["LLM_PROVIDER"] = "mock"
+os.environ["EMBEDDING_PROVIDER"] = "mock"
+os.environ["AI_ALLOW_MOCK_PROVIDERS"] = "true"
 
 import pytest
 from fastapi.testclient import TestClient
@@ -9,6 +13,7 @@ from sqlalchemy.orm import sessionmaker
 from app.db.base import Base
 from app.db.session import get_db
 from app.main import app
+from app.services.ai.factory import get_embedding_provider, get_llm_provider
 
 SQLALCHEMY_DATABASE_URL = "sqlite:///./test.db"
 engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
@@ -19,6 +24,8 @@ TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engin
 def setup_db():
     Base.metadata.drop_all(bind=engine)
     Base.metadata.create_all(bind=engine)
+    get_llm_provider.cache_clear()
+    get_embedding_provider.cache_clear()
     yield
 
 

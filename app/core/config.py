@@ -1,3 +1,4 @@
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -12,11 +13,16 @@ class Settings(BaseSettings):
     database_url: str = "mysql+pymysql://AF-tst-admin:Password@123@applyforge-applyforgedb-y53jkg:3306/AF-tst-db"
     cors_origins: str = "http://localhost:3000"
 
-    llm_provider: str = "mock"
-    llm_model: str = "mock-llm"
-    embedding_provider: str = "mock"
-    embedding_model: str = "mock-embed"
-    ai_api_key: str | None = None
+    llm_provider: str = "openai"
+    llm_model: str = "gpt-4o-mini"
+    embedding_provider: str = "openai"
+    embedding_model: str = "text-embedding-3-small"
+    ai_api_key: SecretStr | None = None
+    openai_base_url: str | None = None
+    ai_request_timeout_seconds: float = 30.0
+    ai_max_retries: int = 2
+    ai_retry_backoff_seconds: float = 0.5
+    ai_allow_mock_providers: bool = False
 
     s3_endpoint_url: str = "http://s3.applyforge-seaweedfs-ff59a1-191-101-80-174.traefik.me"
     s3_access_key: str = "admin"
@@ -29,6 +35,10 @@ class Settings(BaseSettings):
     @property
     def cors_origin_list(self) -> list[str]:
         return [c.strip() for c in self.cors_origins.split(",") if c.strip()]
+
+    @property
+    def ai_api_key_value(self) -> str:
+        return self.ai_api_key.get_secret_value() if self.ai_api_key else ""
 
 
 settings = Settings()
