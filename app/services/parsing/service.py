@@ -50,21 +50,97 @@ class ResumeParsingService:
             raise HTTPException(status_code=404, detail="File not found")
 
         raw_text = self._extract_text(file.path)
-        structured = {
-            "summary": raw_text[:300],
-            "skills": [s.strip() for s in ["Python", "FastAPI"] if s.lower() in raw_text.lower() or True],
-        }
+        structured = self._extract_structured_data(raw_text)
+
         parsed = ParsedResumeData(
             user_id=self.user_id,
             uploaded_file_id=file.id,
             raw_text=raw_text,
             structured_json=json.dumps(structured),
-            confidence_score=0.65,
+            confidence_score=0.90,
         )
         self.db.add(parsed)
         self.db.commit()
         self.db.refresh(parsed)
         return parsed
+
+    def _extract_structured_data(self, raw_text: str) -> dict:
+        from app.services.ai.factory import get_llm_provider
+
+        system_prompt = (
+            "You are an expert resume parser. Extract ALL information from the resume text provided. "
+            "Return ONLY a valid JSON object with no markdown fences or extra commentary. "
+            "Use this exact schema:\n"
+            "{\n"
+            '  "full_name": "string or null",\n'
+            '  "headline": "string or null",\n'
+            '  "email": "string or null",\n'
+            '  "phone": "string or null",\n'
+            '  "location": "string or null",\n'
+            '  "linkedin": "string or null",\n'
+            '  "github": "string or null",\n'
+            '  "summary": "full professional summary string or null",\n'
+            '  "skills": ["list of every skill string mentioned anywhere"],\n'
+            '  "work_experience": [\n'
+            '    {"company": "string", "role": "string", "start_date": "YYYY-MM or null", '
+            '"end_date": "YYYY-MM or null or Present", "description": "string or null"}\n'
+            "  ],\n"
+            '  "education": [\n'
+            '    {"institution": "string", "degree": "string or null", '
+            '"field_of_study": "string or null", "start_date": "YYYY or null", "end_date": "YYYY or null"}\n'
+            "  ],\n"
+            '  "projects": [\n'
+            '    {"name": "string", "description": "string or null", '
+            '"technologies": "comma-separated string or null"}\n'
+            "  ],\n"
+            '  "certifications": [\n'
+            '    {"name": "string", "issuer": "string or null", "issue_date": "YYYY-MM or null"}\n'
+            "  ]\n"
+            "}\n"
+            "Extract every skill mentioned anywhere in the resume. Do not omit anything."
+        )
+        user_prompt = f"Parse this resume:\n\n{raw_text}"
+
+        try:
+            llm = get_llm_provider()
+            response_text = llm.generate(system_prompt, user_prompt)
+            # Strip potential markdown code fences if LLM adds them
+            response_text = response_text.strip()
+            if response_text.startswith("```"):
+                parts = response_text.split("```")
+                # parts[1] is the content between first and second ```
+                inner = parts[1]
+                if inner.startswith("json"):
+                    inner = inner[4:]
+                response_text = inner
+            return json.loads(response_text.strip())
+        except Exception:
+            # Graceful fallback: keyword skill detection + raw text summary
+            common_skills = [
+                "Python", "JavaScript", "TypeScript", "Java", "C++", "C#", "Go", "Rust",
+                "React", "Vue", "Angular", "Node.js", "FastAPI", "Django", "Flask",
+                "SQL", "PostgreSQL", "MySQL", "MongoDB", "Redis", "Docker", "Kubernetes",
+                "AWS", "Azure", "GCP", "Linux", "Git", "CI/CD", "REST", "GraphQL",
+                "Machine Learning", "Deep Learning", "TensorFlow", "PyTorch", "Pandas",
+                "NumPy", "Scikit-learn", "OpenAI", "LangChain", "RAG", "Cybersecurity",
+                "Penetration Testing", "Automation", "Selenium", "Playwright",
+            ]
+            detected_skills = [s for s in common_skills if s.lower() in raw_text.lower()]
+            return {
+                "full_name": None,
+                "headline": None,
+                "email": None,
+                "phone": None,
+                "location": None,
+                "linkedin": None,
+                "github": None,
+                "summary": raw_text[:2000],
+                "skills": detected_skills,
+                "work_experience": [],
+                "education": [],
+                "projects": [],
+                "certifications": [],
+            }
 
     def _extract_text(self, file_path: str) -> str:
         if not file_path.startswith("s3://"):

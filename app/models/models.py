@@ -135,6 +135,7 @@ class JobApplication(Base, TimestampMixin):
     company_name: Mapped[str] = mapped_column(String(255), index=True)
     role_title: Mapped[str] = mapped_column(String(255), index=True)
     job_description: Mapped[str] = mapped_column(Text)
+    jd_link: Mapped[str | None] = mapped_column(String(1000))
     status: Mapped[ApplicationStatus] = mapped_column(Enum(ApplicationStatus), index=True, default=ApplicationStatus.draft)
     jd_analysis_json: Mapped[str | None] = mapped_column(Text)
 

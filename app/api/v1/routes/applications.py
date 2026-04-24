@@ -10,6 +10,8 @@ from app.schemas.application import (
     ApplicationOut,
     ApplicationUpdate,
     GenerateRequest,
+    GenerateResponse,
+    GeneratedDocumentOut,
     JDAnalyzeRequest,
     StatusChangeRequest,
 )
@@ -47,6 +49,12 @@ def update(app_id: int, payload: ApplicationUpdate, user: User = Depends(get_cur
     return ApplicationService(db, user.id).update(app_id, payload.model_dump())
 
 
+@router.delete("/{app_id}", status_code=204)
+def delete_application(app_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Permanently delete an application and all related DB data (documents, chat messages)."""
+    ApplicationService(db, user.id).delete(app_id)
+
+
 @router.post("/{app_id}/status", response_model=ApplicationOut)
 def change_status(app_id: int, payload: StatusChangeRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     return ApplicationService(db, user.id).change_status(app_id, payload.status, payload.note)
@@ -57,6 +65,31 @@ def analyze_jd(app_id: int, payload: JDAnalyzeRequest, user: User = Depends(get_
     return ApplicationService(db, user.id).analyze_jd(app_id, payload.job_description)
 
 
-@router.post("/{app_id}/generate")
+@router.post("/{app_id}/generate", response_model=GenerateResponse)
 def generate(app_id: int, payload: GenerateRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    return ApplicationService(db, user.id).generate_docs(app_id, payload.doc_types)
+    docs = ApplicationService(db, user.id).generate_docs(app_id, payload.doc_types)
+    return GenerateResponse(
+        status="completed",
+        documents=[GeneratedDocumentOut.model_validate(doc) for doc in docs],
+    )
+
+
+@router.get("/{app_id}/documents/current")
+def get_current_documents(app_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    from app.models.models import GeneratedDocument
+    from app.models.enums import DocumentType
+    # Verify the app belongs to the user
+    ApplicationService(db, user.id).get(app_id)
+    result = {}
+    for dt in DocumentType:
+        doc = (
+            db.query(GeneratedDocument)
+            .filter_by(application_id=app_id, doc_type=dt)
+            .order_by(GeneratedDocument.version.desc())
+            .first()
+        )
+        if doc:
+            result[dt.value] = GeneratedDocumentOut.model_validate(doc).model_dump()
+        else:
+            result[dt.value] = None
+    return result
