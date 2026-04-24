@@ -2,8 +2,9 @@ import json
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user
+from app.api.deps import get_current_user, require_feature
 from app.db.session import get_db
+from app.models.enums import FeatureFlag
 from app.models.models import User
 from app.schemas.profile import (
     CertificationIn,
@@ -20,6 +21,7 @@ from app.services.profile.service import PROFILE_MODELS, ProfileService, delete_
 from app.services.rag.service import RAGService
 
 router = APIRouter(prefix="/profile", tags=["profile"])
+_need_resume = Depends(require_feature(FeatureFlag.resume))
 
 
 @router.get("", response_model=UserProfileOut)
@@ -80,7 +82,7 @@ def delete_section(section: str, item_id: int, user: User = Depends(get_current_
     return {"message": "deleted"}
 
 
-@router.get("/resume/history")
+@router.get("/resume/history", dependencies=[_need_resume])
 def resume_history(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     from app.models.models import ParsedResumeData, UploadedFile
     rows = (
@@ -103,19 +105,19 @@ def resume_history(user: User = Depends(get_current_user), db: Session = Depends
     ]
 
 
-@router.post("/resume/upload")
+@router.post("/resume/upload", dependencies=[_need_resume])
 async def upload_resume(file: UploadFile = File(...), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     row = await ResumeParsingService(db, user.id).save_upload(file)
     return {"file_id": row.id, "filename": row.filename}
 
 
-@router.post("/resume/{file_id}/parse", response_model=ResumeParseResponse)
+@router.post("/resume/{file_id}/parse", response_model=ResumeParseResponse, dependencies=[_need_resume])
 def parse_resume(file_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     parsed = ResumeParsingService(db, user.id).parse_resume(file_id)
     return ResumeParseResponse(parse_id=parsed.id, confidence_score=parsed.confidence_score, structured_data=json.loads(parsed.structured_json))
 
 
-@router.post("/knowledge/rebuild")
+@router.post("/knowledge/rebuild", dependencies=[_need_resume])
 def rebuild_knowledge(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     count = RAGService(db, user.id).rebuild_index()
     return {"chunks_indexed": count}
