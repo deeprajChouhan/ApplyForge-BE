@@ -80,6 +80,29 @@ def delete_section(section: str, item_id: int, user: User = Depends(get_current_
     return {"message": "deleted"}
 
 
+@router.get("/resume/history")
+def resume_history(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    from app.models.models import ParsedResumeData, UploadedFile
+    rows = (
+        db.query(ParsedResumeData, UploadedFile.filename)
+        .join(UploadedFile, ParsedResumeData.uploaded_file_id == UploadedFile.id, isouter=True)
+        .filter(ParsedResumeData.user_id == user.id)
+        .order_by(ParsedResumeData.created_at.desc())
+        .limit(10)
+        .all()
+    )
+    return [
+        {
+            "parse_id": row.id,
+            "filename": filename,
+            "confidence_score": row.confidence_score,
+            "parsed_at": row.created_at.isoformat(),
+            "structured_data": json.loads(row.structured_json),
+        }
+        for row, filename in rows
+    ]
+
+
 @router.post("/resume/upload")
 async def upload_resume(file: UploadFile = File(...), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     row = await ResumeParsingService(db, user.id).save_upload(file)

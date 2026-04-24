@@ -7,12 +7,14 @@ class ApplicationCreate(BaseModel):
     company_name: str
     role_title: str
     job_description: str
+    jd_link: str | None = None
 
 
 class ApplicationUpdate(BaseModel):
     company_name: str | None = None
     role_title: str | None = None
     job_description: str | None = None
+    jd_link: str | None = None
 
 
 class ApplicationOut(BaseModel):
@@ -20,6 +22,7 @@ class ApplicationOut(BaseModel):
     company_name: str
     role_title: str
     job_description: str
+    jd_link: str | None = None
     status: ApplicationStatus
     jd_analysis_json: str | None = None
     created_at: datetime
@@ -56,5 +59,11 @@ class GeneratedDocumentOut(BaseModel):
     version: int
     content: str
     format: str
+    is_current: bool = True  # all newly generated docs are current
 
     model_config = {"from_attributes": True}
+
+
+class GenerateResponse(BaseModel):
+    status: str
+    documents: list[GeneratedDocumentOut]
