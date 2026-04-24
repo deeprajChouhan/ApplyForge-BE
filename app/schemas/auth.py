@@ -1,4 +1,7 @@
+from typing import List
 from pydantic import BaseModel, EmailStr, Field
+
+from app.models.enums import FeatureFlag, PlanTier, SubscriptionStatus, UserRole
 
 
 class RegisterRequest(BaseModel):
@@ -24,5 +27,11 @@ class RefreshRequest(BaseModel):
 class UserMe(BaseModel):
     id: int
     email: EmailStr
+    role: UserRole
+    plan: PlanTier
+    subscription_status: SubscriptionStatus
+    token_budget_monthly: int
+    features: List[str] = []  # list of enabled FeatureFlag values
 
     model_config = {"from_attributes": True}
+

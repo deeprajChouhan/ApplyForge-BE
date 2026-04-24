@@ -23,3 +23,36 @@ class DocumentType(str, enum.Enum):
 class FileType(str, enum.Enum):
     resume = "resume"
     other = "other"
+
+
+class UserRole(str, enum.Enum):
+    admin = "admin"
+    user = "user"
+
+
+class PlanTier(str, enum.Enum):
+    free = "free"
+    pro = "pro"
+    enterprise = "enterprise"
+
+
+class SubscriptionStatus(str, enum.Enum):
+    active = "active"
+    trialing = "trialing"
+    cancelled = "cancelled"
+    past_due = "past_due"
+
+
+class FeatureFlag(str, enum.Enum):
+    """
+    Granular feature flags for per-user SaaS access control.
+
+    free tier gets: jd_analyze only (analyze JD + generate docs, no DB save)
+    pro/enterprise get: all features
+    admin can grant/revoke any feature on any user individually.
+    """
+    jd_analyze = "jd_analyze"          # Analyze JD + generate documents (free tier - ephemeral)
+    applications = "applications"       # Save & manage job applications list
+    kanban = "kanban"                   # Kanban board view
+    resume = "resume"                   # Resume upload, parsing, and knowledge base
+    chat = "chat"                       # AI chat assistant per application

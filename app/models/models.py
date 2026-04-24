@@ -3,7 +3,21 @@ from sqlalchemy import Boolean, Date, DateTime, Enum, Float, ForeignKey, Index, 
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
-from app.models.enums import ApplicationStatus, DocumentType, FileType
+from app.models.enums import ApplicationStatus, DocumentType, FeatureFlag, FileType, PlanTier, SubscriptionStatus, UserRole
+
+# Default monthly token budgets per plan tier
+PLAN_TOKEN_BUDGETS: dict[str, int] = {
+    PlanTier.free: 50_000,
+    PlanTier.pro: 500_000,
+    PlanTier.enterprise: 5_000_000,
+}
+
+# Features automatically granted per plan on registration
+PLAN_DEFAULT_FEATURES: dict[str, list] = {
+    PlanTier.free: [FeatureFlag.jd_analyze],
+    PlanTier.pro: [FeatureFlag.jd_analyze, FeatureFlag.applications, FeatureFlag.kanban, FeatureFlag.resume, FeatureFlag.chat],
+    PlanTier.enterprise: [FeatureFlag.jd_analyze, FeatureFlag.applications, FeatureFlag.kanban, FeatureFlag.resume, FeatureFlag.chat],
+}
 
 
 class TimestampMixin:
@@ -17,6 +31,11 @@ class User(Base, TimestampMixin):
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     password_hash: Mapped[str] = mapped_column(String(255))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    role: Mapped[UserRole] = mapped_column(Enum(UserRole), default=UserRole.user, index=True)
+    plan: Mapped[PlanTier] = mapped_column(Enum(PlanTier), default=PlanTier.free, index=True)
+    subscription_status: Mapped[SubscriptionStatus] = mapped_column(Enum(SubscriptionStatus), default=SubscriptionStatus.active)
+    token_budget_monthly: Mapped[int] = mapped_column(Integer, default=PLAN_TOKEN_BUDGETS[PlanTier.free])
+
 
 
 class RefreshToken(Base, TimestampMixin):
@@ -173,3 +192,41 @@ class ApplicationStatusHistory(Base, TimestampMixin):
     old_status: Mapped[ApplicationStatus | None] = mapped_column(Enum(ApplicationStatus))
     new_status: Mapped[ApplicationStatus] = mapped_column(Enum(ApplicationStatus), index=True)
     note: Mapped[str | None] = mapped_column(String(500))
+
+
+# ── SaaS Feature / Usage Tables ────────────────────────────────────────────
+
+class UserFeature(Base, TimestampMixin):
+    """Per-user feature flag override. Admin can grant or revoke individual features."""
+    __tablename__ = "user_features"
+    __table_args__ = (UniqueConstraint("user_id", "feature", name="uq_user_feature"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    feature: Mapped[FeatureFlag] = mapped_column(Enum(FeatureFlag), index=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class UsageLedger(Base):
+    """Aggregated monthly token usage per user. Updated on every AI call."""
+    __tablename__ = "usage_ledger"
+    __table_args__ = (UniqueConstraint("user_id", "month_year", name="uq_ledger_user_month"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    month_year: Mapped[str] = mapped_column(String(7), index=True)  # e.g. "2026-04"
+    tokens_used: Mapped[int] = mapped_column(Integer, default=0)
+    api_calls: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class UsageEvent(Base):
+    """Granular per-API-call token usage log. Used for admin analytics and billing."""
+    __tablename__ = "usage_events"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    feature: Mapped[FeatureFlag | None] = mapped_column(Enum(FeatureFlag), nullable=True, index=True)
+    endpoint: Mapped[str] = mapped_column(String(100))
+    tokens_in: Mapped[int] = mapped_column(Integer, default=0)
+    tokens_out: Mapped[int] = mapped_column(Integer, default=0)
+    model: Mapped[str] = mapped_column(String(100))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+

@@ -5,7 +5,8 @@ from fastapi import HTTPException
 
 from app.core.config import settings
 from app.core.security import create_token, hash_password, verify_password
-from app.models.models import RefreshToken, User
+from app.models.enums import FeatureFlag, PlanTier, UserRole
+from app.models.models import PLAN_DEFAULT_FEATURES, PLAN_TOKEN_BUDGETS, RefreshToken, User, UserFeature
 
 
 class AuthService:
@@ -15,8 +16,28 @@ class AuthService:
     def register(self, email: str, password: str) -> User:
         if self.db.query(User).filter_by(email=email).first():
             raise HTTPException(status_code=400, detail="Email already registered")
-        user = User(email=email, password_hash=hash_password(password))
+
+        # Determine role and plan
+        is_admin = email.lower() == settings.admin_email.lower()
+        role = UserRole.admin if is_admin else UserRole.user
+        plan = PlanTier.pro if is_admin else PlanTier.free  # admin gets pro by default
+        budget = PLAN_TOKEN_BUDGETS[plan]
+
+        user = User(
+            email=email,
+            password_hash=hash_password(password),
+            role=role,
+            plan=plan,
+            token_budget_monthly=budget,
+        )
         self.db.add(user)
+        self.db.flush()  # get user.id without committing
+
+        # Grant default feature flags based on plan
+        features = PLAN_DEFAULT_FEATURES[plan]
+        for feature in features:
+            self.db.add(UserFeature(user_id=user.id, feature=feature, enabled=True))
+
         self.db.commit()
         self.db.refresh(user)
         return user
@@ -25,6 +46,8 @@ class AuthService:
         user = self.db.query(User).filter_by(email=email).first()
         if not user or not verify_password(password, user.password_hash):
             raise HTTPException(status_code=401, detail="Invalid credentials")
+        if not user.is_active:
+            raise HTTPException(status_code=403, detail="Account is disabled")
         return self._issue_tokens(user.id)
 
     def refresh(self, refresh_token: str) -> tuple[str, str]:
@@ -55,3 +78,4 @@ class AuthService:
         )
         self.db.commit()
         return access, refresh
+

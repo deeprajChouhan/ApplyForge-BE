@@ -1,6 +1,9 @@
+from pathlib import Path
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# Always resolve .env relative to this file, not the CWD
+_ENV_FILE = Path(__file__).resolve().parent.parent.parent / ".env"
 
 class Settings(BaseSettings):
     app_name: str = "ApplyForge Backend"
@@ -10,7 +13,12 @@ class Settings(BaseSettings):
     refresh_token_exp_days: int = 14
     jwt_algorithm: str = "HS256"
 
-    database_url: str = "mysql+pymysql://AF-tst-admin:Password@123@applyforge-applyforgedb-y53jkg:3306/AF-tst-db"
+    # Admin bootstrap — the first user registered with this email becomes admin
+    admin_email: str = "deeprajchouhan012@gmail.com"
+    # If set, admin will be auto-created on first boot (used in production seeding)
+    admin_password: str | None = None
+
+    database_url: str = "mysql+pymysql://AF-tst-admin:Password%40123@applyforge-applyforgedb-y53jkg:3306/AF-tst-db"
     cors_origins: str = "http://localhost:3000"
 
     llm_provider: str = "openai"
@@ -30,7 +38,7 @@ class Settings(BaseSettings):
     s3_bucket: str = "applyforge-uploads"
     s3_region: str = "us-east-1"
 
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_file=str(_ENV_FILE), extra="ignore")
 
     @property
     def cors_origin_list(self) -> list[str]:
@@ -42,3 +50,4 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
