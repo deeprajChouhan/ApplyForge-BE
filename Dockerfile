@@ -23,6 +23,10 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+# Ensure Python can find the 'app' package at /app/app/
+# (installed binaries like 'alembic' don't get CWD in sys.path automatically)
+ENV PYTHONPATH=/app
+
 # Pull installed packages from builder stage
 COPY --from=builder /install /usr/local
 
