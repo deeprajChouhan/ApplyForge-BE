@@ -226,23 +226,26 @@ class ApplicationService:
     def analyze_jd(self, app_id: int, jd: str) -> dict:
         rag = RAGService(self.db, self.user_id)
         evidence_chunks = [c.content for c, _ in rag.search(jd, top_k=6)]
-        evidence_text = "\n\n".join(evidence_chunks) if evidence_chunks else "No profile evidence available."
+        evidence_text = "\n\n".join(evidence_chunks) if evidence_chunks else "No resume evidence available."
 
         system_prompt = (
-            "You are an expert recruiter and career coach. Analyze the job description against the candidate's profile evidence. "
+            "You are an expert recruiter and career coach. "
+            "You are given a job description AND the candidate's parsed resume data (extracted via RAG). "
+            "Analyse how well the candidate's ACTUAL background matches this role. "
             "Return ONLY a valid JSON object with no markdown fences. Use this exact schema:\n"
             "{\n"
             '  "keywords": ["top 10 important keywords/phrases from the JD"],\n'
+            '  "suggested_keywords": ["keywords from the JD that match or complement the candidate resume and SHOULD be woven naturally into their documents"],\n'
             '  "required_skills": ["explicitly required skills listed in the JD"],\n'
             '  "preferred_skills": ["nice-to-have or preferred skills from the JD"],\n'
-            '  "strengths": ["areas where the candidate profile clearly matches the JD requirements"],\n'
-            '  "unsupported_gaps": ["requirements in the JD that the candidate profile does NOT clearly support"],\n'
-            '  "fit_summary": "2-3 sentence overall fit assessment explaining how well the candidate matches this role"\n'
+            '  "strengths": ["areas where the candidate resume clearly matches the JD requirements"],\n'
+            '  "unsupported_gaps": ["requirements in the JD that the candidate resume does NOT clearly support"],\n'
+            '  "fit_summary": "2-3 sentence overall fit assessment based on the candidate\'s actual resume data"\n'
             "}"
         )
         user_prompt = (
             f"=== JOB DESCRIPTION ===\n{jd}\n\n"
-            f"=== CANDIDATE PROFILE EVIDENCE ===\n{evidence_text}"
+            f"=== CANDIDATE RESUME DATA (RAG-extracted) ===\n{evidence_text}"
         )
 
         try:
@@ -265,9 +268,10 @@ class ApplicationService:
             keywords = [w for w, _ in sorted(freq.items(), key=lambda x: -x[1])[:10]]
             result = {
                 "keywords": keywords,
+                "suggested_keywords": keywords[:5],
                 "required_skills": [],
                 "preferred_skills": [],
-                "strengths": ["Profile evidence retrieved — manual review recommended"] if evidence_chunks else [],
+                "strengths": ["Resume evidence retrieved — manual review recommended"] if evidence_chunks else [],
                 "unsupported_gaps": ["LLM analysis unavailable — please retry"],
                 "fit_summary": "Automated analysis could not be completed. Please retry or review manually.",
             }
@@ -308,13 +312,15 @@ class ApplicationService:
             "Your task is to produce a clean, ATS-friendly resume using ONLY the candidate data provided below. "
             "\n\nATS RULES (follow strictly):\n"
             "• Use plain text only — NO tables, NO columns, NO text boxes, NO graphics, NO headers/footers\n"
-            "• Use standard section headings: CONTACT, PROFESSIONAL SUMMARY, SKILLS, WORK EXPERIENCE, EDUCATION, PROJECTS, CERTIFICATIONS\n"
+            "• Use standard section headings only for sections that have real data: CONTACT, PROFESSIONAL SUMMARY, SKILLS, WORK EXPERIENCE, EDUCATION, PROJECTS\n"
+            "• ONLY include a CERTIFICATIONS section if certifications are explicitly listed in the candidate data — NEVER invent or suggest certifications\n"
+            "• OMIT any section entirely if no data was provided for it — do not add placeholder text or invented content\n"
             "• Use simple bullet points starting with '•' for achievements\n"
             "• Start each bullet with a strong action verb (Led, Built, Designed, Improved, etc.)\n"
             "• Include quantifiable achievements wherever the evidence provides numbers/metrics\n"
             "• Mirror keywords from the job description naturally throughout the resume\n"
             "• Dates must be in format: Month YYYY – Month YYYY (or Present)\n"
-            "• DO NOT invent any information not present in the candidate data\n"
+            "• DO NOT invent any information not present in the candidate data — this includes certifications, awards, publications, and courses\n"
             "• DO NOT use placeholders like [Your Email] — use only the exact data provided\n"
             "• Output clean text with clear section breaks using '---' between sections"
         )

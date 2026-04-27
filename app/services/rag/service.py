@@ -85,9 +85,8 @@ class RAGService:
                 parts.append(f"({ed.start_date or ''} – {ed.end_date or 'Present'})")
             out.append(("education", " ".join(parts)))
 
-        # Skills: ALWAYS index DB skills + any extra from parsed resume (merged, deduplicated)
-        # We do this below after the parsed resume is loaded so we can merge both sources.
-        _db_skills = skills  # keep reference for merge later
+        # Skills from DB — queried here so we can merge with parsed resume skills below
+        db_skills = self.db.query(Skill).filter_by(user_id=self.user_id).all()
 
         # Projects
         projs = self.db.query(Project).filter_by(user_id=self.user_id).all()
@@ -124,13 +123,12 @@ class RAGService:
             try:
                 rd = json.loads(parsed.structured_json)
 
-                # Skills from parsed resume: merge with DB skills (not just fallback)
-                seen = {sk.name.lower().strip() for sk in _db_skills}
+                # Skills: merge DB skills + parsed resume skills (deduplicated)
+                seen = {sk.name.lower().strip() for sk in db_skills}
                 extra_resume_skills = [rs for rs in rd.get("skills", []) if rs.lower().strip() not in seen]
 
-                # Always emit the DB skills first, then add unique parsed-resume extras
                 all_skill_parts = (
-                    [f"{sk.name} ({sk.level})" if sk.level else sk.name for sk in _db_skills]
+                    [f"{sk.name} ({sk.level})" if sk.level else sk.name for sk in db_skills]
                     + extra_resume_skills
                 )
                 if all_skill_parts:
@@ -178,6 +176,7 @@ class RAGService:
                 pass  # structured_json malformed — raw_text already added above
 
         return out
+
 
     # ── Helpers ────────────────────────────────────────────────────────────
 

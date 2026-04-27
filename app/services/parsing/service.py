@@ -62,6 +62,20 @@ class ResumeParsingService:
         self.db.add(parsed)
         self.db.commit()
         self.db.refresh(parsed)
+
+        # ── Auto-rebuild the RAG knowledge index ──────────────────────────────
+        # This ensures the parsed resume data is immediately available for
+        # JD analysis and document generation via RAG — no manual rebuild needed.
+        try:
+            from app.services.rag.service import RAGService
+            RAGService(self.db, self.user_id).rebuild_index()
+        except Exception as exc:
+            # Non-fatal: parse result is already saved; user can manually rebuild if needed
+            import logging
+            logging.getLogger(__name__).warning(
+                "RAG index rebuild failed after resume parse (non-fatal): %s", exc
+            )
+
         return parsed
 
     def _extract_structured_data(self, raw_text: str) -> dict:
