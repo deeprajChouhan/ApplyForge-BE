@@ -93,10 +93,48 @@ def seed_and_promote_admin() -> None:
         logger.warning("Admin startup task failed (non-fatal): %s", exc)
 
 
+
+@app.on_event("startup")
+def backfill_free_features() -> None:
+    """
+    Idempotent: grant all free-tier features (jd_analyze, applications, resume)
+    to any free-plan user who is missing them.
+    Needed for users who registered before these features were added to the free plan.
+    """
+    try:
+        from app.db.session import SessionLocal
+        from app.models.enums import FeatureFlag, PlanTier
+        from app.models.models import User, UserFeature
+
+        FREE_FEATURES = [FeatureFlag.jd_analyze, FeatureFlag.applications, FeatureFlag.resume]
+
+        db = SessionLocal()
+        try:
+            free_users = db.query(User).filter(User.plan == PlanTier.free).all()
+            added = 0
+            for user in free_users:
+                for feature in FREE_FEATURES:
+                    existing = db.query(UserFeature).filter_by(
+                        user_id=user.id, feature=feature
+                    ).first()
+                    if not existing:
+                        db.add(UserFeature(user_id=user.id, feature=feature, enabled=True))
+                        added += 1
+                    elif not existing.enabled:
+                        existing.enabled = True
+                        added += 1
+            if added:
+                db.commit()
+                logger.info("Backfilled free features for %d user-feature row(s).", added)
+        finally:
+            db.close()
+    except Exception as exc:
+        logger.warning("Free feature backfill startup task failed (non-fatal): %s", exc)
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 
 app.include_router(api_router, prefix="/api/v1")
-

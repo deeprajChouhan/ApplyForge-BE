@@ -14,7 +14,7 @@ PLAN_TOKEN_BUDGETS: dict[str, int] = {
 
 # Features automatically granted per plan on registration
 PLAN_DEFAULT_FEATURES: dict[str, list] = {
-    PlanTier.free: [FeatureFlag.jd_analyze],
+    PlanTier.free: [FeatureFlag.jd_analyze, FeatureFlag.applications, FeatureFlag.resume],
     PlanTier.pro: [FeatureFlag.jd_analyze, FeatureFlag.applications, FeatureFlag.kanban, FeatureFlag.resume, FeatureFlag.chat],
     PlanTier.enterprise: [FeatureFlag.jd_analyze, FeatureFlag.applications, FeatureFlag.kanban, FeatureFlag.resume, FeatureFlag.chat],
 }
