@@ -55,6 +55,8 @@ class UserProfile(Base, TimestampMixin):
     headline: Mapped[str | None] = mapped_column(String(255))
     summary: Mapped[str | None] = mapped_column(Text)
     location: Mapped[str | None] = mapped_column(String(255))
+    phone_number: Mapped[str | None] = mapped_column(String(50))
+    age: Mapped[int | None] = mapped_column(Integer)
 
 
 class WorkExperience(Base, TimestampMixin):

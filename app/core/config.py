@@ -2,8 +2,10 @@ from pathlib import Path
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# Always resolve .env relative to this file, not the CWD
-_ENV_FILE = Path(__file__).resolve().parent.parent.parent / ".env"
+# Resolve .env relative to this file (backend/.env).
+# Fall back to the current working directory if the primary path doesn't exist.
+_PRIMARY_ENV = Path(__file__).resolve().parent.parent.parent / ".env"
+_ENV_FILE = str(_PRIMARY_ENV) if _PRIMARY_ENV.exists() else ".env"
 
 class Settings(BaseSettings):
     app_name: str = "ApplyForge Backend"
@@ -31,6 +33,10 @@ class Settings(BaseSettings):
     ai_max_retries: int = 2
     ai_retry_backoff_seconds: float = 0.5
     ai_allow_mock_providers: bool = False
+
+    # Google OAuth — set these in .env to enable Google Sign-In
+    google_client_id: str | None = None
+    google_client_secret: str | None = None
 
     s3_endpoint_url: str = "http://s3.applyforge-seaweedfs-ff59a1-191-101-80-174.traefik.me"
     s3_access_key: str = "admin"

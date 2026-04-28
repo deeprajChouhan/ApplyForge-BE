@@ -35,6 +35,8 @@ class UserProfileUpsert(BaseModel):
     headline: str | None = None
     summary: str | None = None
     location: str | None = None
+    phone_number: str | None = None
+    age: int | None = None
 
 
 class UserProfileOut(UserProfileUpsert):

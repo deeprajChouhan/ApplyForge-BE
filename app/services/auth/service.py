@@ -6,14 +6,21 @@ from fastapi import HTTPException
 from app.core.config import settings
 from app.core.security import create_token, hash_password, verify_password
 from app.models.enums import FeatureFlag, PlanTier, UserRole
-from app.models.models import PLAN_DEFAULT_FEATURES, PLAN_TOKEN_BUDGETS, RefreshToken, User, UserFeature
+from app.models.models import PLAN_DEFAULT_FEATURES, PLAN_TOKEN_BUDGETS, RefreshToken, User, UserFeature, UserProfile
 
 
 class AuthService:
     def __init__(self, db: Session):
         self.db = db
 
-    def register(self, email: str, password: str) -> User:
+    def register(
+        self,
+        email: str,
+        password: str,
+        phone_number: str | None = None,
+        age: int | None = None,
+        location: str | None = None,
+    ) -> User:
         if self.db.query(User).filter_by(email=email).first():
             raise HTTPException(status_code=400, detail="Email already registered")
 
@@ -37,6 +44,14 @@ class AuthService:
         features = PLAN_DEFAULT_FEATURES[plan]
         for feature in features:
             self.db.add(UserFeature(user_id=user.id, feature=feature, enabled=True))
+
+        # Create initial profile with optional registration fields
+        self.db.add(UserProfile(
+            user_id=user.id,
+            phone_number=phone_number,
+            age=age,
+            location=location,
+        ))
 
         self.db.commit()
         self.db.refresh(user)
