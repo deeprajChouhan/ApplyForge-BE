@@ -13,6 +13,9 @@ app = FastAPI(title=settings.app_name)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origin_list,
+    # Allow any Chrome/Firefox extension origin — IDs change per install so
+    # we can't hardcode them. The JWT still enforces auth on every actual request.
+    allow_origin_regex=r"chrome-extension://.*|moz-extension://.*",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -40,7 +43,6 @@ def seed_and_promote_admin() -> None:
         try:
             admin_user = db.query(User).filter(User.email.ilike(settings.admin_email)).first()
 
-            # ── Step 1: Create admin if missing and password is provided ──
             if not admin_user:
                 if not settings.admin_password:
                     logger.info(
@@ -61,7 +63,6 @@ def seed_and_promote_admin() -> None:
                 db.add(UserProfile(user_id=admin_user.id, full_name="Admin"))
                 logger.info("Admin user <%s> created on first boot.", settings.admin_email)
 
-            # ── Step 2: Promote / synchronize role, plan, features ─────────
             changed = False
             if admin_user.role != UserRole.admin:
                 admin_user.role = UserRole.admin
@@ -93,13 +94,11 @@ def seed_and_promote_admin() -> None:
         logger.warning("Admin startup task failed (non-fatal): %s", exc)
 
 
-
 @app.on_event("startup")
 def backfill_free_features() -> None:
     """
     Idempotent: grant all free-tier features (jd_analyze, applications, resume)
     to any free-plan user who is missing them.
-    Needed for users who registered before these features were added to the free plan.
     """
     try:
         from app.db.session import SessionLocal

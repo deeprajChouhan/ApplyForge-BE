@@ -12,6 +12,7 @@ from app.models.enums import ApplicationStatus
 from app.services.ai.exceptions import AIProviderError
 from app.services.ai.factory import get_llm_provider
 from app.services.rag.service import RAGService
+from app.services.scoring.service import CompetitionScorer, FitScorer, PriorityScorer
 
 
 class ApplicationService:
@@ -69,6 +70,51 @@ class ApplicationService:
         self.db.query(ApplicationStatusHistory).filter_by(application_id=app_id).delete()
         self.db.delete(app)
         self.db.commit()
+
+    # ── Profile skill helper ──────────────────────────────────────────────
+
+    def _get_profile_skills(self) -> List[str]:
+        """
+        Return a deduplicated list of skill name strings for this user.
+
+        Priority order (same as _build_structured_profile):
+          1. Skill table rows (manually added or synced from a resume parse)
+          2. skills[] array inside the latest ParsedResumeData.structured_json
+
+        Using this merged set ensures the scorer sees all known skills even
+        when the user never explicitly pressed "save skills" after uploading
+        their resume.
+        """
+        from app.models.models import ParsedResumeData
+
+        seen: set[str] = set()
+        skills: list[str] = []
+
+        for s in self.db.query(Skill).filter_by(user_id=self.user_id).all():
+            key = s.name.lower().strip()
+            if key not in seen:
+                seen.add(key)
+                skills.append(s.name)
+
+        # Fallback / supplement: parsed resume skills
+        parsed = (
+            self.db.query(ParsedResumeData)
+            .filter_by(user_id=self.user_id)
+            .order_by(ParsedResumeData.created_at.desc())
+            .first()
+        )
+        if parsed:
+            try:
+                rd: dict = json.loads(parsed.structured_json) or {}
+            except (json.JSONDecodeError, TypeError):
+                rd = {}
+            for rs in rd.get("skills", []):
+                key = rs.lower().strip()
+                if key not in seen:
+                    seen.add(key)
+                    skills.append(rs)
+
+        return skills
 
     # ── Profile builder ───────────────────────────────────────────────────
 
@@ -278,8 +324,65 @@ class ApplicationService:
 
         app = self.get(app_id)
         app.jd_analysis_json = json.dumps(result)
+
+        # Auto-compute and persist scores right after analysis
+        profile_skills   = self._get_profile_skills()
+        work_experiences = self.db.query(WorkExperience).filter_by(user_id=self.user_id).order_by(WorkExperience.start_date.desc()).all()
+        educations       = self.db.query(Education).filter_by(user_id=self.user_id).all()
+
+        fit, fit_breakdown = FitScorer.score(
+            result, profile_skills,
+            jd_text=jd,
+            work_experiences=work_experiences,
+            educations=educations,
+            role_title=app.role_title,
+        )
+        comp     = CompetitionScorer.score(jd, app.company_name)
+        composed = PriorityScorer.compose(fit, comp, fit_breakdown)
+
+        app.fit_score         = composed["fit_score"]
+        app.competition_score = composed["competition_score"]
+        app.priority_score    = composed["priority_score"]
+
         self.db.commit()
+        # Merge score data into response so the frontend gets everything in one call
+        result["_scores"] = composed
         return result
+
+    def compute_priority_score(self, app_id: int) -> dict:
+        """
+        (Re)compute and persist Priority Score for an existing application.
+        Requires jd_analysis_json to already be present — run analyze_jd first.
+        Reachability is refreshed from the stored value so Phase 2 updates flow through.
+        """
+        app = self.get(app_id)
+        if not app.jd_analysis_json:
+            raise HTTPException(
+                status_code=422,
+                detail="Run JD analysis first — Priority Score requires it.",
+            )
+
+        jd_analysis = json.loads(app.jd_analysis_json)
+        profile_skills = self._get_profile_skills()
+
+        work_experiences = self.db.query(WorkExperience).filter_by(user_id=self.user_id).order_by(WorkExperience.start_date.desc()).all()
+        educations       = self.db.query(Education).filter_by(user_id=self.user_id).all()
+
+        fit, fit_breakdown = FitScorer.score(
+            jd_analysis, profile_skills,
+            jd_text=app.job_description,
+            work_experiences=work_experiences,
+            educations=educations,
+            role_title=app.role_title,
+        )
+        comp     = CompetitionScorer.score(app.job_description, app.company_name)
+        composed = PriorityScorer.compose(fit, comp, fit_breakdown)
+
+        app.fit_score         = composed["fit_score"]
+        app.competition_score = composed["competition_score"]
+        app.priority_score    = composed["priority_score"]
+        self.db.commit()
+        return composed
 
     # ── Document generation ───────────────────────────────────────────────
 

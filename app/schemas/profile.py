@@ -127,3 +127,26 @@ class ResumeParseResponse(BaseModel):
     parse_id: int
     confidence_score: float
     structured_data: dict
+
+
+# ---------------------------------------------------------------------------
+# LinkedIn connections (Phase 2)
+# ---------------------------------------------------------------------------
+
+class LinkedInConnectionOut(BaseModel):
+    """Single LinkedIn connection as returned by the API."""
+    id: int
+    full_name: str
+    company: str | None = None
+    position: str | None = None
+    connected_on: date | None = None
+
+    model_config = {"from_attributes": True}
+
+
+class LinkedInImportResponse(BaseModel):
+    """Summary returned after a CSV ingestion."""
+    imported: int            # newly inserted rows
+    updated: int             # rows that already existed and were refreshed
+    total: int               # total rows processed from the CSV
+    applications_refreshed: int  # applications whose priority_score was recomposed

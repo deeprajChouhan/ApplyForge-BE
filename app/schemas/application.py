@@ -25,6 +25,9 @@ class ApplicationOut(BaseModel):
     jd_link: str | None = None
     status: ApplicationStatus
     jd_analysis_json: str | None = None
+    fit_score: float | None = None
+    competition_score: float | None = None
+    priority_score: float | None = None
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -59,7 +62,6 @@ class GeneratedDocumentOut(BaseModel):
     version: int
     content: str
     format: str
-    is_current: bool = True  # all newly generated docs are current
 
     model_config = {"from_attributes": True}
 
@@ -67,3 +69,21 @@ class GeneratedDocumentOut(BaseModel):
 class GenerateResponse(BaseModel):
     status: str
     documents: list[GeneratedDocumentOut]
+
+
+class ScoreResponse(BaseModel):
+    priority_score: float
+    fit_score: float
+    competition_score: float
+    fit_breakdown: dict[str, float] = {}
+    recommendation: str
+    label: str
+
+
+class ScorePreviewRequest(BaseModel):
+    """
+    Body for POST /utils/score-preview (browser extension endpoint).
+    Scores a JD without a saved application -- no RAG, no profile lookup.
+    """
+    jd_text: str
+    company_name: str = ""

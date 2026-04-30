@@ -10,12 +10,15 @@ from app.schemas.profile import (
     CertificationIn,
     EducationIn,
     ExperienceIn,
+    LinkedInConnectionOut,
+    LinkedInImportResponse,
     ProjectIn,
     ResumeParseResponse,
     SkillIn,
     UserProfileOut,
     UserProfileUpsert,
 )
+from app.services.linkedin.service import LinkedInService, parse_linkedin_csv
 from app.services.parsing.service import ResumeParsingService
 from app.services.profile.service import PROFILE_MODELS, ProfileService, delete_owned, list_owned, upsert_owned
 from app.services.rag.service import RAGService
@@ -33,6 +36,92 @@ def get_profile(user: User = Depends(get_current_user), db: Session = Depends(ge
 def update_profile(payload: UserProfileUpsert, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     return ProfileService(db, user.id).update_profile(payload.model_dump())
 
+
+# ---------------------------------------------------------------------------
+# LinkedIn connections (Phase 2) -- defined BEFORE the /{section} wildcard so
+# Starlette resolves the literal path "linkedin-connections" with priority.
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/linkedin-connections",
+    response_model=LinkedInImportResponse,
+    summary="Import LinkedIn Connections CSV",
+    description=(
+        "Upload the Connections.csv file exported from LinkedIn "
+        "(Settings > Data privacy > Get a copy of your data). "
+        "Rows are upserted by (user_id, full_name); re-importing refreshes "
+        "company/position without creating duplicates. "
+        "After ingestion, priority_score is recomposed for every saved "
+        "application where JD analysis already exists."
+    ),
+)
+async def import_linkedin_connections(
+    file: UploadFile = File(..., description="LinkedIn Connections.csv export"),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> LinkedInImportResponse:
+    # --- validate content-type loosely (CSV can arrive as text/plain or text/csv)
+    if file.content_type and "html" in file.content_type:
+        raise HTTPException(
+            status_code=415,
+            detail="Expected a CSV file. Received an HTML response — make sure you are uploading the raw Connections.csv file.",
+        )
+
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+    # --- parse CSV
+    try:
+        rows = parse_linkedin_csv(raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    if not rows:
+        raise HTTPException(
+            status_code=422,
+            detail="No connection rows found in the CSV. Verify you uploaded the correct file.",
+        )
+
+    svc = LinkedInService(db, user.id)
+
+    # --- upsert connections
+    upsert_result = svc.upsert_connections(rows)
+
+    # --- recompose priority scores for all existing applications
+    apps_refreshed = svc.refresh_all_priority_scores()
+
+    return LinkedInImportResponse(
+        imported=upsert_result["imported"],
+        updated=upsert_result["updated"],
+        total=upsert_result["total"],
+        applications_refreshed=apps_refreshed,
+    )
+
+
+@router.get(
+    "/linkedin-connections",
+    response_model=list[LinkedInConnectionOut],
+    summary="List LinkedIn connections",
+)
+def list_linkedin_connections(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[LinkedInConnectionOut]:
+    """Return all LinkedIn connections stored for the current user."""
+    from app.models.models import LinkedInConnection
+    conns = (
+        db.query(LinkedInConnection)
+        .filter_by(user_id=user.id)
+        .order_by(LinkedInConnection.full_name)
+        .all()
+    )
+    return conns
+
+
+# ---------------------------------------------------------------------------
+# Generic profile section CRUD (wildcard -- must come AFTER named routes)
+# ---------------------------------------------------------------------------
 
 def _payload_by_section(section: str, payload: dict):
     match section:

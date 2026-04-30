@@ -44,6 +44,15 @@ class Settings(BaseSettings):
     s3_bucket: str = "applyforge-uploads"
     s3_region: str = "us-east-1"
 
+    # Qdrant vector store — used by RAGService for efficient similarity search
+    qdrant_url: str = "http://localhost:6333"
+    qdrant_api_key: str | None = None
+    qdrant_collection: str = "applyforge_chunks"
+    # Must match the output dimension of the configured embedding model.
+    # text-embedding-3-small / ada-002 → 1536  |  text-embedding-3-large → 3072
+    # MockEmbeddingProvider (dev/test) → 16
+    embedding_dim: int = 1536
+
     model_config = SettingsConfigDict(env_file=str(_ENV_FILE), extra="ignore")
 
     @property

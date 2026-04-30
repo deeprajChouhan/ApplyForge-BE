@@ -1,12 +1,56 @@
+from __future__ import annotations
+
 import json
-import math
+import threading
+
+import structlog
+from qdrant_client import QdrantClient
+from qdrant_client.models import (
+    FieldCondition,
+    Filter,
+    FilterSelector,
+    MatchValue,
+    PointStruct,
+)
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.models.models import (
-    Certification, Education, KnowledgeChunk, KnowledgeDocument,
-    ParsedResumeData, Project, Skill, UserProfile, WorkExperience,
+    Certification,
+    Education,
+    KnowledgeChunk,
+    KnowledgeDocument,
+    ParsedResumeData,
+    Project,
+    Skill,
+    UserProfile,
+    WorkExperience,
 )
 from app.services.ai.factory import get_embedding_provider
+
+logger = structlog.get_logger(__name__)
+
+
+_qdrant_client: QdrantClient | None = None
+_qdrant_client_lock = threading.Lock()
+
+
+def _get_qdrant_client() -> QdrantClient:
+    """
+    Module-level singleton with lazy init.
+    Using a plain global (instead of lru_cache) so that uvicorn --reload
+    properly rebuilds the client when settings change between reloads.
+    """
+    global _qdrant_client
+    if _qdrant_client is None:
+        with _qdrant_client_lock:
+            if _qdrant_client is None:
+                _qdrant_client = QdrantClient(
+                    url=settings.qdrant_url,
+                    api_key=settings.qdrant_api_key or None,
+                    check_compatibility=False,
+                )
+    return _qdrant_client
 
 
 class RAGService:
@@ -14,37 +58,147 @@ class RAGService:
         self.db = db
         self.user_id = user_id
         self.embedder = get_embedding_provider()
+        self.qdrant = _get_qdrant_client()
+        self.collection = settings.qdrant_collection
+
+    # ── Public API ─────────────────────────────────────────────────────────
 
     def rebuild_index(self) -> int:
+        """
+        Rebuild the vector index for this user from scratch.
+
+        1. Delete all existing Qdrant points for the user.
+        2. Delete stale KnowledgeDocument / KnowledgeChunk rows from MySQL.
+        3. Re-embed every document chunk and upsert into Qdrant.
+           KnowledgeChunk rows are kept for content retrieval; embeddings
+           are stored only in Qdrant (embedding column stays NULL).
+
+        Returns the total number of chunks indexed.
+        """
+        self._ensure_collection()
+
+        # Remove existing vectors for this user from Qdrant
+        self.qdrant.delete(
+            collection_name=self.collection,
+            points_selector=FilterSelector(
+                filter=Filter(
+                    must=[FieldCondition(key="user_id", match=MatchValue(value=self.user_id))]
+                )
+            ),
+        )
+
+        # Remove stale MySQL records
         self.db.query(KnowledgeChunk).filter_by(user_id=self.user_id).delete()
         self.db.query(KnowledgeDocument).filter_by(user_id=self.user_id).delete()
 
         docs = self._compose_documents()
+        points: list[PointStruct] = []
         chunk_count = 0
+
         for source_type, content in docs:
             if not content.strip():
                 continue
-            doc = KnowledgeDocument(user_id=self.user_id, source_type=source_type, content=content)
+
+            doc = KnowledgeDocument(
+                user_id=self.user_id,
+                source_type=source_type,
+                content=content,
+            )
             self.db.add(doc)
-            self.db.flush()
+            self.db.flush()  # obtain doc.id
+
             for idx, chunk in enumerate(self._chunk(content)):
                 emb = self.embedder.embed(chunk)
-                self.db.add(KnowledgeChunk(
+
+                chunk_row = KnowledgeChunk(
                     user_id=self.user_id,
                     document_id=doc.id,
                     chunk_index=idx,
                     content=chunk,
-                    embedding=json.dumps(emb),
-                ))
+                    # embedding intentionally NULL — stored in Qdrant instead
+                )
+                self.db.add(chunk_row)
+                self.db.flush()  # obtain chunk_row.id used as Qdrant point ID
+
+                points.append(
+                    PointStruct(
+                        id=chunk_row.id,
+                        vector=emb,
+                        payload={
+                            "user_id": self.user_id,
+                            "content": chunk,
+                            "source_type": source_type,
+                            "document_id": doc.id,
+                            "chunk_index": idx,
+                        },
+                    )
+                )
                 chunk_count += 1
+
         self.db.commit()
+
+        if points:
+            self.qdrant.upsert(collection_name=self.collection, points=points)
+
+        logger.info(
+            "rag_index_rebuilt",
+            user_id=self.user_id,
+            chunk_count=chunk_count,
+            collection=self.collection,
+        )
         return chunk_count
 
-    def search(self, query: str, top_k: int = 5):
+    def search(self, query: str, top_k: int = 5) -> list[tuple[KnowledgeChunk, float]]:
+        """
+        Semantic search over this user's indexed chunks.
+
+        Returns a list of (KnowledgeChunk, score) tuples sorted by
+        descending cosine similarity — identical interface to before.
+        """
         q_emb = self.embedder.embed(query)
-        chunks = self.db.query(KnowledgeChunk).filter_by(user_id=self.user_id).all()
-        scored = [(c, self._cosine(q_emb, json.loads(c.embedding))) for c in chunks]
-        return sorted(scored, key=lambda x: x[1], reverse=True)[:top_k]
+
+        result = self.qdrant.query_points(
+            collection_name=self.collection,
+            query=q_emb,
+            query_filter=Filter(
+                must=[FieldCondition(key="user_id", match=MatchValue(value=self.user_id))]
+            ),
+            limit=top_k,
+            with_payload=True,
+        )
+        hits = result.points
+
+        if not hits:
+            return []
+
+        chunk_ids = [h.id for h in hits]
+        chunks_by_id: dict[int, KnowledgeChunk] = {
+            c.id: c
+            for c in self.db.query(KnowledgeChunk).filter(KnowledgeChunk.id.in_(chunk_ids)).all()
+        }
+
+        return [(chunks_by_id[h.id], h.score) for h in hits if h.id in chunks_by_id]
+
+    # ── Collection management ───────────────────────────────────────────────
+
+    def _ensure_collection(self) -> None:
+        """
+        Verify the Qdrant collection exists — do NOT auto-create it.
+
+        The collection is provisioned manually in Qdrant Cloud with an
+        optimized multitenancy config (is_principal payload index, tuned
+        HNSW payload_m) that cannot be reproduced by a simple API call.
+        If the collection is missing it means the environment is not set up
+        correctly, so we raise immediately with a clear message.
+        """
+        existing = {c.name for c in self.qdrant.get_collections().collections}
+        if self.collection not in existing:
+            raise RuntimeError(
+                f"Qdrant collection '{self.collection}' does not exist. "
+                "Create it manually in Qdrant Cloud (Multitenancy preset, "
+                "1536 dims, Cosine, user_id tenant field) before starting the server."
+            )
+        logger.debug("qdrant_collection_verified", collection=self.collection)
 
     # ── Document composition ───────────────────────────────────────────────
 
@@ -177,16 +331,7 @@ class RAGService:
 
         return out
 
-
     # ── Helpers ────────────────────────────────────────────────────────────
 
     def _chunk(self, text: str, chunk_size: int = 500) -> list[str]:
         return [text[i: i + chunk_size] for i in range(0, len(text), chunk_size)] or [""]
-
-    def _cosine(self, a: list[float], b: list[float]) -> float:
-        if len(a) != len(b):
-            return 0.0
-        dot = sum(x * y for x, y in zip(a, b))
-        na = math.sqrt(sum(x * x for x in a))
-        nb = math.sqrt(sum(x * x for x in b))
-        return dot / (na * nb + 1e-9)

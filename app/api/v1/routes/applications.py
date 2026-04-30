@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, Query
+from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, require_feature
@@ -13,9 +14,15 @@ from app.schemas.application import (
     GenerateResponse,
     GeneratedDocumentOut,
     JDAnalyzeRequest,
+    ScoreResponse,
     StatusChangeRequest,
 )
+from app.schemas.profile import LinkedInConnectionOut
+from app.schemas.suggestions import SuggestionsResponse
+from app.services.linkedin.service import LinkedInService
 from app.services.applications.service import ApplicationService
+from app.services.suggestions.service import SuggestionService
+from app.services.export.resume_exporter import ResumeExporter
 
 router = APIRouter(prefix="/applications", tags=["applications"])
 
@@ -55,7 +62,6 @@ def update(app_id: int, payload: ApplicationUpdate, user: User = Depends(get_cur
 
 @router.delete("/{app_id}", status_code=204, dependencies=[_need_apps])
 def delete_application(app_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Permanently delete an application and all related DB data (documents, chat messages)."""
     ApplicationService(db, user.id).delete(app_id)
 
 
@@ -69,6 +75,18 @@ def analyze_jd(app_id: int, payload: JDAnalyzeRequest, user: User = Depends(get_
     return ApplicationService(db, user.id).analyze_jd(app_id, payload.job_description)
 
 
+@router.post("/{app_id}/score", response_model=ScoreResponse, dependencies=[_need_jd])
+def score_application(app_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    return ApplicationService(db, user.id).compute_priority_score(app_id)
+
+
+@router.get("/{app_id}/connections", response_model=list[LinkedInConnectionOut], dependencies=[_need_apps])
+def get_application_connections(app_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    app = ApplicationService(db, user.id).get(app_id)
+    svc = LinkedInService(db, user.id)
+    return svc.get_connections_for_company(app.company_name)
+
+
 @router.post("/{app_id}/generate", response_model=GenerateResponse, dependencies=[_need_jd])
 def generate(app_id: int, payload: GenerateRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     docs = ApplicationService(db, user.id).generate_docs(app_id, payload.doc_types)
@@ -78,11 +96,16 @@ def generate(app_id: int, payload: GenerateRequest, user: User = Depends(get_cur
     )
 
 
+@router.post("/{app_id}/suggestions", response_model=SuggestionsResponse, dependencies=[_need_jd])
+def generate_suggestions(app_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Generate AI-powered resume improvement suggestions for this application."""
+    return SuggestionService(db, user.id).generate(app_id)
+
+
 @router.get("/{app_id}/documents/current", dependencies=[_need_apps])
 def get_current_documents(app_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     from app.models.models import GeneratedDocument
     from app.models.enums import DocumentType
-    # Verify the app belongs to the user
     ApplicationService(db, user.id).get(app_id)
     result = {}
     for dt in DocumentType:
@@ -97,3 +120,32 @@ def get_current_documents(app_id: int, user: User = Depends(get_current_user), d
         else:
             result[dt.value] = None
     return result
+
+
+@router.get("/{app_id}/export/pdf", dependencies=[_need_apps])
+def export_resume_pdf(app_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Download the user's resume as an ATS-optimised PDF."""
+    # Verify the application belongs to this user (raises 404 otherwise)
+    ApplicationService(db, user.id).get(app_id)
+    pdf_bytes = ResumeExporter(db, user).as_pdf()
+    safe_name = (user.email or "resume").split("@")[0].replace(" ", "_")
+    filename = f"{safe_name}_resume.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/{app_id}/export/docx", dependencies=[_need_apps])
+def export_resume_docx(app_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Download the user's resume as a DOCX file."""
+    ApplicationService(db, user.id).get(app_id)
+    docx_bytes = ResumeExporter(db, user).as_docx()
+    safe_name = (user.email or "resume").split("@")[0].replace(" ", "_")
+    filename = f"{safe_name}_resume.docx"
+    return Response(
+        content=docx_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )

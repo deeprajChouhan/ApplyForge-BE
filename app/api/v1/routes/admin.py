@@ -164,6 +164,22 @@ def toggle_feature(
     return _build_admin_user(user, db)
 
 
+@router.delete("/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_user(
+    user_id: int,
+    _admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Permanently delete a user and all associated data."""
+    user = db.get(User, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if user.role.value == "admin":
+        raise HTTPException(status_code=400, detail="Cannot delete an admin account")
+    db.delete(user)
+    db.commit()
+
+
 @router.post("/users/{user_id}/activate", status_code=status.HTTP_200_OK)
 def activate_user(
     user_id: int,

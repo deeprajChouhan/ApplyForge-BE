@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 from sqlalchemy import Boolean, Date, DateTime, Enum, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -35,7 +35,6 @@ class User(Base, TimestampMixin):
     plan: Mapped[PlanTier] = mapped_column(Enum(PlanTier), default=PlanTier.free, index=True)
     subscription_status: Mapped[SubscriptionStatus] = mapped_column(Enum(SubscriptionStatus), default=SubscriptionStatus.active)
     token_budget_monthly: Mapped[int] = mapped_column(Integer, default=PLAN_TOKEN_BUDGETS[PlanTier.free])
-
 
 
 class RefreshToken(Base, TimestampMixin):
@@ -145,7 +144,9 @@ class KnowledgeChunk(Base, TimestampMixin):
     document_id: Mapped[int] = mapped_column(ForeignKey("knowledge_documents.id", ondelete="CASCADE"), index=True)
     chunk_index: Mapped[int] = mapped_column(Integer)
     content: Mapped[str] = mapped_column(Text)
-    embedding: Mapped[str] = mapped_column(Text)
+    # Nullable: vectors are stored in Qdrant; this column is kept for schema
+    # compatibility but is no longer populated by RAGService.
+    embedding: Mapped[str | None] = mapped_column(Text, nullable=True)
     __table_args__ = (Index("idx_chunks_doc_chunk", "document_id", "chunk_index"),)
 
 
@@ -159,6 +160,10 @@ class JobApplication(Base, TimestampMixin):
     jd_link: Mapped[str | None] = mapped_column(String(1000))
     status: Mapped[ApplicationStatus] = mapped_column(Enum(ApplicationStatus), index=True, default=ApplicationStatus.draft)
     jd_analysis_json: Mapped[str | None] = mapped_column(Text)
+    # Priority Score sub-scores (populated after analyze_jd or /score)
+    fit_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    competition_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    priority_score: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
 class GeneratedDocument(Base, TimestampMixin):
@@ -232,3 +237,23 @@ class UsageEvent(Base):
     model: Mapped[str] = mapped_column(String(100))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
+
+# LinkedIn Connections (Phase 2 -- LinkedIn CSV ingestion)
+
+class LinkedInConnection(Base, TimestampMixin):
+    """
+    One LinkedIn connection imported from the user's Connections CSV export.
+    Unique per (user_id, full_name) -- re-importing the same person updates
+    their company/position rather than creating a duplicate row.
+    """
+    __tablename__ = "linkedin_connections"
+    __table_args__ = (
+        UniqueConstraint("user_id", "full_name", name="uq_linkedin_conn_user_name"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    full_name: Mapped[str] = mapped_column(String(255))
+    company: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    position: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    connected_on: Mapped[date | None] = mapped_column(Date, nullable=True)
