@@ -1,5 +1,5 @@
 from pathlib import Path
-from pydantic import SecretStr
+from pydantic import SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _PRIMARY_ENV = Path(__file__).resolve().parent.parent.parent / ".env"
@@ -36,10 +36,12 @@ class Settings(BaseSettings):
     storage_backend: str = "local"
     upload_dir: str = "./storage/uploads"
 
-    s3_endpoint_url: str = "https://applyforge-rustfs-cd53e0-191-101-80-174.traefik.me"
-    s3_access_key: str = "rustfsadmin"
-    s3_secret_key: str = "vcqdhbkkeq11czol"
-    s3_bucket: str = "applyforge-uploads"
+    # S3-compatible storage. No defaults — must be supplied via env when S3 is in use.
+    # Validated below in `_require_s3_settings_when_used`.
+    s3_endpoint_url: str | None = None
+    s3_access_key: str | None = None
+    s3_secret_key: SecretStr | None = None
+    s3_bucket: str | None = None
     s3_region: str = "us-east-1"
 
     qdrant_url: str = "http://localhost:6333"
@@ -62,6 +64,43 @@ class Settings(BaseSettings):
     @property
     def ai_api_key_value(self) -> str:
         return self.ai_api_key.get_secret_value() if self.ai_api_key else ""
+
+    @property
+    def s3_secret_key_value(self) -> str:
+        return self.s3_secret_key.get_secret_value() if self.s3_secret_key else ""
+
+    @property
+    def uses_s3_storage(self) -> bool:
+        """True when the app will actually instantiate the S3 storage backend.
+
+        Mirrors the logic in `app.services.storage.service.get_storage_service`:
+        local storage is used only in dev when `storage_backend=local`;
+        anything else (any prod env, or explicit `storage_backend=s3`) means S3.
+        """
+        return not (self.env == "dev" and self.storage_backend == "local")
+
+    @model_validator(mode="after")
+    def _require_s3_settings_when_used(self) -> "Settings":
+        if not self.uses_s3_storage:
+            return self
+        missing = [
+            name
+            for name, value in (
+                ("S3_ENDPOINT_URL", self.s3_endpoint_url),
+                ("S3_ACCESS_KEY", self.s3_access_key),
+                ("S3_SECRET_KEY", self.s3_secret_key),
+                ("S3_BUCKET", self.s3_bucket),
+            )
+            if not value
+        ]
+        if missing:
+            raise ValueError(
+                "S3 storage is enabled (env="
+                f"{self.env!r}, storage_backend={self.storage_backend!r}) "
+                "but the following env vars are not set: "
+                + ", ".join(missing)
+            )
+        return self
 
 
 settings = Settings()

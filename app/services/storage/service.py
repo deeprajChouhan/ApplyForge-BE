@@ -33,12 +33,24 @@ class LocalStorageService:
 
 class S3StorageService:
     def __init__(self) -> None:
-        self.bucket = settings.s3_bucket
+        # These are validated at app startup by Settings._require_s3_settings_when_used,
+        # but re-check here so direct instantiation (e.g. in tests) fails loudly.
+        if not (
+            settings.s3_endpoint_url
+            and settings.s3_access_key
+            and settings.s3_secret_key
+            and settings.s3_bucket
+        ):
+            raise RuntimeError(
+                "S3 storage requested but S3_ENDPOINT_URL / S3_ACCESS_KEY / "
+                "S3_SECRET_KEY / S3_BUCKET are not all configured."
+            )
+        self.bucket: str = settings.s3_bucket
         self.client: BaseClient = boto3.client(
             "s3",
             endpoint_url=settings.s3_endpoint_url,
             aws_access_key_id=settings.s3_access_key,
-            aws_secret_access_key=settings.s3_secret_key,
+            aws_secret_access_key=settings.s3_secret_key_value,
             region_name=settings.s3_region,
             config=Config(s3={"addressing_style": "path"}),
         )
