@@ -15,10 +15,11 @@ from app.schemas.application import (
     GeneratedDocumentOut,
     JDAnalyzeRequest,
     ScoreResponse,
+    SetResumeRequest,
     StatusChangeRequest,
 )
 from app.schemas.profile import LinkedInConnectionOut
-from app.schemas.suggestions import SuggestionsResponse
+from app.schemas.suggestions import ApplySuggestionRequest, CustomizationOut, SuggestionsResponse
 from app.services.linkedin.service import LinkedInService
 from app.services.applications.service import ApplicationService
 from app.services.suggestions.service import SuggestionService
@@ -58,6 +59,12 @@ def get_app(app_id: int, user: User = Depends(get_current_user), db: Session = D
 @router.patch("/{app_id}", response_model=ApplicationOut, dependencies=[_need_apps])
 def update(app_id: int, payload: ApplicationUpdate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     return ApplicationService(db, user.id).update(app_id, payload.model_dump())
+
+
+@router.patch("/{app_id}/resume", response_model=ApplicationOut, dependencies=[_need_apps])
+def set_resume(app_id: int, payload: SetResumeRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Pin (or unpin) a specific parsed resume to this application."""
+    return ApplicationService(db, user.id).set_resume(app_id, payload.parsed_resume_id)
 
 
 @router.delete("/{app_id}", status_code=204, dependencies=[_need_apps])
@@ -102,6 +109,18 @@ def generate_suggestions(app_id: int, user: User = Depends(get_current_user), db
     return SuggestionService(db, user.id).generate(app_id)
 
 
+@router.get("/{app_id}/customizations", response_model=CustomizationOut, dependencies=[_need_apps])
+def get_customizations(app_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Return per-application AI customizations (applied suggestions count + data)."""
+    return SuggestionService(db, user.id).get_customizations(app_id)
+
+
+@router.post("/{app_id}/suggestions/apply", response_model=CustomizationOut, dependencies=[_need_jd])
+def apply_suggestion(app_id: int, payload: ApplySuggestionRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Apply a single AI suggestion as a per-application override (does not mutate the global profile)."""
+    return SuggestionService(db, user.id).apply_suggestion(app_id, payload.suggestion)
+
+
 @router.get("/{app_id}/documents/current", dependencies=[_need_apps])
 def get_current_documents(app_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     from app.models.models import GeneratedDocument
@@ -127,7 +146,7 @@ def export_resume_pdf(app_id: int, user: User = Depends(get_current_user), db: S
     """Download the user's resume as an ATS-optimised PDF."""
     # Verify the application belongs to this user (raises 404 otherwise)
     ApplicationService(db, user.id).get(app_id)
-    pdf_bytes = ResumeExporter(db, user).as_pdf()
+    pdf_bytes = ResumeExporter(db, user, app_id=app_id).as_pdf()
     safe_name = (user.email or "resume").split("@")[0].replace(" ", "_")
     filename = f"{safe_name}_resume.pdf"
     return Response(
@@ -141,7 +160,7 @@ def export_resume_pdf(app_id: int, user: User = Depends(get_current_user), db: S
 def export_resume_docx(app_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Download the user's resume as a DOCX file."""
     ApplicationService(db, user.id).get(app_id)
-    docx_bytes = ResumeExporter(db, user).as_docx()
+    docx_bytes = ResumeExporter(db, user, app_id=app_id).as_docx()
     safe_name = (user.email or "resume").split("@")[0].replace(" ", "_")
     filename = f"{safe_name}_resume.docx"
     return Response(

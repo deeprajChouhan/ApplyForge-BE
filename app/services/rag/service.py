@@ -148,21 +148,142 @@ class RAGService:
         )
         return chunk_count
 
-    def search(self, query: str, top_k: int = 5) -> list[tuple[KnowledgeChunk, float]]:
+    def rebuild_index_for_resume(self, parsed_resume_id: int) -> int:
+        """
+        Build (or rebuild) the Qdrant index for a *single* parsed resume.
+
+        This is used for PRO multi-resume support.  Unlike rebuild_index(),
+        it only touches chunks tagged with this specific parsed_resume_id —
+        the legacy untagged chunks (from the full-profile rebuild) are
+        untouched.
+
+        Content is built exclusively from the ParsedResumeData record so
+        each resume gets a truly independent knowledge base.
+
+        Returns the number of chunks indexed.
+        """
+        self._ensure_collection()
+
+        # Delete any existing Qdrant points for this specific resume
+        self.qdrant.delete(
+            collection_name=self.collection,
+            points_selector=FilterSelector(
+                filter=Filter(
+                    must=[
+                        FieldCondition(key="user_id", match=MatchValue(value=self.user_id)),
+                        FieldCondition(key="parsed_resume_id", match=MatchValue(value=parsed_resume_id)),
+                    ]
+                )
+            ),
+        )
+
+        # Remove stale MySQL records for this resume
+        self.db.query(KnowledgeChunk).filter_by(
+            user_id=self.user_id, parsed_resume_id=parsed_resume_id
+        ).delete()
+        self.db.query(KnowledgeDocument).filter_by(
+            user_id=self.user_id, parsed_resume_id=parsed_resume_id
+        ).delete()
+
+        # Build documents from just this resume's data
+        parsed = (
+            self.db.query(ParsedResumeData)
+            .filter_by(id=parsed_resume_id, user_id=self.user_id)
+            .first()
+        )
+        if not parsed:
+            logger.warning("rag_resume_not_found", parsed_resume_id=parsed_resume_id)
+            return 0
+
+        docs = self._compose_documents_for_resume(parsed)
+        points: list[PointStruct] = []
+        chunk_count = 0
+
+        for source_type, content in docs:
+            if not content.strip():
+                continue
+
+            doc = KnowledgeDocument(
+                user_id=self.user_id,
+                source_type=source_type,
+                content=content,
+                parsed_resume_id=parsed_resume_id,
+            )
+            self.db.add(doc)
+            self.db.flush()
+
+            for idx, chunk in enumerate(self._chunk(content)):
+                emb = self.embedder.embed(chunk)
+
+                chunk_row = KnowledgeChunk(
+                    user_id=self.user_id,
+                    document_id=doc.id,
+                    chunk_index=idx,
+                    content=chunk,
+                    parsed_resume_id=parsed_resume_id,
+                )
+                self.db.add(chunk_row)
+                self.db.flush()
+
+                points.append(
+                    PointStruct(
+                        id=chunk_row.id,
+                        vector=emb,
+                        payload={
+                            "user_id": self.user_id,
+                            "parsed_resume_id": parsed_resume_id,
+                            "content": chunk,
+                            "source_type": source_type,
+                            "document_id": doc.id,
+                            "chunk_index": idx,
+                        },
+                    )
+                )
+                chunk_count += 1
+
+        self.db.commit()
+
+        if points:
+            self.qdrant.upsert(collection_name=self.collection, points=points)
+
+        logger.info(
+            "rag_resume_index_rebuilt",
+            user_id=self.user_id,
+            parsed_resume_id=parsed_resume_id,
+            chunk_count=chunk_count,
+        )
+        return chunk_count
+
+    def search(
+        self,
+        query: str,
+        top_k: int = 5,
+        parsed_resume_id: int | None = None,
+    ) -> list[tuple[KnowledgeChunk, float]]:
         """
         Semantic search over this user's indexed chunks.
 
+        When parsed_resume_id is provided (PRO multi-resume), the search is
+        scoped to chunks from that specific resume's knowledge base only.
+        Otherwise all chunks for the user are searched (legacy behaviour).
+
         Returns a list of (KnowledgeChunk, score) tuples sorted by
-        descending cosine similarity — identical interface to before.
+        descending cosine similarity.
         """
         q_emb = self.embedder.embed(query)
+
+        must_conditions = [
+            FieldCondition(key="user_id", match=MatchValue(value=self.user_id))
+        ]
+        if parsed_resume_id is not None:
+            must_conditions.append(
+                FieldCondition(key="parsed_resume_id", match=MatchValue(value=parsed_resume_id))
+            )
 
         result = self.qdrant.query_points(
             collection_name=self.collection,
             query=q_emb,
-            query_filter=Filter(
-                must=[FieldCondition(key="user_id", match=MatchValue(value=self.user_id))]
-            ),
+            query_filter=Filter(must=must_conditions),
             limit=top_k,
             with_payload=True,
         )
@@ -328,6 +449,80 @@ class RAGService:
 
             except (json.JSONDecodeError, TypeError):
                 pass  # structured_json malformed — raw_text already added above
+
+        return out
+
+    # ── Per-resume document composition ────────────────────────────────────
+
+    def _compose_documents_for_resume(self, parsed: ParsedResumeData) -> list[tuple[str, str]]:
+        """
+        Build knowledge documents from a *single* ParsedResumeData record.
+        Used by rebuild_index_for_resume() to create an independent knowledge
+        base for each uploaded resume.
+
+        Content is derived solely from parsed.raw_text and parsed.structured_json
+        so that two resumes with different experience focus produce distinct
+        RAG knowledge bases.
+        """
+        out: list[tuple[str, str]] = []
+
+        # Full raw text — high-recall fallback
+        if parsed.raw_text:
+            out.append(("resume_raw", parsed.raw_text[:6000]))
+
+        try:
+            rd: dict = json.loads(parsed.structured_json) or {}
+        except (json.JSONDecodeError, TypeError):
+            return out  # raw text only
+
+        # Contact / identity
+        contact_parts: list[str] = []
+        for field in ("full_name", "headline", "location", "email", "phone", "linkedin", "github"):
+            val = rd.get(field)
+            if val:
+                contact_parts.append(f"{field.replace('_', ' ').title()}: {val}")
+        if rd.get("summary"):
+            contact_parts.append(f"Summary: {rd['summary']}")
+        if contact_parts:
+            out.append(("resume_identity", "\n".join(contact_parts)))
+
+        # Skills
+        skills = rd.get("skills", [])
+        if skills:
+            out.append(("resume_skills", "Skills: " + ", ".join(skills)))
+
+        # Work experience
+        for e in rd.get("work_experience", []):
+            text = f"{e.get('role', '')} at {e.get('company', '')} ({e.get('start_date', '')} – {e.get('end_date', 'Present')})."
+            if e.get("description"):
+                text += f"\n{e['description']}"
+            out.append(("resume_experience", text))
+
+        # Education
+        for e in rd.get("education", []):
+            out.append((
+                "resume_education",
+                f"{e.get('degree', '')} in {e.get('field_of_study', '')} at {e.get('institution', '')} "
+                f"({e.get('start_date', '')} – {e.get('end_date', '')})",
+            ))
+
+        # Projects
+        for p in rd.get("projects", []):
+            text = f"Project: {p.get('name', '')}"
+            if p.get("technologies"):
+                text += f" | Tech: {p['technologies']}"
+            if p.get("description"):
+                text += f"\n{p['description']}"
+            out.append(("resume_project", text))
+
+        # Certifications
+        certs = rd.get("certifications", [])
+        if certs:
+            cert_lines = [
+                f"{c.get('name', '')} — {c.get('issuer', '')} ({c.get('issue_date', '')})"
+                for c in certs
+            ]
+            out.append(("resume_certifications", "Certifications:\n" + "\n".join(cert_lines)))
 
         return out
 

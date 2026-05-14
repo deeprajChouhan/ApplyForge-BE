@@ -1,3 +1,3 @@
-from app.services.storage.service import S3StorageService
+from app.services.storage.service import LocalStorageService, S3StorageService, get_storage_service
 
-__all__ = ["S3StorageService"]
+__all__ = ["S3StorageService", "LocalStorageService", "get_storage_service"]

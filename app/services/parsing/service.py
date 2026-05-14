@@ -9,14 +9,14 @@ from sqlalchemy.orm import Session
 
 from app.models.enums import FileType
 from app.models.models import ParsedResumeData, UploadedFile
-from app.services.storage import S3StorageService
+from app.services.storage import get_storage_service
 
 
 class ResumeParsingService:
     def __init__(self, db: Session, user_id: int):
         self.db = db
         self.user_id = user_id
-        self.storage = S3StorageService()
+        self.storage = get_storage_service()
 
     async def save_upload(self, upload: UploadFile) -> UploadedFile:
         suffix = Path(upload.filename).suffix.lower()
@@ -63,18 +63,24 @@ class ResumeParsingService:
         self.db.commit()
         self.db.refresh(parsed)
 
-        # ── Auto-rebuild the RAG knowledge index ──────────────────────────────
-        # This ensures the parsed resume data is immediately available for
-        # JD analysis and document generation via RAG — no manual rebuild needed.
+        # ── Auto-build the per-resume RAG knowledge index ─────────────────────
+        # For PRO multi-resume: index this specific resume's content tagged with
+        # parsed_resume_id so it can be selected independently per application.
+        # Falls back to a full rebuild on error (non-fatal).
         try:
             from app.services.rag.service import RAGService
-            RAGService(self.db, self.user_id).rebuild_index()
+            rag = RAGService(self.db, self.user_id)
+            rag.rebuild_index_for_resume(parsed.id)
         except Exception as exc:
-            # Non-fatal: parse result is already saved; user can manually rebuild if needed
             import logging
             logging.getLogger(__name__).warning(
-                "RAG index rebuild failed after resume parse (non-fatal): %s", exc
+                "Per-resume RAG index build failed (non-fatal): %s", exc
             )
+            # Best-effort fallback: full index rebuild keeps legacy behaviour working
+            try:
+                RAGService(self.db, self.user_id).rebuild_index()
+            except Exception:
+                pass
 
         return parsed
 
@@ -157,12 +163,11 @@ class ResumeParsingService:
             }
 
     def _extract_text(self, file_path: str) -> str:
-        if not file_path.startswith("s3://"):
-            return self._extract_text_from_bytes(Path(file_path).read_bytes(), Path(file_path).suffix)
-
-        content = self.storage.download_bytes(file_path)
-        suffix = Path(file_path).suffix
-        return self._extract_text_from_bytes(content, suffix)
+        if file_path.startswith("s3://") or file_path.startswith("local://"):
+            content = self.storage.download_bytes(file_path)
+            suffix = Path(file_path).suffix
+            return self._extract_text_from_bytes(content, suffix)
+        return self._extract_text_from_bytes(Path(file_path).read_bytes(), Path(file_path).suffix)
 
     def _extract_text_from_bytes(self, content: bytes, suffix: str) -> str:
         ext = suffix.lower()

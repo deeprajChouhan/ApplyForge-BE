@@ -3,6 +3,14 @@ from pydantic import BaseModel
 from app.models.enums import ApplicationStatus, DocumentType
 
 
+class SetResumeRequest(BaseModel):
+    """
+    Body for PATCH /applications/{id}/resume.
+    Set parsed_resume_id=null to revert to latest-resume (default) behaviour.
+    """
+    parsed_resume_id: int | None = None
+
+
 class ApplicationCreate(BaseModel):
     company_name: str
     role_title: str
@@ -28,6 +36,8 @@ class ApplicationOut(BaseModel):
     fit_score: float | None = None
     competition_score: float | None = None
     priority_score: float | None = None
+    # PRO: which parsed resume is selected for this application (None = use latest)
+    selected_resume_id: int | None = None
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -78,6 +88,17 @@ class ScoreResponse(BaseModel):
     fit_breakdown: dict[str, float] = {}
     recommendation: str
     label: str
+    # Enriched preview fields (populated by /utils/score-preview)
+    job_summary: str = ""
+    key_requirements: list[str] = []
+    why_score: str = ""
+    reply_probability: float = 0.0
+    reply_label: str = ""
+    reply_reasoning: str = ""
+    required_yoe: int | None = None
+    detected_seniority: str | None = None
+    work_type: str = ""
+    contract_type: str = ""
 
 
 class ScorePreviewRequest(BaseModel):
@@ -87,3 +108,17 @@ class ScorePreviewRequest(BaseModel):
     """
     jd_text: str
     company_name: str = ""
+    role_title: str = ""
+
+
+class CoverLetterExportRequest(BaseModel):
+    """
+    Recipient details collected before exporting a cover letter.
+    The backend merges these with the user's own profile data (name, email,
+    phone, location) pulled from the DB / parsed resume so every [placeholder]
+    in the generated content is replaced with real information.
+    """
+    recipient_name: str = "Hiring Manager"
+    recipient_title: str | None = None
+    company_address: str | None = None
+    export_format: str = "pdf"   # "pdf" | "docx"

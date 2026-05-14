@@ -43,7 +43,7 @@ from app.models.models import (
     UserProfile,
     WorkExperience,
 )
-from app.schemas.suggestions import SuggestionOut, SuggestionsResponse
+from app.schemas.suggestions import ApplySuggestionRequest, CustomizationOut, SuggestionOut, SuggestionsResponse
 from app.services.ai.factory import get_llm_provider
 
 logger = structlog.get_logger(__name__)
@@ -248,6 +248,116 @@ Return ONLY a valid JSON array. No markdown, no commentary. Maximum 8 suggestion
             raise HTTPException(status_code=502, detail="Unexpected AI response shape.")
 
         return suggestions
+
+    # ── Per-application customizations ───────────────────────────────────
+
+    def apply_suggestion(self, app_id: int, suggestion: SuggestionOut) -> CustomizationOut:
+        """
+        Persist a suggestion as an application-specific override.
+        The global profile (skills / experiences / projects tables) is
+        NOT touched — only this application's customizations_json changes.
+        """
+        from app.models.models import ApplicationCustomization
+
+        # Verify ownership
+        self._get_application(app_id)
+
+        # Load or create the customization record
+        customization = (
+            self.db.query(ApplicationCustomization)
+            .filter_by(application_id=app_id, user_id=self.user_id)
+            .first()
+        )
+        if not customization:
+            customization = ApplicationCustomization(
+                application_id=app_id,
+                user_id=self.user_id,
+                customizations_json="{}",
+            )
+            self.db.add(customization)
+
+        try:
+            data: dict = json.loads(customization.customizations_json or "{}")
+        except json.JSONDecodeError:
+            data = {}
+
+        data.setdefault("skills_add", [])
+        data.setdefault("experiences_update", {})
+        data.setdefault("projects_add", [])
+        data.setdefault("applied_suggestions", [])
+
+        # Merge the incoming suggestion into the right payload bucket
+        if suggestion.action == "add" and suggestion.section == "skills":
+            existing_names = {s.get("name", "").lower() for s in data["skills_add"]}
+            if suggestion.payload.get("name", "").lower() not in existing_names:
+                data["skills_add"].append(suggestion.payload)
+
+        elif (
+            suggestion.action == "update"
+            and suggestion.section == "experiences"
+            and suggestion.target_id is not None
+        ):
+            data["experiences_update"][str(suggestion.target_id)] = suggestion.payload
+
+        elif suggestion.action == "add" and suggestion.section == "projects":
+            data["projects_add"].append(suggestion.payload)
+
+        # Also store the full suggestion object so the UI can show a
+        # "Previously Applied" list without needing to re-call the LLM.
+        existing_ids = {s.get("id") for s in data["applied_suggestions"]}
+        if suggestion.id not in existing_ids:
+            data["applied_suggestions"].append(suggestion.model_dump())
+
+        customization.customizations_json = json.dumps(data)
+        self.db.commit()
+
+        logger.info(
+            "suggestion_applied_to_app",
+            app_id=app_id,
+            user_id=self.user_id,
+            section=suggestion.section,
+            action=suggestion.action,
+        )
+
+        return self._build_customization_out(app_id, data)
+
+    def get_customizations(self, app_id: int) -> CustomizationOut:
+        """Return the current per-application customizations (read-only)."""
+        from app.models.models import ApplicationCustomization
+
+        self._get_application(app_id)
+
+        customization = (
+            self.db.query(ApplicationCustomization)
+            .filter_by(application_id=app_id, user_id=self.user_id)
+            .first()
+        )
+        if not customization:
+            return CustomizationOut(application_id=app_id)
+
+        try:
+            data = json.loads(customization.customizations_json or "{}") or {}
+        except json.JSONDecodeError:
+            data = {}
+
+        return self._build_customization_out(app_id, data)
+
+    @staticmethod
+    def _build_customization_out(app_id: int, data: dict) -> CustomizationOut:
+        skills_add          = data.get("skills_add", [])
+        experiences_update  = data.get("experiences_update", {})
+        projects_add        = data.get("projects_add", [])
+        applied_suggestions = data.get("applied_suggestions", [])
+        return CustomizationOut(
+            application_id=app_id,
+            skills_add=skills_add,
+            experiences_update=experiences_update,
+            projects_add=projects_add,
+            applied_count=len(applied_suggestions) or (
+                len(skills_add) + len(experiences_update) + len(projects_add)
+            ),
+            applied_suggestions=applied_suggestions,
+        )
 
     # ── Hydration ─────────────────────────────────────────────────────────
 

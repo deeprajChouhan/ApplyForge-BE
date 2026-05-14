@@ -15,8 +15,8 @@ PLAN_TOKEN_BUDGETS: dict[str, int] = {
 # Features automatically granted per plan on registration
 PLAN_DEFAULT_FEATURES: dict[str, list] = {
     PlanTier.free: [FeatureFlag.jd_analyze, FeatureFlag.applications, FeatureFlag.resume],
-    PlanTier.pro: [FeatureFlag.jd_analyze, FeatureFlag.applications, FeatureFlag.kanban, FeatureFlag.resume, FeatureFlag.chat],
-    PlanTier.enterprise: [FeatureFlag.jd_analyze, FeatureFlag.applications, FeatureFlag.kanban, FeatureFlag.resume, FeatureFlag.chat],
+    PlanTier.pro: [FeatureFlag.jd_analyze, FeatureFlag.applications, FeatureFlag.kanban, FeatureFlag.resume, FeatureFlag.chat, FeatureFlag.multi_resume],
+    PlanTier.enterprise: [FeatureFlag.jd_analyze, FeatureFlag.applications, FeatureFlag.kanban, FeatureFlag.resume, FeatureFlag.chat, FeatureFlag.multi_resume],
 }
 
 
@@ -135,6 +135,11 @@ class KnowledgeDocument(Base, TimestampMixin):
     source_type: Mapped[str] = mapped_column(String(50))
     source_ref: Mapped[str | None] = mapped_column(String(100))
     content: Mapped[str] = mapped_column(Text)
+    # When set, this document belongs to a specific uploaded resume's knowledge base.
+    # NULL = legacy full-profile index (backward-compatible).
+    parsed_resume_id: Mapped[int | None] = mapped_column(
+        ForeignKey("parsed_resume_data.id", ondelete="CASCADE"), nullable=True, index=True
+    )
 
 
 class KnowledgeChunk(Base, TimestampMixin):
@@ -147,6 +152,10 @@ class KnowledgeChunk(Base, TimestampMixin):
     # Nullable: vectors are stored in Qdrant; this column is kept for schema
     # compatibility but is no longer populated by RAGService.
     embedding: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Mirrors parsed_resume_id from the parent KnowledgeDocument for fast filtering.
+    parsed_resume_id: Mapped[int | None] = mapped_column(
+        ForeignKey("parsed_resume_data.id", ondelete="CASCADE"), nullable=True, index=True
+    )
     __table_args__ = (Index("idx_chunks_doc_chunk", "document_id", "chunk_index"),)
 
 
@@ -164,6 +173,11 @@ class JobApplication(Base, TimestampMixin):
     fit_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     competition_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     priority_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # PRO: which parsed resume this application uses for RAG and document generation.
+    # NULL = use the latest parsed resume (free-tier / default behaviour).
+    selected_resume_id: Mapped[int | None] = mapped_column(
+        ForeignKey("parsed_resume_data.id", ondelete="SET NULL"), nullable=True, index=True
+    )
 
 
 class GeneratedDocument(Base, TimestampMixin):
@@ -236,6 +250,28 @@ class UsageEvent(Base):
     tokens_out: Mapped[int] = mapped_column(Integer, default=0)
     model: Mapped[str] = mapped_column(String(100))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
+class ApplicationCustomization(Base, TimestampMixin):
+    """
+    Per-application resume customizations applied from AI suggestions.
+    Stored separately from the master profile so each job gets its own
+    tailored resume without polluting shared profile data.
+
+    customizations_json structure:
+    {
+        "skills_add":          [{"name": "Docker", "level": "intermediate"}, ...],
+        "experiences_update":  {"<exp_id>": {"description": "improved bullets…"}, ...},
+        "projects_add":        [{"name": "…", "description": "…", "technologies": "…"}, …]
+    }
+    """
+    __tablename__ = "application_customizations"
+    id:             Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id:        Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    application_id: Mapped[int] = mapped_column(
+        ForeignKey("job_applications.id", ondelete="CASCADE"), unique=True, index=True
+    )
+    customizations_json: Mapped[str] = mapped_column(Text, default="{}")
 
 
 # LinkedIn Connections (Phase 2 -- LinkedIn CSV ingestion)

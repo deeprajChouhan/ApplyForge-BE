@@ -56,3 +56,4 @@ class FeatureFlag(str, enum.Enum):
     kanban = "kanban"                   # Kanban board view (pro+)
     resume = "resume"                   # Resume upload, parsing, and knowledge base
     chat = "chat"                       # AI chat assistant per application (pro+)
+    multi_resume = "multi_resume"       # Multiple resumes + per-application RAG (pro+)

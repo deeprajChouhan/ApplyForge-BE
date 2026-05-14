@@ -39,3 +39,27 @@ class SuggestionsResponse(BaseModel):
 
     application_id: int
     suggestions: list[SuggestionOut]
+
+
+class ApplySuggestionRequest(BaseModel):
+    """
+    Request body for POST /applications/{app_id}/suggestions/apply.
+    Carries a single suggestion whose payload should be stored as an
+    application-specific override — the global profile is NOT mutated.
+    """
+    suggestion: SuggestionOut
+
+
+class CustomizationOut(BaseModel):
+    """
+    Current per-application customizations (applied AI suggestions).
+    Returned by POST /suggestions/apply and GET /customizations.
+    """
+    application_id: int
+    skills_add:           list[dict[str, Any]] = []
+    experiences_update:   dict[str, dict[str, Any]] = {}
+    projects_add:         list[dict[str, Any]] = []
+    applied_count: int = 0
+    # Full suggestion objects stored in application order — used by the
+    # frontend "Previously Applied" panel without re-generating suggestions.
+    applied_suggestions:  list[SuggestionOut] = []

@@ -5,8 +5,9 @@ from sqlalchemy.orm import Session
 from fastapi import HTTPException
 
 from app.models.models import (
-    ApplicationChat, ApplicationStatusHistory, Certification, Education, GeneratedDocument,
-    JobApplication, Project, Skill, User, UserProfile, WorkExperience,
+    ApplicationChat, ApplicationCustomization, ApplicationStatusHistory, Certification,
+    Education, GeneratedDocument, JobApplication, Project, Skill, User, UserProfile,
+    WorkExperience,
 )
 from app.models.enums import ApplicationStatus
 from app.services.ai.exceptions import AIProviderError
@@ -58,6 +59,14 @@ class ApplicationService:
         old_status = app.status
         app.status = new_status
         self.db.add(ApplicationStatusHistory(application_id=app.id, old_status=old_status, new_status=new_status, note=note))
+        self.db.commit()
+        self.db.refresh(app)
+        return app
+
+    def set_resume(self, app_id: int, parsed_resume_id: int | None) -> JobApplication:
+        """Pin a specific parsed resume to this application, or clear it (None = use latest)."""
+        app = self.get(app_id)
+        app.selected_resume_id = parsed_resume_id
         self.db.commit()
         self.db.refresh(app)
         return app
@@ -115,6 +124,23 @@ class ApplicationService:
                     skills.append(rs)
 
         return skills
+
+    def _load_customizations(self, app_id: int) -> dict:
+        """
+        Return the parsed customizations_json for this application, or an
+        empty dict if none has been saved yet.
+        """
+        row = (
+            self.db.query(ApplicationCustomization)
+            .filter_by(application_id=app_id, user_id=self.user_id)
+            .first()
+        )
+        if not row:
+            return {}
+        try:
+            return json.loads(row.customizations_json) or {}
+        except (json.JSONDecodeError, TypeError):
+            return {}
 
     # ── Profile builder ───────────────────────────────────────────────────
 
@@ -353,8 +379,13 @@ class ApplicationService:
         """
         (Re)compute and persist Priority Score for an existing application.
         Requires jd_analysis_json to already be present — run analyze_jd first.
-        Reachability is refreshed from the stored value so Phase 2 updates flow through.
+
+        Per-application AI suggestion overrides (applied skills, updated experience
+        descriptions, added projects) are merged in before scoring so Recalculate
+        reflects the improvements the user has already applied.
         """
+        from types import SimpleNamespace
+
         app = self.get(app_id)
         if not app.jd_analysis_json:
             raise HTTPException(
@@ -362,11 +393,76 @@ class ApplicationService:
                 detail="Run JD analysis first — Priority Score requires it.",
             )
 
-        jd_analysis = json.loads(app.jd_analysis_json)
+        jd_analysis    = json.loads(app.jd_analysis_json)
         profile_skills = self._get_profile_skills()
 
         work_experiences = self.db.query(WorkExperience).filter_by(user_id=self.user_id).order_by(WorkExperience.start_date.desc()).all()
         educations       = self.db.query(Education).filter_by(user_id=self.user_id).all()
+
+        # ── Merge per-application AI suggestion overrides before scoring ──────
+        customizations = self._load_customizations(app_id)
+        exp_overrides  = customizations.get("experiences_update", {})
+        extra_skills   = customizations.get("skills_add", [])
+        extra_projects = customizations.get("projects_add", [])
+
+        # 1. Merge applied skills
+        seen_skills = {s.lower().strip() for s in profile_skills}
+        for skill_payload in extra_skills:
+            name = (skill_payload.get("name") or "").strip()
+            if name and name.lower() not in seen_skills:
+                profile_skills.append(name)
+                seen_skills.add(name.lower())
+
+        # 2. Apply experience description overrides without mutating ORM objects
+        if exp_overrides:
+            patched = []
+            for exp in work_experiences:
+                override = exp_overrides.get(str(exp.id), {})
+                if override and "description" in override:
+                    ns = SimpleNamespace(
+                        id=exp.id, role=exp.role, company=exp.company,
+                        description=override["description"],
+                        start_date=exp.start_date, end_date=exp.end_date,
+                    )
+                    patched.append(ns)
+                else:
+                    patched.append(exp)
+            work_experiences = patched  # type: ignore[assignment]
+
+        # 3. Project technologies as extra skill signals
+        for proj in extra_projects:
+            techs = (proj.get("technologies") or "").replace(",", " ").split()
+            for tech in techs:
+                tech = tech.strip()
+                if tech and tech.lower() not in seen_skills:
+                    profile_skills.append(tech)
+                    seen_skills.add(tech.lower())
+
+        # 4. Re-evaluate cached JD gaps against the NOW-updated profile.
+        #
+        #    jd_analysis_json was produced at analysis time and encodes
+        #    unsupported_gaps from the original profile.  After applying
+        #    suggestions the gap list is stale: FitScorer's Strengths/Gaps
+        #    signal (15 pts) would never move without this step.
+        #
+        #    If a gap's text overlaps substantially with any skill now in the
+        #    profile it is promoted to strengths and dropped from gaps.
+        jd_analysis = dict(jd_analysis)   # shallow copy
+        live_gaps: list = []
+        promoted:  list = []
+        for gap in jd_analysis.get("unsupported_gaps", []):
+            gap_l     = gap.lower()
+            gap_words = {w for w in re.split(r"\W+", gap_l) if len(w) > 2}
+            covered   = any(
+                gap_l in sk or sk in gap_l
+                or bool(gap_words & {w for w in re.split(r"\W+", sk) if len(w) > 2})
+                for sk in seen_skills
+            )
+            (promoted if covered else live_gaps).append(gap)
+
+        if promoted:
+            jd_analysis["unsupported_gaps"] = live_gaps
+            jd_analysis["strengths"] = jd_analysis.get("strengths", []) + promoted
 
         fit, fit_breakdown = FitScorer.score(
             jd_analysis, profile_skills,

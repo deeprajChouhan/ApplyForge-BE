@@ -430,3 +430,244 @@ class PriorityScorer:
             "recommendation":    recommendation,
             "label":             label,
         }
+
+
+
+# -- JD Insight Extractor -----------------------------------------------------
+
+class JDInsightExtractor:
+    """
+    Lightweight, regex-based JD parser - no LLM required.
+
+    Extracts:
+      - required years of experience
+      - seniority level
+      - work type (Remote / Hybrid / On-site)
+      - contract type (Full-time / Part-time / Contract)
+      - top skill keywords detected in the JD
+      - a short human-readable job summary
+    """
+
+    _YOE_RE = re.compile(r'(\d+)\+?\s*(?:to\s*\d+\s*)?years?', re.IGNORECASE)
+
+    _SENIORITY_MAP = [
+        (["cto", "ceo", "cpo", "coo", "cfo"],                        "C-Suite"),
+        (["vice president", "vp "],                                   "VP"),
+        (["head of", "director"],                                     "Director"),
+        (["principal", "architect", "distinguished"],                 "Principal / Architect"),
+        (["staff engineer", "staff "],                                "Staff"),
+        (["engineering manager", "tech lead", "lead "],               "Lead / Manager"),
+        (["senior", "sr."],                                           "Senior"),
+        (["mid level", "mid-level", "intermediate", "associate"],     "Mid-Level"),
+        (["junior", "jr.", "entry level", "entry-level", "graduate",
+          "fresher"],                                                  "Junior"),
+        (["intern", "internship"],                                     "Intern"),
+    ]
+
+    _WORK_TYPE = [
+        (["remote", "work from home", "wfh", "fully remote"],  "Remote"),
+        (["hybrid"],                                             "Hybrid"),
+        (["on-site", "onsite", "in-office", "office-based"],   "On-site"),
+    ]
+
+    _CONTRACT = [
+        (["part-time", "part time"],              "Part-time"),
+        (["contract", "freelance", "contractor"], "Contract"),
+        (["full-time", "full time", "permanent"], "Full-time"),
+    ]
+
+    _SKILLS = [
+        "machine learning", "deep learning", "computer vision",
+        "natural language processing", "large language model",
+        "next.js", "node.js", "vue.js",
+        "react native", "react",
+        "postgresql", "mongodb", "elasticsearch", "redis",
+        "kubernetes", "terraform", "docker",
+        "typescript", "javascript", "python", "java", "golang", "rust",
+        "c++", "c#", "ruby", "php", "swift", "kotlin",
+        "aws", "gcp", "azure",
+        "fastapi", "django", "flask", "spring",
+        "graphql", "rest api", "microservices",
+        "ci/cd", "devops", "agile", "scrum",
+        "sql", "data engineering", "spark", "kafka",
+        "rag", "vector database", "embeddings", "langchain",
+        "llm", "pytorch", "tensorflow",
+    ]
+
+    @classmethod
+    def extract(cls, jd_text, company_name="", role_title=""):
+        text_lower = jd_text.lower()
+
+        yoe_match    = cls._YOE_RE.search(jd_text)
+        required_yoe = int(yoe_match.group(1)) if yoe_match else None
+
+        detected_seniority = None
+        for keywords, label in cls._SENIORITY_MAP:
+            if any(kw in text_lower for kw in keywords):
+                detected_seniority = label
+                break
+
+        work_type = "Not Specified"
+        for signals, label in cls._WORK_TYPE:
+            if any(s in text_lower for s in signals):
+                work_type = label
+                break
+
+        contract_type = "Not Specified"
+        for signals, label in cls._CONTRACT:
+            if any(s in text_lower for s in signals):
+                contract_type = label
+                break
+
+        found_skills = [skill for skill in cls._SKILLS if skill in text_lower][:8]
+        job_summary  = cls._extract_summary(jd_text, role_title, company_name)
+
+        return {
+            "required_yoe":       required_yoe,
+            "detected_seniority": detected_seniority,
+            "work_type":          work_type,
+            "contract_type":      contract_type,
+            "key_skills":         found_skills,
+            "job_summary":        job_summary,
+        }
+
+    @classmethod
+    def _extract_summary(cls, jd_text, role_title, company_name):
+        if not jd_text or len(jd_text) < 50:
+            parts = [p for p in [role_title, company_name] if p]
+            return " at ".join(parts) + "." if parts else "No description available."
+
+        sentences = re.split(r'(?<=[.!?])\s+', jd_text.strip())
+        chosen = []
+        for s in sentences:
+            s = s.strip()
+            if len(s) > 40 and s[:1] not in ("*", "-", "+", ".", chr(8226)):
+                chosen.append(s)
+            if len(chosen) >= 2:
+                break
+
+        return " ".join(chosen) if chosen else jd_text[:200].strip()
+
+
+# -- Reply Predictor ----------------------------------------------------------
+
+class ReplyPredictor:
+    """
+    Custom algorithm estimating reply probability (0-100).
+
+    Signals (additive, capped at [10, 95])
+    Base                     50
+    Competition penalty      up to -30
+    Staffing agency bonus    +10
+    Remote penalty           -8
+    Part-time/contract       +5
+    Urgency bonus            +12
+    Detailed JD bonus        +5
+    Big-tech penalty         -10
+    """
+
+    _STAFFING = [
+        "staffing", "recruitment", "recruiter", "talent agency",
+        "hiring agency", "manpower", "workforce", "placement",
+        "headhunt", "headhunting",
+    ]
+    _URGENCY = [
+        "immediately", "asap", "urgent", "right away",
+        "as soon as possible", "immediate start", "immediate joining",
+        "start immediately",
+    ]
+    _BIG_TECH = frozenset([
+        "google", "meta", "apple", "amazon", "microsoft", "netflix",
+        "uber", "stripe", "airbnb", "openai", "anthropic", "deepmind",
+        "salesforce", "oracle", "ibm", "nvidia", "tesla",
+    ])
+
+    @classmethod
+    def predict(cls, competition_score, jd_text, company_name,
+                work_type="", contract_type=""):
+        text_lower    = (jd_text or "").lower()
+        company_lower = (company_name or "").lower()
+        reasons = []
+        score   = 50.0
+
+        comp_penalty = -(competition_score / 100.0) * 30.0
+        score += comp_penalty
+        if competition_score >= 70:
+            reasons.append("highly selective role")
+        elif competition_score >= 45:
+            reasons.append("moderate competition")
+        else:
+            reasons.append("less competitive opening")
+
+        is_staffing = any(s in company_lower or s in text_lower for s in cls._STAFFING)
+        if is_staffing:
+            score += 10
+            reasons.append("staffing agencies respond more consistently")
+
+        if work_type == "Remote":
+            score -= 8
+            reasons.append("remote roles attract a global applicant pool")
+
+        if contract_type in ("Part-time", "Contract"):
+            score += 5
+            reasons.append("smaller applicant pool for non-permanent roles")
+
+        if any(sig in text_lower for sig in cls._URGENCY):
+            score += 12
+            reasons.append("urgent hire — expect faster responses")
+
+        if len(jd_text) > 500:
+            score += 5
+            reasons.append("detailed JD suggests a targeted search")
+
+        if any(name in company_lower for name in cls._BIG_TECH):
+            score -= 10
+            reasons.append("top-tier company receives thousands of applications")
+
+        probability = round(max(10.0, min(score, 95.0)), 1)
+
+        if probability >= 60:
+            label = "High"
+        elif probability >= 38:
+            label = "Medium"
+        else:
+            label = "Low"
+
+        reasoning = "; ".join(reasons[:3]).capitalize() if reasons else \
+            "Based on role competitiveness and company type"
+
+        return probability, label, reasoning
+
+
+# -- Score Explainer ----------------------------------------------------------
+
+def explain_preview_score(fit_score, competition_score, insights):
+    """Plain-English explanation of the preview score."""
+    parts = []
+    parts.append(
+        "Fit score shows as neutral (50/100) in preview "
+        "— your full profile match is calculated once you save the job."
+    )
+    ease = 100.0 - competition_score
+    if competition_score >= 70:
+        parts.append(
+            "Competition looks tough (Opportunity: {:.0f}/100). "
+            "Senior seniority signals or high YoE requirements are driving selectivity up.".format(ease)
+        )
+    elif competition_score >= 45:
+        parts.append(
+            "Moderate competition (Opportunity: {:.0f}/100). "
+            "Standard hiring bar — a strong application can stand out.".format(ease)
+        )
+    else:
+        parts.append(
+            "Low competition (Opportunity: {:.0f}/100). "
+            "Good window — fewer applicants expected for this type of role.".format(ease)
+        )
+    yoe = insights.get("required_yoe")
+    if yoe:
+        parts.append("The role explicitly asks for {}+ years of experience.".format(yoe))
+    seniority = insights.get("detected_seniority")
+    if seniority:
+        parts.append("Seniority level detected: {}.".format(seniority))
+    return " ".join(parts)
