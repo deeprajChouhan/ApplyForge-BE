@@ -91,32 +91,69 @@ class S3StorageService:
             )
 
         self.bucket: str = settings.s3_bucket  # type: ignore[assignment]
+
+        # Support plain-HTTP endpoints (e.g. internal Docker hostnames like
+        # http://seaweedfs-s3:8333).  boto3 defaults to SSL=True which causes
+        # connection failures against non-TLS endpoints.
+        endpoint_url: str = settings.s3_endpoint_url  # type: ignore[assignment]
+        use_ssl: bool = endpoint_url.startswith("https://")
+
         self.client: BaseClient = boto3.client(
             "s3",
-            endpoint_url=settings.s3_endpoint_url,
+            endpoint_url=endpoint_url,
             aws_access_key_id=settings.s3_access_key,
             aws_secret_access_key=settings.s3_secret_key_value,
             region_name=settings.s3_region,
-            config=Config(s3={"addressing_style": "path"}),
+            use_ssl=use_ssl,
+            verify=use_ssl,  # skip cert verification for plain HTTP
+            config=Config(
+                s3={"addressing_style": "path"},
+                # Tight timeouts for self-hosted S3 (SeaweedFS / MinIO / RustFS)
+                connect_timeout=5,      # seconds to establish TCP connection
+                read_timeout=30,        # seconds to wait for response after connect
+                retries={
+                    "max_attempts": 2,  # 1 initial + 1 retry (vs boto3 default of 5)
+                    "mode": "standard",
+                },
+            ),
         )
-        logger.info("s3_storage_init endpoint=%s bucket=%s", settings.s3_endpoint_url, self.bucket)
+        logger.info(
+            "s3_storage_init endpoint=%s bucket=%s use_ssl=%s",
+            endpoint_url, self.bucket, use_ssl,
+        )
 
     # ── Core ────────────────────────────────────────────────────────────────
 
     def upload_bytes(self, *, content: bytes, key_prefix: str, filename: str, content_type: str | None) -> str:
+        from fastapi import HTTPException
         key = f"{key_prefix}/{uuid4().hex}_{filename}"
         extra: dict[str, str] = {}
         if content_type:
             extra["ContentType"] = content_type
-        self.client.put_object(Bucket=self.bucket, Key=key, Body=BytesIO(content), **extra)
+        try:
+            self.client.put_object(Bucket=self.bucket, Key=key, Body=BytesIO(content), **extra)
+        except Exception as exc:
+            logger.error("s3_upload_failed key=%s error=%s", key, exc)
+            raise HTTPException(
+                status_code=503,
+                detail="File storage is temporarily unavailable. Please try again in a moment.",
+            ) from exc
         uri = f"s3://{self.bucket}/{key}"
         logger.debug("s3_upload key=%s bytes=%d", key, len(content))
         return uri
 
     def download_bytes(self, uri: str) -> bytes:
+        from fastapi import HTTPException
         bucket, key = self._parse_uri(uri)
-        response = self.client.get_object(Bucket=bucket, Key=key)
-        return response["Body"].read()
+        try:
+            response = self.client.get_object(Bucket=bucket, Key=key)
+            return response["Body"].read()
+        except Exception as exc:
+            logger.error("s3_download_failed key=%s error=%s", key, exc)
+            raise HTTPException(
+                status_code=503,
+                detail="File could not be retrieved from storage. Please try again.",
+            ) from exc
 
     def delete_file(self, uri: str) -> None:
         try:
