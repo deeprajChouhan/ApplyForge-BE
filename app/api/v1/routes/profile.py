@@ -22,6 +22,7 @@ from app.services.linkedin.service import LinkedInService, parse_linkedin_csv
 from app.services.parsing.service import ResumeParsingService
 from app.services.profile.service import PROFILE_MODELS, ProfileService, delete_owned, list_owned, upsert_owned
 from app.services.rag.service import RAGService
+from app.services.storage.service import get_storage_service
 
 router = APIRouter(prefix="/profile", tags=["profile"])
 _need_resume = Depends(require_feature(FeatureFlag.resume))
@@ -185,6 +186,7 @@ def resume_history(user: User = Depends(get_current_user), db: Session = Depends
     return [
         {
             "parse_id": row.id,
+            "file_id": row.uploaded_file_id,
             "filename": filename,
             "confidence_score": row.confidence_score,
             "parsed_at": row.created_at.isoformat(),
@@ -204,6 +206,36 @@ async def upload_resume(file: UploadFile = File(...), user: User = Depends(get_c
 def parse_resume(file_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     parsed = ResumeParsingService(db, user.id).parse_resume(file_id)
     return ResumeParseResponse(parse_id=parsed.id, confidence_score=parsed.confidence_score, structured_data=json.loads(parsed.structured_json))
+
+
+@router.delete("/resume/upload/{file_id}", status_code=204, dependencies=[_need_resume])
+def delete_uploaded_file(file_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Delete an uploaded resume file from storage and the database."""
+    from app.models.models import UploadedFile
+    f = db.query(UploadedFile).filter_by(id=file_id, user_id=user.id).first()
+    if not f:
+        raise HTTPException(status_code=404, detail="File not found")
+    get_storage_service().delete_file(f.path)
+    db.delete(f)
+    db.commit()
+
+
+@router.delete("/resume/parsed/{parse_id}", status_code=204, dependencies=[_need_resume])
+def delete_parsed_resume(parse_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Delete a parsed resume record (and its knowledge chunks) from the database."""
+    from app.models.models import ParsedResumeData
+    row = db.query(ParsedResumeData).filter_by(id=parse_id, user_id=user.id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Parsed resume not found")
+    # Optionally delete the underlying uploaded file too if still present
+    if row.uploaded_file_id:
+        from app.models.models import UploadedFile
+        uf = db.query(UploadedFile).filter_by(id=row.uploaded_file_id, user_id=user.id).first()
+        if uf:
+            get_storage_service().delete_file(uf.path)
+            db.delete(uf)
+    db.delete(row)
+    db.commit()
 
 
 @router.post("/knowledge/rebuild", dependencies=[_need_resume])

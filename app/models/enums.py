@@ -57,3 +57,17 @@ class FeatureFlag(str, enum.Enum):
     resume = "resume"                   # Resume upload, parsing, and knowledge base
     chat = "chat"                       # AI chat assistant per application (pro+)
     multi_resume = "multi_resume"       # Multiple resumes + per-application RAG (pro+)
+    job_crawler = "job_crawler"         # Automated daily job discovery crawler (pro+)
+
+
+class WorkType(str, enum.Enum):
+    remote = "remote"
+    hybrid = "hybrid"
+    onsite = "onsite"
+    any = "any"
+
+
+class CrawlSource(str, enum.Enum):
+    remoteok = "remoteok"
+    arbeitnow = "arbeitnow"
+    adzuna = "adzuna"

@@ -137,3 +137,23 @@ def health():
 
 
 app.include_router(api_router, prefix="/api/v1")
+
+
+@app.on_event("startup")
+def start_job_crawler_scheduler() -> None:
+    """Start the APScheduler background scheduler for automated job crawling."""
+    try:
+        from app.core.scheduler import start_scheduler
+        start_scheduler()
+    except Exception as exc:
+        logger.warning("Job crawler scheduler failed to start (non-fatal): %s", exc)
+
+
+@app.on_event("shutdown")
+def stop_job_crawler_scheduler() -> None:
+    """Gracefully stop the background scheduler on app shutdown."""
+    try:
+        from app.core.scheduler import stop_scheduler
+        stop_scheduler()
+    except Exception as exc:
+        logger.warning("Job crawler scheduler shutdown error (non-fatal): %s", exc)

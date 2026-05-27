@@ -15,8 +15,8 @@ PLAN_TOKEN_BUDGETS: dict[str, int] = {
 # Features automatically granted per plan on registration
 PLAN_DEFAULT_FEATURES: dict[str, list] = {
     PlanTier.free: [FeatureFlag.jd_analyze, FeatureFlag.applications, FeatureFlag.resume],
-    PlanTier.pro: [FeatureFlag.jd_analyze, FeatureFlag.applications, FeatureFlag.kanban, FeatureFlag.resume, FeatureFlag.chat, FeatureFlag.multi_resume],
-    PlanTier.enterprise: [FeatureFlag.jd_analyze, FeatureFlag.applications, FeatureFlag.kanban, FeatureFlag.resume, FeatureFlag.chat, FeatureFlag.multi_resume],
+    PlanTier.pro: [FeatureFlag.jd_analyze, FeatureFlag.applications, FeatureFlag.kanban, FeatureFlag.resume, FeatureFlag.chat, FeatureFlag.multi_resume, FeatureFlag.job_crawler],
+    PlanTier.enterprise: [FeatureFlag.jd_analyze, FeatureFlag.applications, FeatureFlag.kanban, FeatureFlag.resume, FeatureFlag.chat, FeatureFlag.multi_resume, FeatureFlag.job_crawler],
 }
 
 
@@ -293,3 +293,77 @@ class LinkedInConnection(Base, TimestampMixin):
     company: Mapped[str | None] = mapped_column(String(255), nullable=True)
     position: Mapped[str | None] = mapped_column(String(255), nullable=True)
     connected_on: Mapped[date | None] = mapped_column(Date, nullable=True)
+
+
+# ── Job Crawler Feature ────────────────────────────────────────────────────
+
+class CrawlerConfig(Base, TimestampMixin):
+    """
+    Per-user configuration for the automated job discovery crawler.
+    One row per user (created when they first configure the crawler).
+    """
+    __tablename__ = "crawler_configs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), unique=True, index=True)
+
+    is_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    # What to search for
+    job_roles: Mapped[str] = mapped_column(Text, default="[]")      # JSON array of role keywords
+    salary_min: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    salary_max: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    salary_currency: Mapped[str] = mapped_column(String(10), default="USD")
+    country: Mapped[str | None] = mapped_column(String(100), nullable=True)  # e.g. "us", "gb", "in"
+    work_type: Mapped[str] = mapped_column(String(20), default="any")         # remote/hybrid/onsite/any
+
+    # Which resume to match against (NULL = latest)
+    selected_resume_id: Mapped[int | None] = mapped_column(
+        ForeignKey("parsed_resume_data.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+
+    # Daily application goal
+    daily_goal: Mapped[int] = mapped_column(Integer, default=10)
+
+    # When the crawler last ran successfully
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class CrawledJob(Base, TimestampMixin):
+    """
+    A job discovered by the daily crawler for a specific user.
+    Unique per (user_id, source, external_id) — prevents re-adding the same posting.
+    """
+    __tablename__ = "crawled_jobs"
+    __table_args__ = (
+        UniqueConstraint("user_id", "source", "external_id", name="uq_crawled_job_user_source_ext"),
+        Index("ix_crawled_jobs_user_crawled", "user_id", "crawled_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+
+    source: Mapped[str] = mapped_column(String(50))          # "remoteok" | "arbeitnow" | "adzuna"
+    external_id: Mapped[str] = mapped_column(String(255))    # Job posting ID on the source site
+
+    title: Mapped[str] = mapped_column(String(255))
+    company: Mapped[str] = mapped_column(String(255))
+    location: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    work_type: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    salary_range: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    apply_url: Mapped[str] = mapped_column(String(1000))
+    tags: Mapped[str | None] = mapped_column(Text, nullable=True)   # JSON array of tags/skills
+
+    # AI scoring: how well does this job match the user's resume/preferences?
+    match_score: Mapped[float | None] = mapped_column(Float, nullable=True)    # 0-100
+    match_reason: Mapped[str | None] = mapped_column(Text, nullable=True)       # Short AI explanation
+
+    crawled_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+    # User actions
+    is_dismissed: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_saved: Mapped[bool] = mapped_column(Boolean, default=False)         # added to applications
+    application_id: Mapped[int | None] = mapped_column(
+        ForeignKey("job_applications.id", ondelete="SET NULL"), nullable=True
+    )

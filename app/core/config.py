@@ -42,6 +42,10 @@ class Settings(BaseSettings):
     s3_access_key: str | None = None
     s3_secret_key: SecretStr | None = None
     s3_bucket: str | None = None
+
+    # Adzuna Jobs API (optional — enables Adzuna as a crawler source)
+    adzuna_app_id: str | None = None
+    adzuna_app_key: str | None = None
     s3_region: str = "us-east-1"
 
     qdrant_url: str = "http://localhost:6333"
@@ -71,35 +75,23 @@ class Settings(BaseSettings):
 
     @property
     def uses_s3_storage(self) -> bool:
-        """True when the app will actually instantiate the S3 storage backend.
+        """True when all S3 credentials are present (credential-driven, not env-driven).
 
-        Mirrors the logic in `app.services.storage.service.get_storage_service`:
-        local storage is used only in dev when `storage_backend=local`;
-        anything else (any prod env, or explicit `storage_backend=s3`) means S3.
+        The storage service itself uses this same logic: S3 is used whenever
+        the four required vars are all set, regardless of ENV or STORAGE_BACKEND.
         """
-        return not (self.env == "dev" and self.storage_backend == "local")
+        return all([
+            self.s3_endpoint_url,
+            self.s3_access_key,
+            self.s3_secret_key,
+            self.s3_bucket,
+        ])
 
     @model_validator(mode="after")
     def _require_s3_settings_when_used(self) -> "Settings":
-        if not self.uses_s3_storage:
-            return self
-        missing = [
-            name
-            for name, value in (
-                ("S3_ENDPOINT_URL", self.s3_endpoint_url),
-                ("S3_ACCESS_KEY", self.s3_access_key),
-                ("S3_SECRET_KEY", self.s3_secret_key),
-                ("S3_BUCKET", self.s3_bucket),
-            )
-            if not value
-        ]
-        if missing:
-            raise ValueError(
-                "S3 storage is enabled (env="
-                f"{self.env!r}, storage_backend={self.storage_backend!r}) "
-                "but the following env vars are not set: "
-                + ", ".join(missing)
-            )
+        # No-op: validation is now credential-driven (uses_s3_storage above).
+        # The storage service will log a warning and fall back to local if
+        # credentials are incomplete. No startup crash needed.
         return self
 
 

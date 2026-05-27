@@ -23,6 +23,7 @@ dependencies = [
   "openai>=1.14.0",
   "boto3>=1.35.0",
   "qdrant-client>=1.9.0",
+  "apscheduler>=3.10.0",
 ]
 
 [project.optional-dependencies]
