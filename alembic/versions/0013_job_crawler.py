@@ -8,6 +8,10 @@ Adds:
 Revision ID: 0013
 Revises: 0012
 Create Date: 2026-05-27
+
+Fix: MySQL does not allow DEFAULT values on TEXT/BLOB columns.
+     job_roles (TEXT) is now nullable=True with no server_default;
+     the application layer always writes '[]' on INSERT.
 """
 from alembic import op
 import sqlalchemy as sa
@@ -19,13 +23,14 @@ depends_on = None
 
 
 def upgrade() -> None:
-    # crawler_configs
+    # ── crawler_configs ────────────────────────────────────────────────────
     op.create_table(
         "crawler_configs",
         sa.Column("id", sa.Integer(), primary_key=True),
         sa.Column("user_id", sa.Integer(), sa.ForeignKey("users.id", ondelete="CASCADE"), nullable=False),
         sa.Column("is_enabled", sa.Boolean(), nullable=False, server_default="0"),
-        sa.Column("job_roles", sa.Text(), nullable=False, server_default="[]"),
+        # TEXT columns cannot have a DEFAULT in MySQL — app layer writes '[]' on INSERT
+        sa.Column("job_roles", sa.Text(), nullable=True),
         sa.Column("salary_min", sa.Integer(), nullable=True),
         sa.Column("salary_max", sa.Integer(), nullable=True),
         sa.Column("salary_currency", sa.String(10), nullable=False, server_default="USD"),
@@ -41,7 +46,7 @@ def upgrade() -> None:
     )
     op.create_index("ix_crawler_configs_user_id", "crawler_configs", ["user_id"])
 
-    # crawled_jobs
+    # ── crawled_jobs ───────────────────────────────────────────────────────
     op.create_table(
         "crawled_jobs",
         sa.Column("id", sa.Integer(), primary_key=True),
@@ -53,6 +58,7 @@ def upgrade() -> None:
         sa.Column("location", sa.String(255), nullable=True),
         sa.Column("work_type", sa.String(30), nullable=True),
         sa.Column("salary_range", sa.String(100), nullable=True),
+        # TEXT columns — no server_default (MySQL restriction)
         sa.Column("description", sa.Text(), nullable=True),
         sa.Column("apply_url", sa.String(1000), nullable=False),
         sa.Column("tags", sa.Text(), nullable=True),
@@ -71,7 +77,7 @@ def upgrade() -> None:
     op.create_index("ix_crawled_jobs_user_crawled", "crawled_jobs", ["user_id", "crawled_at"])
     op.create_index("ix_crawled_jobs_crawled_at", "crawled_jobs", ["crawled_at"])
 
-    # Add job_crawler to the feature enum (MySQL)
+    # ── Extend the feature enum (MySQL ALTER TABLE) ────────────────────────
     op.execute(
         "ALTER TABLE user_features MODIFY COLUMN feature ENUM("
         "'jd_analyze','applications','kanban','resume','chat','multi_resume','job_crawler'"

@@ -310,7 +310,7 @@ class CrawlerConfig(Base, TimestampMixin):
     is_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
 
     # What to search for
-    job_roles: Mapped[str] = mapped_column(Text, default="[]")      # JSON array of role keywords
+    job_roles: Mapped[str | None] = mapped_column(Text, nullable=True, default="[]")   # JSON array of role keywords
     salary_min: Mapped[int | None] = mapped_column(Integer, nullable=True)
     salary_max: Mapped[int | None] = mapped_column(Integer, nullable=True)
     salary_currency: Mapped[str] = mapped_column(String(10), default="USD")
