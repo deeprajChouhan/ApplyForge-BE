@@ -121,6 +121,22 @@ class S3StorageService:
             "s3_storage_init endpoint=%s bucket=%s use_ssl=%s",
             endpoint_url, self.bucket, use_ssl,
         )
+        self._ensure_bucket()
+
+    # ── Bucket bootstrap ─────────────────────────────────────────────────────
+
+    def _ensure_bucket(self) -> None:
+        """Create the bucket if it doesn't exist (idempotent)."""
+        try:
+            self.client.head_bucket(Bucket=self.bucket)
+            logger.debug("s3_bucket_exists bucket=%s", self.bucket)
+        except Exception:
+            try:
+                self.client.create_bucket(Bucket=self.bucket)
+                logger.info("s3_bucket_created bucket=%s", self.bucket)
+            except Exception as exc:
+                # Non-fatal: log and continue — upload will surface a clearer error
+                logger.warning("s3_bucket_create_failed bucket=%s error=%s", self.bucket, exc)
 
     # ── Core ────────────────────────────────────────────────────────────────
 
