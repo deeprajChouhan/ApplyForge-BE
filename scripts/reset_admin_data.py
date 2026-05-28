@@ -16,9 +16,9 @@ from dotenv import load_dotenv
 # Load .env from the backend folder
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
-DATABASE_URL      = os.environ["DATABASE_URL"]
-QDRANT_URL        = os.environ.get("QDRANT_URL", "")
-QDRANT_API_KEY    = os.environ.get("QDRANT_API_KEY", "")
+DATABASE_URL      = "mysql+pymysql://AF-prd-admin:Hawkeye%40786@191.101.80.174:3307/AF-Prd"
+QDRANT_URL        = "https://applyforge-qdrant-654062-191-101-80-174.traefik.me/"
+QDRANT_API_KEY    = "ooivuzh0nttbn6iv5ablaiae5zvcer8r"
 QDRANT_COLLECTION = os.environ.get("QDRANT_COLLECTION", "applyforge_chunks")
 
 engine = create_engine(DATABASE_URL, echo=False)
