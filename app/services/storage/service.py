@@ -126,17 +126,18 @@ class S3StorageService:
     # ── Bucket bootstrap ─────────────────────────────────────────────────────
 
     def _ensure_bucket(self) -> None:
-        """Create the bucket if it doesn't exist (idempotent)."""
+        """Verify the bucket is reachable; warn loudly if not (SeaweedFS
+        requires buckets to be created via the filer, not the S3 API)."""
         try:
             self.client.head_bucket(Bucket=self.bucket)
             logger.debug("s3_bucket_exists bucket=%s", self.bucket)
-        except Exception:
-            try:
-                self.client.create_bucket(Bucket=self.bucket)
-                logger.info("s3_bucket_created bucket=%s", self.bucket)
-            except Exception as exc:
-                # Non-fatal: log and continue — upload will surface a clearer error
-                logger.warning("s3_bucket_create_failed bucket=%s error=%s", self.bucket, exc)
+        except Exception as exc:
+            logger.error(
+                "s3_bucket_missing bucket=%s error=%s — "
+                "Create it via the SeaweedFS filer: "
+                "curl -X POST http://<filer-host>:8888/buckets/%s/",
+                self.bucket, exc, self.bucket,
+            )
 
     # ── Core ────────────────────────────────────────────────────────────────
 

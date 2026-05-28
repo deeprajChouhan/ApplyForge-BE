@@ -15,14 +15,14 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.models.models import CrawledJob, CrawlerConfig, JobApplication, ParsedResumeData
-from app.services.crawler.sources import fetch_arbeitnow, fetch_adzuna, fetch_remoteok
+from app.services.crawler.sources import fetch_arbeitnow, fetch_adzuna, fetch_jobicy, fetch_linkedin, fetch_remoteok
 
 logger = logging.getLogger(__name__)
 
@@ -65,22 +65,25 @@ class CrawlerService:
         """
         cfg = self.get_or_create_config()
         if not cfg.is_enabled:
-            return {"jobs_found": 0, "jobs_added": 0}
+            logger.info("crawler_skip_not_enabled user_id=%s", self.user_id)
+            return {"jobs_found": 0, "jobs_added": 0, "skipped": True, "skip_reason": "not_enabled"}
 
         job_roles: list[str] = json.loads(cfg.job_roles) if cfg.job_roles else []
         if not job_roles:
             logger.info("crawler_skip_no_roles user_id=%s", self.user_id)
-            return {"jobs_found": 0, "jobs_added": 0}
+            return {"jobs_found": 0, "jobs_added": 0, "skipped": True, "skip_reason": "no_roles"}
 
         country    = cfg.country or "us"
         work_type  = cfg.work_type or "any"
         salary_min = cfg.salary_min
 
-        # 1. Fetch from all sources
+        # 1. Fetch from all sources (country passed to every source)
         raw_jobs: list[dict] = []
-        raw_jobs += fetch_remoteok(job_roles, work_type)
-        raw_jobs += fetch_arbeitnow(job_roles, work_type, country)
-        raw_jobs += fetch_adzuna(
+        src_remoteok  = fetch_remoteok(job_roles, work_type, country)
+        src_arbeitnow = fetch_arbeitnow(job_roles, work_type, country)
+        src_jobicy    = fetch_jobicy(job_roles, work_type, country)
+        src_linkedin  = fetch_linkedin(job_roles, work_type, country)
+        src_adzuna    = fetch_adzuna(
             job_roles,
             country=country,
             salary_min=salary_min,
@@ -88,9 +91,16 @@ class CrawlerService:
             app_id=getattr(settings, "adzuna_app_id", None),
             app_key=getattr(settings, "adzuna_app_key", None),
         )
+        raw_jobs = src_remoteok + src_arbeitnow + src_jobicy + src_linkedin + src_adzuna
 
         jobs_found = len(raw_jobs)
-        logger.info("crawler_fetched user_id=%s count=%s", self.user_id, jobs_found)
+        logger.info(
+            "crawler_fetched user_id=%s total=%s "
+            "remoteok=%s arbeitnow=%s jobicy=%s linkedin=%s adzuna=%s",
+            self.user_id, jobs_found,
+            len(src_remoteok), len(src_arbeitnow),
+            len(src_jobicy), len(src_linkedin), len(src_adzuna),
+        )
 
         # 2. Build existing-URL set for duplicate detection
         existing_urls = self._existing_application_urls()
@@ -150,9 +160,17 @@ class CrawlerService:
         return {r.jd_link for r in rows if r.jd_link}
 
     def _existing_crawled_keys(self) -> set[tuple]:
+        """
+        Only deduplicate against jobs crawled in the last 30 days.
+        Older records are expired — the same job re-posted is fair game.
+        """
+        cutoff = datetime.utcnow() - timedelta(days=30)
         rows = (
             self.db.query(CrawledJob.source, CrawledJob.external_id)
-            .filter(CrawledJob.user_id == self.user_id)
+            .filter(
+                CrawledJob.user_id == self.user_id,
+                CrawledJob.crawled_at >= cutoff,
+            )
             .all()
         )
         return {(r.source, r.external_id) for r in rows}

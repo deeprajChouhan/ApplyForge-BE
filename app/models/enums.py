@@ -70,4 +70,6 @@ class WorkType(str, enum.Enum):
 class CrawlSource(str, enum.Enum):
     remoteok = "remoteok"
     arbeitnow = "arbeitnow"
+    jobicy = "jobicy"
+    linkedin = "linkedin"
     adzuna = "adzuna"

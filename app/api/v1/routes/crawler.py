@@ -91,8 +91,19 @@ def action_job(
 def manual_run(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Manually trigger the crawler for the current user (runs synchronously)."""
     result = CrawlerService(db, user.id).run_crawl()
+    skipped = result.get("skipped", False)
+    skip_reason = result.get("skip_reason")
+    message = (
+        "Crawler not enabled — turn it on in Settings."
+        if skip_reason == "not_enabled" else
+        "No job roles configured — add keywords in Settings first."
+        if skip_reason == "no_roles" else
+        "Crawl complete"
+    )
     return CrawlTriggerResponse(
-        message="Crawl complete",
+        message=message,
         jobs_found=result["jobs_found"],
         jobs_added=result["jobs_added"],
+        skipped=skipped,
+        skip_reason=skip_reason,
     )

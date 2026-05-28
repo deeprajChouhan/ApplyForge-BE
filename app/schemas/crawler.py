@@ -96,3 +96,5 @@ class CrawlTriggerResponse(BaseModel):
     message: str
     jobs_found: int
     jobs_added: int
+    skipped: bool = False
+    skip_reason: Optional[str] = None  # "no_roles" | "not_enabled"
