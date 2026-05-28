@@ -280,13 +280,24 @@ class RAGService:
                 FieldCondition(key="parsed_resume_id", match=MatchValue(value=parsed_resume_id))
             )
 
-        result = self.qdrant.query_points(
-            collection_name=self.collection,
-            query=q_emb,
-            query_filter=Filter(must=must_conditions),
-            limit=top_k,
-            with_payload=True,
-        )
+        try:
+            result = self.qdrant.query_points(
+                collection_name=self.collection,
+                query=q_emb,
+                query_filter=Filter(must=must_conditions),
+                limit=top_k,
+                with_payload=True,
+            )
+        except Exception as exc:
+            from fastapi import HTTPException
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Vector search is temporarily unavailable. "
+                    "Qdrant may be down or unreachable. Please try again shortly."
+                ),
+            ) from exc
+
         hits = result.points
 
         if not hits:
