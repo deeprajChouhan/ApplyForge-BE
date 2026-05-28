@@ -133,7 +133,7 @@ class CrawlerService:
                 salary_range=raw.get("salary_range"),
                 description=raw.get("description"),
                 apply_url=raw["apply_url"],
-                tags=json.dumps(raw.get("tags") or []),
+                tags=json.dumps([str(t) for t in (raw.get("tags") or []) if t and not isinstance(t, (list, dict))]),
                 match_score=score,
                 match_reason=reason,
                 crawled_at=datetime.utcnow(),
@@ -194,7 +194,9 @@ class CrawlerService:
         """
         title = (raw.get("title") or "").lower()
         desc  = (raw.get("description") or "").lower()
-        tags  = " ".join(raw.get("tags") or []).lower()
+        # Flatten tags — guard against nested lists from some API responses
+        raw_tags = raw.get("tags") or []
+        tags = " ".join(str(t) for t in raw_tags if t and not isinstance(t, (list, dict))).lower()
 
         # Keyword score (0-60 points)
         kw_hits = sum(1 for k in job_roles if k.lower() in f"{title} {tags} {desc}")

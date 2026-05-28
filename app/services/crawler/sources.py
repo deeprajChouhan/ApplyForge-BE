@@ -353,7 +353,7 @@ def fetch_jobicy(keywords: list[str], work_type: str = "any",
                     "salary_range": _jobicy_salary(job),
                     "description": _strip_html(job.get("jobDescription", ""))[:3000],
                     "apply_url": apply_url,
-                    "tags": ([job.get("jobIndustry")] if job.get("jobIndustry") else [])[:15],
+                    "tags": [str(job["jobIndustry"])][:15] if job.get("jobIndustry") and isinstance(job["jobIndustry"], str) else [],
                 })
         except Exception as exc:
             logger.warning("jobicy_fetch_error kw=%s: %s", kw, exc)
