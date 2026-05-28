@@ -185,39 +185,103 @@ class CrawlerService:
         row = q.first()
         return row.raw_text if row else ""
 
+    # Common words to ignore when comparing resume ↔ job description
+    _STOP_WORDS = {
+        "the", "and", "for", "are", "but", "not", "you", "all", "can", "her",
+        "was", "one", "our", "out", "day", "get", "has", "him", "his", "how",
+        "its", "new", "now", "old", "see", "two", "who", "did", "let", "put",
+        "say", "she", "too", "use", "will", "with", "this", "that", "have",
+        "from", "they", "been", "were", "your", "what", "when", "which", "more",
+        "also", "into", "than", "then", "some", "would", "about", "their",
+        "there", "these", "other", "after", "work", "team", "role", "join",
+        "look", "help", "make", "time", "need", "must", "well", "strong",
+        "good", "great", "able", "within", "across", "including", "such",
+        "skills", "experience", "years", "working", "looking", "based",
+        "position", "company", "provide", "ability", "ensure", "manage",
+        "develop", "support", "using", "learn", "build", "lead", "drive",
+    }
+
     def _score_job(
         self, raw: dict, job_roles: list[str], resume_text: str
     ) -> tuple[float, str]:
         """
-        Lightweight AI-free scoring based on keyword overlap.
-        Falls back gracefully; if an LLM is available it will use it.
+        Score a job against the user's target roles and resume.
+
+        Component 1 — Title relevance (0–40 pts):
+            Does the job title directly contain one of the user's target role
+            keywords?  Full phrase match = 40, single-word match = 20.
+
+        Component 2 — Resume ↔ job description overlap (0–60 pts):
+            Extract meaningful words (4+ chars, not stop-words) from both the
+            resume and the job description, then score by what fraction of the
+            job's unique words also appear in the resume.  This varies per job
+            so jobs with matching skills rank higher.
+
+        Falls back gracefully if no resume or no description is available.
+        LLM re-scoring is attempted as a best-effort upgrade.
         """
+        import re
+
         title = (raw.get("title") or "").lower()
         desc  = (raw.get("description") or "").lower()
-        # Flatten tags — guard against nested lists from some API responses
         raw_tags = raw.get("tags") or []
-        tags = " ".join(str(t) for t in raw_tags if t and not isinstance(t, (list, dict))).lower()
+        tags  = " ".join(str(t) for t in raw_tags if t and not isinstance(t, (list, dict))).lower()
+        job_text = f"{title} {tags} {desc}"
 
-        # Keyword score (0-60 points)
-        kw_hits = sum(1 for k in job_roles if k.lower() in f"{title} {tags} {desc}")
-        kw_score = min(60.0, (kw_hits / max(len(job_roles), 1)) * 60)
+        # ── Component 1: title relevance ────────────────────────────────────
+        title_score = 0.0
+        matched_role = ""
+        for role in job_roles:
+            role_lower = role.lower()
+            if role_lower in title:
+                title_score = 40.0
+                matched_role = role
+                break
+            # Partial: any single word of the role in the title
+            words = [w for w in role_lower.split() if len(w) > 2]
+            if any(w in title for w in words):
+                if title_score < 20.0:
+                    title_score = 20.0
+                    matched_role = role
 
-        # Resume keyword overlap (0-40 points)
+        # ── Component 2: resume ↔ job description overlap ───────────────────
         resume_score = 0.0
-        if resume_text:
-            resume_lower = resume_text.lower()
-            overlap = sum(1 for k in job_roles if k.lower() in resume_lower)
-            resume_score = min(40.0, (overlap / max(len(job_roles), 1)) * 40)
+        overlap_count = 0
+        job_word_count = 1
 
-        total = round(kw_score + resume_score, 1)
-        reason = (
-            f"Matched {kw_hits}/{len(job_roles)} keywords in job listing"
-            + (f" — strong resume alignment" if resume_score > 20 else "")
-        )
+        if resume_text and desc:
+            def extract_words(text: str) -> set[str]:
+                return {
+                    w for w in re.findall(r'\b[a-z]{4,}\b', text.lower())
+                    if w not in self._STOP_WORDS
+                }
+
+            resume_words = extract_words(resume_text)
+            job_words    = extract_words(job_text)
+            job_word_count = max(len(job_words), 1)
+
+            if resume_words and job_words:
+                overlap_count = len(resume_words & job_words)
+                # Normalise: overlap / job_words, scaled to 0–60
+                # Cap at 40 % overlap = full score (most jobs won't exceed this)
+                ratio = min(overlap_count / job_word_count, 0.40) / 0.40
+                resume_score = round(ratio * 60.0, 1)
+
+        total = round(min(100.0, title_score + resume_score), 1)
+
+        if matched_role:
+            reason = f'Title matches "{matched_role}"'
+        else:
+            reason = "Keyword match in description"
+        if resume_score >= 30:
+            reason += " — strong resume overlap"
+        elif resume_score >= 15:
+            reason += " — good resume overlap"
+        reason += f" ({overlap_count} shared skills/{job_word_count} job terms)"
 
         # Optional LLM upgrade (best-effort, won't block if it fails)
         try:
-            if resume_text:
+            if resume_text and desc:
                 total, reason = self._llm_score(raw, job_roles, resume_text, total, reason)
         except Exception as exc:
             logger.debug("crawler_llm_score_failed: %s", exc)
