@@ -353,11 +353,19 @@ class CrawlerService:
             job.is_saved = is_saved
             if is_saved:
                 # Auto-create a job application draft
+                # If LinkedIn description wasn't fetched at crawl time, try now
+                description = job.description
+                if not description and job.source == "linkedin":
+                    from app.services.crawler.sources import _fetch_linkedin_description
+                    description = _fetch_linkedin_description(job.external_id)
+                    if description:
+                        job.description = description  # cache for future
+
                 app = JobApplication(
                     user_id=self.user_id,
                     company_name=job.company,
                     role_title=job.title,
-                    job_description=job.description or f"{job.title} at {job.company}",
+                    job_description=description or "",
                     jd_link=job.apply_url,
                 )
                 self.db.add(app)

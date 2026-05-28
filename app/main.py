@@ -131,6 +131,40 @@ def backfill_free_features() -> None:
         logger.warning("Free feature backfill startup task failed (non-fatal): %s", exc)
 
 
+@app.on_event("startup")
+def clear_admin_crawled_jobs() -> None:
+    """
+    On every deploy: wipe all crawled_jobs rows for the admin account so the
+    Discovered Jobs page starts clean after each redeployment.
+    Only runs if ADMIN_EMAIL is configured.
+    """
+    try:
+        from app.db.session import SessionLocal
+        from app.models.models import CrawledJob, User
+
+        db = SessionLocal()
+        try:
+            admin = db.query(User).filter(User.email.ilike(settings.admin_email)).first()
+            if not admin:
+                return
+            deleted = db.query(CrawledJob).filter(CrawledJob.user_id == admin.id).delete()
+            db.commit()
+            if deleted:
+                logger.info(
+                    "deploy_cleanup: deleted %d crawled_jobs for admin <%s>",
+                    deleted, settings.admin_email,
+                )
+            else:
+                logger.info(
+                    "deploy_cleanup: no crawled_jobs to clear for admin <%s>",
+                    settings.admin_email,
+                )
+        finally:
+            db.close()
+    except Exception as exc:
+        logger.warning("Admin crawled-jobs cleanup failed (non-fatal): %s", exc)
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}

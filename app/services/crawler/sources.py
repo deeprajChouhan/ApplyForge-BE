@@ -375,12 +375,37 @@ def _jobicy_salary(job: dict) -> str | None:
 
 # ── LinkedIn (guest / unauthenticated) ───────────────────────────────────────
 
+def _fetch_linkedin_description(job_id: str) -> str | None:
+    """
+    Fetch the full job description for a single LinkedIn posting.
+    Uses the same guest API — no auth required.
+    """
+    try:
+        url = f"https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{job_id}"
+        html = _get_html(url, timeout=12)
+        # Primary: show-more-less-html__markup div contains the full JD
+        m = re.search(
+            r'class="show-more-less-html__markup[^"]*">([\s\S]*?)</div>',
+            html,
+        )
+        if m:
+            return _strip_html(m.group(1))[:3000]
+        # Fallback: description meta tag
+        m = re.search(r'<meta\s+name="description"\s+content="([^"]+)"', html)
+        if m:
+            return m.group(1)[:3000]
+    except Exception as exc:
+        logger.debug("linkedin_desc_failed job_id=%s: %s", job_id, exc)
+    return None
+
+
 def fetch_linkedin(keywords: list[str], work_type: str = "any",
                    country: str | None = None) -> list[dict]:
     """
     LinkedIn guest jobs API — unauthenticated endpoint used by LinkedIn's own
     public job search page.  No API key required but subject to rate limiting.
     Returns HTML which we parse with regex (no bs4 dependency).
+    Fetches full job descriptions for each result (up to 12 jobs, polite delay).
     """
     country_code = _normalize_country(country)
     location_str = _COUNTRY_LOCATION_NAME.get(country_code or "", "") if country_code else ""
@@ -392,7 +417,7 @@ def fetch_linkedin(keywords: list[str], work_type: str = "any",
     results: list[dict] = []
     seen_ids: set[str] = set()
 
-    for kw in keywords[:2]:  # limit to avoid rate-limiting
+    for kw in keywords[:2]:  # limit keywords to avoid rate-limiting
         try:
             q = urllib.parse.quote(kw)
             loc = urllib.parse.quote(location_str) if location_str else ""
@@ -433,7 +458,7 @@ def fetch_linkedin(keywords: list[str], work_type: str = "any",
                     "location": location,
                     "work_type": work_type if work_type != "any" else None,
                     "salary_range": None,
-                    "description": None,   # LinkedIn doesn't expose description in guest API
+                    "description": None,  # fetched below
                     "apply_url": apply_url,
                     "tags": [],
                 })
@@ -441,7 +466,18 @@ def fetch_linkedin(keywords: list[str], work_type: str = "any",
         except Exception as exc:
             logger.warning("linkedin_fetch_error kw=%s: %s", kw, exc)
 
-    logger.info("linkedin_fetch matched=%d", len(results))
+    # Fetch full descriptions (cap at 12 to stay under rate limits)
+    fetched = 0
+    for result in results:
+        if fetched >= 12:
+            break
+        desc = _fetch_linkedin_description(result["external_id"])
+        if desc:
+            result["description"] = desc
+        fetched += 1
+        time.sleep(0.4)  # polite delay between requests
+
+    logger.info("linkedin_fetch matched=%d descriptions_fetched=%d", len(results), fetched)
     return results
 
 
