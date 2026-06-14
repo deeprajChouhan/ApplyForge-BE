@@ -5,20 +5,63 @@ services:
     ports:
       - "8000:8000"
     depends_on:
-      - mysql
+      qdrant-init:
+        condition: service_completed_successfully
+      seaweedfs-init:
+        condition: service_completed_successfully
     volumes:
       - ./storage:/app/storage
-  mysql:
-    image: mysql:8
-    environment:
-      MYSQL_ROOT_PASSWORD: root
-      MYSQL_DATABASE: applyforge
-      MYSQL_USER: applyforge
-      MYSQL_PASSWORD: applyforge
-    ports:
-      - "3306:3306"
+    networks:
+      - default
+      - dokploy-network
+
+  # ── Vector store (RAG embeddings) ───────────────────────────────────────────
+  qdrant:
+    image: qdrant/qdrant:latest
     volumes:
-      - mysql_data:/var/lib/mysql
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/6333'"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # One-shot: create the Qdrant collection (idempotent) before the API starts.
+  qdrant-init:
+    build: .
+    env_file: .env
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    entrypoint: ["python", "scripts/qdrant_init.py"]
+    restart: "no"
+
+  # ── S3-compatible object storage (resume uploads) ───────────────────────────
+  seaweedfs:
+    image: chrislusf/seaweedfs:latest
+    command: server -dir=/data -s3 -s3.port=8333
+    volumes:
+      - seaweed_data:/data
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "8333"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # One-shot: create the upload bucket (idempotent) before the API starts.
+  seaweedfs-init:
+    image: curlimages/curl:latest
+    depends_on:
+      seaweedfs:
+        condition: service_healthy
+    env_file: .env
+    entrypoint: ["sh", "-c", "curl -sf -X POST http://seaweedfs:8888/buckets/${S3_BUCKET}/"]
+    restart: "no"
 
 volumes:
-  mysql_data:
+  qdrant_data:
+  seaweed_data:
+
+networks:
+  dokploy-network:
+    external: true
