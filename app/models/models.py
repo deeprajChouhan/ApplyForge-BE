@@ -64,6 +64,12 @@ class UserProfile(Base, TimestampMixin):
     phone_number: Mapped[str | None] = mapped_column(String(50))
     age: Mapped[int | None] = mapped_column(Integer)
     onboarding_completed: Mapped[bool] = mapped_column(Boolean, default=False)
+    current_role: Mapped[str | None] = mapped_column(String(255))
+    career_goals: Mapped[str | None] = mapped_column(Text)
+    target_roles: Mapped[str | None] = mapped_column(Text)  # JSON list[str]
+    preferred_locations: Mapped[str | None] = mapped_column(Text)  # JSON list[str]
+    salary_expectation: Mapped[str | None] = mapped_column(String(100))
+    deal_breakers: Mapped[str | None] = mapped_column(Text)  # JSON list[str]
 
 
 class WorkExperience(Base, TimestampMixin):

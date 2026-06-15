@@ -1,3 +1,5 @@
+import json
+
 from sqlalchemy.orm import Session
 from fastapi import HTTPException, Request
 from app.models.models import (
@@ -71,6 +73,12 @@ class ProfileService:
         if not profile.summary:
             profile.summary = career_goals
 
+        profile.current_role = current_role or profile.current_role
+        profile.career_goals = career_goals or profile.career_goals
+        profile.target_roles = json.dumps(target_roles)
+        profile.preferred_locations = json.dumps(preferred_locations)
+        profile.salary_expectation = salary_expectation or profile.salary_expectation
+        profile.deal_breakers = json.dumps(deal_breakers)
         profile.onboarding_completed = True
 
         # Replace any prior career-goals knowledge document with the latest answers.

@@ -1,5 +1,7 @@
 from datetime import date, datetime
+import json
 import re
+from typing import Any
 from pydantic import BaseModel, field_validator
 
 
@@ -39,11 +41,33 @@ class UserProfileUpsert(BaseModel):
     age: int | None = None
 
 
+def _parse_json_list(v: Any) -> list:
+    if not v:
+        return []
+    if isinstance(v, str):
+        try:
+            return json.loads(v)
+        except (TypeError, ValueError):
+            return []
+    return v
+
+
 class UserProfileOut(UserProfileUpsert):
     id: int
     user_id: int
     onboarding_completed: bool = False
+    current_role: str | None = None
+    career_goals: str | None = None
+    target_roles: list[str] = []
+    preferred_locations: list[str] = []
+    salary_expectation: str | None = None
+    deal_breakers: list[str] = []
     model_config = {"from_attributes": True}
+
+    @field_validator('target_roles', 'preferred_locations', 'deal_breakers', mode='before')
+    @classmethod
+    def parse_json_list_fields(cls, v):
+        return _parse_json_list(v)
 
 
 class OnboardingRequest(BaseModel):
