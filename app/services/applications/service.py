@@ -1,6 +1,9 @@
+from __future__ import annotations
+
 import json
 import re
 from typing import List
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 from fastapi import HTTPException
 
@@ -9,11 +12,15 @@ from app.models.models import (
     Education, GeneratedDocument, JobApplication, Project, Skill, User, UserProfile,
     WorkExperience,
 )
-from app.models.enums import ApplicationStatus
+from app.models.enums import ApplicationStatus, DocumentType
 from app.services.ai.exceptions import AIProviderError
 from app.services.ai.factory import get_llm_provider
+from app.services.analytics.service import ProductEventService
+from app.services.audit.service import AuditService
+from app.services.common.soft_delete import soft_delete
 from app.services.rag.service import RAGService
 from app.services.scoring.service import CompetitionScorer, FitScorer, PriorityScorer
+from app.services.usage.service import UsageTracker
 
 
 class ApplicationService:
@@ -34,7 +41,12 @@ class ApplicationService:
         return app
 
     def get(self, app_id: int) -> JobApplication:
-        app = self.db.query(JobApplication).filter_by(id=app_id, user_id=self.user_id).first()
+        app = (
+            self.db.query(JobApplication)
+            .filter_by(id=app_id, user_id=self.user_id)
+            .filter(JobApplication.deleted_at.is_(None))
+            .first()
+        )
         if not app:
             raise HTTPException(status_code=404, detail="Application not found")
         return app
@@ -49,10 +61,27 @@ class ApplicationService:
         return app
 
     def list(self, status: ApplicationStatus | None = None):
-        q = self.db.query(JobApplication).filter_by(user_id=self.user_id)
+        q = self.db.query(JobApplication).filter_by(user_id=self.user_id).filter(JobApplication.deleted_at.is_(None))
         if status:
             q = q.filter_by(status=status)
         return q.order_by(JobApplication.created_at.desc()).all()
+
+    def list_paginated(
+        self,
+        status: ApplicationStatus | None = None,
+        search: str | None = None,
+        page: int = 1,
+        page_size: int = 20,
+    ) -> tuple[list[JobApplication], int]:
+        q = self.db.query(JobApplication).filter_by(user_id=self.user_id).filter(JobApplication.deleted_at.is_(None))
+        if status:
+            q = q.filter_by(status=status)
+        if search:
+            like = f"%{search}%"
+            q = q.filter(or_(JobApplication.company_name.ilike(like), JobApplication.role_title.ilike(like)))
+        total = q.count()
+        items = q.order_by(JobApplication.created_at.desc()).offset((page - 1) * page_size).limit(page_size).all()
+        return items, total
 
     def change_status(self, app_id: int, new_status: ApplicationStatus, note: str | None) -> JobApplication:
         app = self.get(app_id)
@@ -71,14 +100,20 @@ class ApplicationService:
         self.db.refresh(app)
         return app
 
-    def delete(self, app_id: int) -> None:
-        """Permanently delete an application + all related data (docs, chat, status history)."""
+    def delete(self, app_id: int, reason: str | None = None) -> None:
+        """Archive (soft delete) an application. Related docs/chat/history are kept."""
         app = self.get(app_id)  # raises 404 if not found / wrong user
-        self.db.query(GeneratedDocument).filter_by(application_id=app_id).delete()
-        self.db.query(ApplicationChat).filter_by(application_id=app_id).delete()
-        self.db.query(ApplicationStatusHistory).filter_by(application_id=app_id).delete()
-        self.db.delete(app)
-        self.db.commit()
+        before = {"id": app.id, "company_name": app.company_name, "role_title": app.role_title, "status": app.status.value}
+        soft_delete(self.db, app, deleted_by=self.user_id, reason=reason)
+        AuditService(self.db).log(
+            action="application_archived",
+            entity_type="job_application",
+            entity_id=app.id,
+            actor_user_id=self.user_id,
+            actor_role="user",
+            before=before,
+            metadata={"reason": reason} if reason else None,
+        )
 
     # ── Profile skill helper ──────────────────────────────────────────────
 
@@ -109,6 +144,7 @@ class ApplicationService:
         parsed = (
             self.db.query(ParsedResumeData)
             .filter_by(user_id=self.user_id)
+            .filter(ParsedResumeData.deleted_at.is_(None))
             .order_by(ParsedResumeData.created_at.desc())
             .first()
         )
@@ -164,6 +200,7 @@ class ApplicationService:
         parsed = (
             self.db.query(ParsedResumeData)
             .filter_by(user_id=self.user_id)
+            .filter(ParsedResumeData.deleted_at.is_(None))
             .order_by(ParsedResumeData.created_at.desc())
             .first()
         )
@@ -606,3 +643,57 @@ class ApplicationService:
         for row in out:
             self.db.refresh(row)
         return out
+
+    # ── One-click application package ─────────────────────────────────────
+
+    def generate_package(self, app_id: int) -> tuple[List[GeneratedDocument], int, int]:
+        """
+        Generate a complete application package (resume + cover letter + cold email)
+        in one call, enforcing the monthly package-generation limit for free users.
+
+        Returns (documents, packages_used_this_month, monthly_package_limit).
+        Raises HTTP 429 with a structured body if the user is at their limit.
+        """
+        user = self.db.query(User).filter_by(id=self.user_id).first()
+        tracker = UsageTracker(self.db, self.user_id, model="")
+        limit = tracker.monthly_package_limit(user)
+        used = tracker.packages_used_this_month()
+
+        if limit != -1 and used >= limit:
+            ProductEventService(self.db).track(
+                "package_limit_reached",
+                user_id=self.user_id,
+                entity_type="job_application",
+                entity_id=app_id,
+                properties={"used": used, "limit": limit},
+            )
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "error": "package_limit_reached",
+                    "used": used,
+                    "limit": limit,
+                    "message": f"You've used {used} of your {limit} monthly application packages. Upgrade your plan for unlimited packages.",
+                },
+            )
+
+        docs = self.generate_docs(app_id, [DocumentType.resume, DocumentType.cover_letter, DocumentType.cold_email])
+        new_used = tracker.increment_packages_used()
+
+        AuditService(self.db).log(
+            action="package_generated",
+            entity_type="job_application",
+            entity_id=app_id,
+            actor_user_id=self.user_id,
+            actor_role="user",
+            metadata={"used": new_used, "limit": limit},
+        )
+        ProductEventService(self.db).track(
+            "package_generated",
+            user_id=self.user_id,
+            entity_type="job_application",
+            entity_id=app_id,
+            properties={"used": new_used, "limit": limit},
+        )
+
+        return docs, new_used, limit

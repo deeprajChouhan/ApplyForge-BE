@@ -1,5 +1,5 @@
 from datetime import date, datetime
-from sqlalchemy import Boolean, Date, DateTime, Enum, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, Date, DateTime, Enum, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -14,9 +14,16 @@ PLAN_TOKEN_BUDGETS: dict[str, int] = {
 
 # Features automatically granted per plan on registration
 PLAN_DEFAULT_FEATURES: dict[str, list] = {
-    PlanTier.free: [FeatureFlag.jd_analyze, FeatureFlag.applications, FeatureFlag.resume],
-    PlanTier.pro: [FeatureFlag.jd_analyze, FeatureFlag.applications, FeatureFlag.kanban, FeatureFlag.resume, FeatureFlag.chat, FeatureFlag.multi_resume, FeatureFlag.job_crawler],
-    PlanTier.enterprise: [FeatureFlag.jd_analyze, FeatureFlag.applications, FeatureFlag.kanban, FeatureFlag.resume, FeatureFlag.chat, FeatureFlag.multi_resume, FeatureFlag.job_crawler],
+    PlanTier.free: [FeatureFlag.jd_analyze, FeatureFlag.applications, FeatureFlag.resume, FeatureFlag.package_generation],
+    PlanTier.pro: [FeatureFlag.jd_analyze, FeatureFlag.applications, FeatureFlag.kanban, FeatureFlag.resume, FeatureFlag.chat, FeatureFlag.multi_resume, FeatureFlag.job_crawler, FeatureFlag.job_discovery, FeatureFlag.interview_practice, FeatureFlag.package_generation],
+    PlanTier.enterprise: [FeatureFlag.jd_analyze, FeatureFlag.applications, FeatureFlag.kanban, FeatureFlag.resume, FeatureFlag.chat, FeatureFlag.multi_resume, FeatureFlag.job_crawler, FeatureFlag.job_discovery, FeatureFlag.interview_practice, FeatureFlag.package_generation],
+}
+
+# Monthly application-package generation limits per plan (-1 = unlimited)
+PLAN_PACKAGE_LIMITS: dict[str, int] = {
+    PlanTier.free: 5,
+    PlanTier.pro: -1,
+    PlanTier.enterprise: -1,
 }
 
 
@@ -56,6 +63,7 @@ class UserProfile(Base, TimestampMixin):
     location: Mapped[str | None] = mapped_column(String(255))
     phone_number: Mapped[str | None] = mapped_column(String(50))
     age: Mapped[int | None] = mapped_column(Integer)
+    onboarding_completed: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class WorkExperience(Base, TimestampMixin):
@@ -126,6 +134,8 @@ class ParsedResumeData(Base, TimestampMixin):
     raw_text: Mapped[str] = mapped_column(Text)
     structured_json: Mapped[str] = mapped_column(Text)
     confidence_score: Mapped[float] = mapped_column(Float)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    deleted_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
 
 
 class KnowledgeDocument(Base, TimestampMixin):
@@ -140,6 +150,7 @@ class KnowledgeDocument(Base, TimestampMixin):
     parsed_resume_id: Mapped[int | None] = mapped_column(
         ForeignKey("parsed_resume_data.id", ondelete="CASCADE"), nullable=True, index=True
     )
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
 
 
 class KnowledgeChunk(Base, TimestampMixin):
@@ -178,6 +189,9 @@ class JobApplication(Base, TimestampMixin):
     selected_resume_id: Mapped[int | None] = mapped_column(
         ForeignKey("parsed_resume_data.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    deleted_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    delete_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
 
 class GeneratedDocument(Base, TimestampMixin):
@@ -189,6 +203,7 @@ class GeneratedDocument(Base, TimestampMixin):
     version: Mapped[int] = mapped_column(Integer, default=1)
     content: Mapped[str] = mapped_column(Text)
     format: Mapped[str] = mapped_column(String(20), default="txt")
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
 
 
 class ApplicationChat(Base, TimestampMixin):
@@ -236,6 +251,7 @@ class UsageLedger(Base):
     month_year: Mapped[str] = mapped_column(String(7), index=True)  # e.g. "2026-04"
     tokens_used: Mapped[int] = mapped_column(Integer, default=0)
     api_calls: Mapped[int] = mapped_column(Integer, default=0)
+    packages_used: Mapped[int] = mapped_column(Integer, default=0)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
@@ -367,3 +383,128 @@ class CrawledJob(Base, TimestampMixin):
     application_id: Mapped[int | None] = mapped_column(
         ForeignKey("job_applications.id", ondelete="SET NULL"), nullable=True
     )
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+
+
+# ── Platform Foundation: audit, analytics, plans, support, interview ──────
+
+
+class AuditLog(Base):
+    """Append-only record of state-changing actions across the platform."""
+    __tablename__ = "audit_logs"
+    __table_args__ = (
+        Index("ix_audit_logs_actor_created", "actor_user_id", "created_at"),
+        Index("ix_audit_logs_entity", "entity_type", "entity_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    actor_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    actor_role: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    action: Mapped[str] = mapped_column(String(100), index=True)
+    entity_type: Mapped[str] = mapped_column(String(50), index=True)
+    entity_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    before: Mapped[str | None] = mapped_column(Text, nullable=True)
+    after: Mapped[str | None] = mapped_column(Text, nullable=True)
+    extra_metadata: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ip_address: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    user_agent: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
+class ProductEvent(Base):
+    """First-party product/website analytics event."""
+    __tablename__ = "product_events"
+    __table_args__ = (
+        Index("ix_product_events_name_created", "event_name", "created_at"),
+        Index("ix_product_events_user_created", "user_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    event_name: Mapped[str] = mapped_column(String(100), index=True)
+    entity_type: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    entity_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    properties: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ip_address: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    user_agent: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    referrer: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
+class Plan(Base, TimestampMixin):
+    """Admin-managed pricing plan, surfaced via public /plans and admin CRUD."""
+    __tablename__ = "plans"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(100))
+    slug: Mapped[str] = mapped_column(String(50), unique=True, index=True)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    price_monthly: Mapped[float] = mapped_column(Float, default=0)
+    price_yearly: Mapped[float | None] = mapped_column(Float, nullable=True)
+    currency: Mapped[str] = mapped_column(String(10), default="usd")
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    is_public: Mapped[bool] = mapped_column(Boolean, default=True)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    features: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON array of feature labels
+    limits: Mapped[str | None] = mapped_column(Text, nullable=True)    # JSON object of limit key/values
+    cta_label: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    highlighted: Mapped[bool] = mapped_column(Boolean, default=False)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+
+
+class SupportTicket(Base, TimestampMixin):
+    """User-submitted help desk ticket."""
+    __tablename__ = "support_tickets"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    subject: Mapped[str] = mapped_column(String(255))
+    category: Mapped[str] = mapped_column(String(50), default="general")
+    priority: Mapped[str] = mapped_column(String(20), default="normal")
+    status: Mapped[str] = mapped_column(String(20), default="open", index=True)
+    related_entity_type: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    related_entity_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    assigned_admin_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+
+
+class SupportTicketMessage(Base):
+    """A single message within a support ticket thread."""
+    __tablename__ = "support_ticket_messages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ticket_id: Mapped[int] = mapped_column(ForeignKey("support_tickets.id", ondelete="CASCADE"), index=True)
+    sender_user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    sender_role: Mapped[str] = mapped_column(String(20), default="user")
+    body: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class InterviewSession(Base, TimestampMixin):
+    """A mock interview practice session for a user, optionally tied to an application."""
+    __tablename__ = "interview_sessions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    application_id: Mapped[int | None] = mapped_column(ForeignKey("job_applications.id", ondelete="SET NULL"), nullable=True, index=True)
+    role_title: Mapped[str] = mapped_column(String(255))
+    status: Mapped[str] = mapped_column(String(20), default="in_progress", index=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    delete_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
+
+class InterviewAnswer(Base, TimestampMixin):
+    """A single question/answer/feedback unit within an interview session."""
+    __tablename__ = "interview_answers"
+    __table_args__ = (Index("ix_interview_answers_session_q", "session_id", "question_index"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    session_id: Mapped[int] = mapped_column(ForeignKey("interview_sessions.id", ondelete="CASCADE"), index=True)
+    question_index: Mapped[int] = mapped_column(Integer)
+    question: Mapped[str] = mapped_column(Text)
+    answer: Mapped[str | None] = mapped_column(Text, nullable=True)
+    feedback: Mapped[str | None] = mapped_column(Text, nullable=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

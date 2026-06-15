@@ -77,6 +77,7 @@ class _ResumeData:
         parsed_row = (
             db.query(ParsedResumeData)
             .filter_by(user_id=user_id)
+            .filter(ParsedResumeData.deleted_at.is_(None))
             .order_by(ParsedResumeData.created_at.desc())
             .first()
         )

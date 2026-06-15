@@ -42,7 +42,18 @@ class UserProfileUpsert(BaseModel):
 class UserProfileOut(UserProfileUpsert):
     id: int
     user_id: int
+    onboarding_completed: bool = False
     model_config = {"from_attributes": True}
+
+
+class OnboardingRequest(BaseModel):
+    """Answers collected by the conversational onboarding flow."""
+    current_role: str | None = None
+    career_goals: str
+    target_roles: list[str] = []
+    preferred_locations: list[str] = []
+    salary_expectation: str | None = None
+    deal_breakers: list[str] | None = None
 
 
 class ExperienceIn(BaseModel):

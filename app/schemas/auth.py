@@ -35,6 +35,9 @@ class UserMe(BaseModel):
     subscription_status: SubscriptionStatus
     token_budget_monthly: int
     features: List[str] = []  # list of enabled FeatureFlag values
+    onboarding_completed: bool = False
+    packages_used_this_month: int = 0
+    monthly_package_limit: int = 0  # -1 = unlimited
 
     model_config = {"from_attributes": True}
 

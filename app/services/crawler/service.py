@@ -177,7 +177,7 @@ class CrawlerService:
 
     def _get_resume_text(self, resume_id: Optional[int]) -> str:
         """Return raw resume text for the selected (or latest) parsed resume."""
-        q = self.db.query(ParsedResumeData).filter_by(user_id=self.user_id)
+        q = self.db.query(ParsedResumeData).filter_by(user_id=self.user_id).filter(ParsedResumeData.deleted_at.is_(None))
         if resume_id:
             q = q.filter_by(id=resume_id)
         else:
@@ -325,7 +325,7 @@ class CrawlerService:
         limit: int = 50,
         offset: int = 0,
     ) -> list[CrawledJob]:
-        q = self.db.query(CrawledJob).filter(CrawledJob.user_id == self.user_id)
+        q = self.db.query(CrawledJob).filter(CrawledJob.user_id == self.user_id, CrawledJob.deleted_at.is_(None))
         if not show_dismissed:
             q = q.filter(CrawledJob.is_dismissed == False)
         if date_str:

@@ -43,6 +43,13 @@ class ApplicationOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class ApplicationListResponse(BaseModel):
+    items: list[ApplicationOut]
+    total: int
+    page: int
+    page_size: int
+
+
 class StatusChangeRequest(BaseModel):
     status: ApplicationStatus
     note: str | None = None
@@ -79,6 +86,14 @@ class GeneratedDocumentOut(BaseModel):
 class GenerateResponse(BaseModel):
     status: str
     documents: list[GeneratedDocumentOut]
+
+
+class PackageResponse(BaseModel):
+    """Response for POST /applications/{id}/package — resume + cover letter + cold email in one call."""
+    status: str
+    documents: list[GeneratedDocumentOut]
+    packages_used_this_month: int
+    monthly_package_limit: int  # -1 = unlimited
 
 
 class ScoreResponse(BaseModel):

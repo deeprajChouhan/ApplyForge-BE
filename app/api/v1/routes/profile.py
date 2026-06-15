@@ -1,5 +1,5 @@
 import json
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, require_feature
@@ -12,6 +12,7 @@ from app.schemas.profile import (
     ExperienceIn,
     LinkedInConnectionOut,
     LinkedInImportResponse,
+    OnboardingRequest,
     ProjectIn,
     ResumeParseResponse,
     SkillIn,
@@ -36,6 +37,17 @@ def get_profile(user: User = Depends(get_current_user), db: Session = Depends(ge
 @router.put("", response_model=UserProfileOut)
 def update_profile(payload: UserProfileUpsert, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     return ProfileService(db, user.id).update_profile(payload.model_dump())
+
+
+@router.post("/onboarding", response_model=UserProfileOut)
+def complete_onboarding(
+    payload: OnboardingRequest,
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Persist the conversational onboarding answers and mark onboarding as complete."""
+    return ProfileService(db, user.id).complete_onboarding(payload.model_dump(), request=request)
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +191,7 @@ def resume_history(user: User = Depends(get_current_user), db: Session = Depends
         db.query(ParsedResumeData, UploadedFile.filename)
         .join(UploadedFile, ParsedResumeData.uploaded_file_id == UploadedFile.id, isouter=True)
         .filter(ParsedResumeData.user_id == user.id)
+        .filter(ParsedResumeData.deleted_at.is_(None))
         .order_by(ParsedResumeData.created_at.desc())
         .limit(10)
         .all()
@@ -222,20 +235,27 @@ def delete_uploaded_file(file_id: int, user: User = Depends(get_current_user), d
 
 @router.delete("/resume/parsed/{parse_id}", status_code=204, dependencies=[_need_resume])
 def delete_parsed_resume(parse_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Delete a parsed resume record (and its knowledge chunks) from the database."""
+    """Archive a parsed resume record. It is hidden from history but can be restored by an admin."""
     from app.models.models import ParsedResumeData
-    row = db.query(ParsedResumeData).filter_by(id=parse_id, user_id=user.id).first()
+    from app.services.audit.service import AuditService
+    from app.services.common.soft_delete import soft_delete
+
+    row = (
+        db.query(ParsedResumeData)
+        .filter_by(id=parse_id, user_id=user.id)
+        .filter(ParsedResumeData.deleted_at.is_(None))
+        .first()
+    )
     if not row:
         raise HTTPException(status_code=404, detail="Parsed resume not found")
-    # Optionally delete the underlying uploaded file too if still present
-    if row.uploaded_file_id:
-        from app.models.models import UploadedFile
-        uf = db.query(UploadedFile).filter_by(id=row.uploaded_file_id, user_id=user.id).first()
-        if uf:
-            get_storage_service().delete_file(uf.path)
-            db.delete(uf)
-    db.delete(row)
-    db.commit()
+    soft_delete(db, row, deleted_by=user.id)
+    AuditService(db).log(
+        action="resume_archived",
+        entity_type="parsed_resume_data",
+        entity_id=row.id,
+        actor_user_id=user.id,
+        actor_role="user",
+    )
 
 
 @router.post("/knowledge/rebuild", dependencies=[_need_resume])

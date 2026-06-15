@@ -8,12 +8,14 @@ from app.models.enums import ApplicationStatus, FeatureFlag
 from app.models.models import User
 from app.schemas.application import (
     ApplicationCreate,
+    ApplicationListResponse,
     ApplicationOut,
     ApplicationUpdate,
     GenerateRequest,
     GenerateResponse,
     GeneratedDocumentOut,
     JDAnalyzeRequest,
+    PackageResponse,
     ScoreResponse,
     SetResumeRequest,
     StatusChangeRequest,
@@ -30,6 +32,7 @@ router = APIRouter(prefix="/applications", tags=["applications"])
 _need_apps = Depends(require_feature(FeatureFlag.applications))
 _need_kanban = Depends(require_feature(FeatureFlag.kanban))
 _need_jd = Depends(require_feature(FeatureFlag.jd_analyze))
+_need_package = Depends(require_feature(FeatureFlag.package_generation))
 
 
 @router.post("", response_model=ApplicationOut, dependencies=[_need_apps])
@@ -37,9 +40,17 @@ def create(payload: ApplicationCreate, user: User = Depends(get_current_user), d
     return ApplicationService(db, user.id).create(payload.model_dump())
 
 
-@router.get("", response_model=list[ApplicationOut], dependencies=[_need_apps])
-def list_apps(status: ApplicationStatus | None = Query(default=None), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    return ApplicationService(db, user.id).list(status)
+@router.get("", response_model=ApplicationListResponse, dependencies=[_need_apps])
+def list_apps(
+    status: ApplicationStatus | None = Query(default=None),
+    search: str | None = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    items, total = ApplicationService(db, user.id).list_paginated(status, search, page, page_size)
+    return ApplicationListResponse(items=items, total=total, page=page, page_size=page_size)
 
 
 @router.get("/kanban", dependencies=[_need_kanban])
@@ -100,6 +111,18 @@ def generate(app_id: int, payload: GenerateRequest, user: User = Depends(get_cur
     return GenerateResponse(
         status="completed",
         documents=[GeneratedDocumentOut.model_validate(doc) for doc in docs],
+    )
+
+
+@router.post("/{app_id}/package", response_model=PackageResponse, dependencies=[_need_package])
+def generate_package(app_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Generate a complete application package: resume + cover letter + cold email in one call."""
+    docs, used, limit = ApplicationService(db, user.id).generate_package(app_id)
+    return PackageResponse(
+        status="completed",
+        documents=[GeneratedDocumentOut.model_validate(doc) for doc in docs],
+        packages_used_this_month=used,
+        monthly_package_limit=limit,
     )
 
 

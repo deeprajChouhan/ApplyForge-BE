@@ -129,6 +129,9 @@ def _text_contains(haystack: str, needle: str, threshold: float = 0.8) -> bool:
     needle_l = _normalise(needle)
     haystack_l = _normalise(haystack)
 
+    if not needle_l:
+        return False
+
     # Direct substring match
     if needle_l in haystack_l:
         return True

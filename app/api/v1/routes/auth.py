@@ -4,10 +4,11 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
 from app.db.session import get_db
-from app.models.models import User, UserFeature
+from app.models.models import User, UserFeature, UserProfile
 from app.schemas.auth import LoginRequest, RefreshRequest, RegisterRequest, TokenResponse, UserMe
 from app.services.auth.service import AuthService
 from app.services.auth.google_oauth import exchange_code_for_user
+from app.services.usage.service import UsageTracker
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -16,6 +17,11 @@ def _build_user_me(user: User, db: Session) -> UserMe:
     """Build UserMe response with populated features list."""
     feature_rows = db.query(UserFeature).filter_by(user_id=user.id, enabled=True).all()
     features = [f.feature.value for f in feature_rows]
+
+    profile = db.query(UserProfile).filter_by(user_id=user.id).first()
+    onboarding_completed = bool(profile.onboarding_completed) if profile else False
+
+    tracker = UsageTracker(db, user.id, model="")
     return UserMe(
         id=user.id,
         email=user.email,
@@ -24,6 +30,9 @@ def _build_user_me(user: User, db: Session) -> UserMe:
         subscription_status=user.subscription_status,
         token_budget_monthly=user.token_budget_monthly,
         features=features,
+        onboarding_completed=onboarding_completed,
+        packages_used_this_month=tracker.packages_used_this_month(),
+        monthly_package_limit=tracker.monthly_package_limit(user),
     )
 
 

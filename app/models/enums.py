@@ -58,6 +58,28 @@ class FeatureFlag(str, enum.Enum):
     chat = "chat"                       # AI chat assistant per application (pro+)
     multi_resume = "multi_resume"       # Multiple resumes + per-application RAG (pro+)
     job_crawler = "job_crawler"         # Automated daily job discovery crawler (pro+)
+    job_discovery = "job_discovery"     # Curated job discovery feed (pro+)
+    interview_practice = "interview_practice"  # AI mock interview practice (pro+)
+    package_generation = "package_generation"  # One-click application package (all plans, free=limited)
+
+
+class SupportTicketStatus(str, enum.Enum):
+    open = "open"
+    pending = "pending"
+    resolved = "resolved"
+    closed = "closed"
+
+
+class SupportTicketPriority(str, enum.Enum):
+    low = "low"
+    normal = "normal"
+    high = "high"
+    urgent = "urgent"
+
+
+class InterviewSessionStatus(str, enum.Enum):
+    in_progress = "in_progress"
+    completed = "completed"
 
 
 class WorkType(str, enum.Enum):

@@ -17,7 +17,7 @@ from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.models.enums import FeatureFlag
-from app.models.models import UsageEvent, UsageLedger, User
+from app.models.models import PLAN_PACKAGE_LIMITS, UsageEvent, UsageLedger, User
 
 logger = logging.getLogger(__name__)
 
@@ -137,3 +137,27 @@ class UsageTracker:
     def estimate_tokens(self, *texts: str) -> int:
         """Estimate the token count for one or more text strings."""
         return sum(_count_tokens_approx(t, self.model) for t in texts)
+
+    def packages_used_this_month(self) -> int:
+        """Return how many application packages this user has generated this month."""
+        month = _current_month()
+        ledger = self.db.query(UsageLedger).filter_by(user_id=self.user_id, month_year=month).first()
+        return ledger.packages_used if ledger else 0
+
+    def monthly_package_limit(self, user: User) -> int:
+        """Return the monthly application-package limit for this user's plan (-1 = unlimited)."""
+        return PLAN_PACKAGE_LIMITS.get(user.plan, 0)
+
+    def increment_packages_used(self) -> int:
+        """
+        Increment the monthly package-generation counter (upsert) and return the new total.
+        """
+        month = _current_month()
+        ledger = self.db.query(UsageLedger).filter_by(user_id=self.user_id, month_year=month).first()
+        if ledger:
+            ledger.packages_used += 1
+        else:
+            ledger = UsageLedger(user_id=self.user_id, month_year=month, packages_used=1)
+            self.db.add(ledger)
+        self.db.commit()
+        return ledger.packages_used
