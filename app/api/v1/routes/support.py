@@ -18,6 +18,7 @@ from app.schemas.support import (
     TicketMessageCreate,
     TicketMessageOut,
     TicketOut,
+    TicketUserStatusUpdate,
 )
 from app.services.support.service import SupportService
 
@@ -102,4 +103,18 @@ def reply_to_ticket(
 ):
     service = SupportService(db, user.id)
     service.add_message(ticket_id, payload.body, admin=False, request=request)
+    return _ticket_out(service, ticket_id)
+
+
+@router.post("/tickets/{ticket_id}/status", response_model=TicketOut)
+def set_ticket_status(
+    ticket_id: int,
+    payload: TicketUserStatusUpdate,
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Close or reopen your own ticket."""
+    service = SupportService(db, user.id)
+    service.set_status_by_user(ticket_id, payload.status, request=request)
     return _ticket_out(service, ticket_id)

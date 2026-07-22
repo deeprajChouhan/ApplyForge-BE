@@ -8,6 +8,7 @@ from app.api.v1.routes import interview
 from app.api.v1.routes import plans
 from app.api.v1.routes import analytics
 from app.api.v1.routes import support
+from app.api.v1.routes import extension
 
 api_router = APIRouter()
 api_router.include_router(auth.router)
@@ -27,3 +28,4 @@ api_router.include_router(interview.router)
 api_router.include_router(plans.router)
 api_router.include_router(analytics.router)
 api_router.include_router(support.router)
+api_router.include_router(extension.router)

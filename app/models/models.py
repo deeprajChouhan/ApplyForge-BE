@@ -476,6 +476,17 @@ class SupportTicket(Base, TimestampMixin):
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
 
 
+class UserExtensionState(Base, TimestampMixin):
+    """Per-user state for the ApplyForge Job Clipper browser extension."""
+    __tablename__ = "user_extension_state"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), unique=True, index=True)
+    connected_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    promo_dismissed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
 class SupportTicketMessage(Base):
     """A single message within a support ticket thread."""
     __tablename__ = "support_ticket_messages"

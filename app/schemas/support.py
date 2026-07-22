@@ -67,6 +67,11 @@ class TicketMessageCreate(BaseModel):
     body: str
 
 
+class TicketUserStatusUpdate(BaseModel):
+    """User-facing status change — limited to closing or reopening a ticket."""
+    status: str  # "closed" | "open"
+
+
 class AdminTicketUpdate(BaseModel):
     """Admin-only ticket update: change status, priority, and/or assignment."""
     status: Optional[str] = None

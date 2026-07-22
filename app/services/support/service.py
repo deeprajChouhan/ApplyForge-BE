@@ -152,6 +152,43 @@ class SupportService:
         )
         return message
 
+    def set_status_by_user(
+        self,
+        ticket_id: int,
+        new_status: str,
+        *,
+        request: Request | None = None,
+    ) -> SupportTicket:
+        """Allow the owning user to close or reopen their own ticket."""
+        if new_status not in ("closed", "open"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="You can only close or reopen a ticket.",
+            )
+        ticket = self.get_ticket(ticket_id)  # ownership enforced (not admin)
+        before = ticket.status
+        ticket.status = new_status
+        if new_status == "closed":
+            ticket.closed_at = datetime.utcnow()
+        else:
+            ticket.closed_at = None
+            ticket.resolved_at = None
+
+        self.db.commit()
+        self.db.refresh(ticket)
+
+        AuditService(self.db).log(
+            action="support_ticket_status_changed",
+            entity_type="support_ticket",
+            entity_id=ticket.id,
+            actor_user_id=self.user_id,
+            actor_role="user",
+            before={"status": before},
+            after={"status": ticket.status},
+            request=request,
+        )
+        return ticket
+
     # ── Admin ────────────────────────────────────────────────────────────
 
     def list_all(
