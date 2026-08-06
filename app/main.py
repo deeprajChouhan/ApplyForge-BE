@@ -165,6 +165,21 @@ def clear_admin_crawled_jobs() -> None:
         logger.warning("Admin crawled-jobs cleanup failed (non-fatal): %s", exc)
 
 
+@app.on_event("startup")
+def ensure_recruiter_schema() -> None:
+    """
+    Create the recruiter module's rec_* tables if missing. Isolated from the
+    consumer schema (its own tables, no cross foreign keys) and idempotent —
+    safe to run on every boot.
+    """
+    try:
+        from app.recruiter.init_db import ensure_recruiter_tables
+        ensure_recruiter_tables()
+        logger.info("recruiter schema ready (rec_* tables ensured).")
+    except Exception as exc:
+        logger.warning("recruiter schema bootstrap failed (non-fatal): %s", exc)
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
