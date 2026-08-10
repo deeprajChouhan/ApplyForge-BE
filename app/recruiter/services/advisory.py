@@ -17,7 +17,8 @@ from sqlalchemy.orm import Session
 from app.recruiter.models import CandidateProfile, Client, Role
 from app.recruiter.services import ai_support
 
-# Skill clusters → a suggested role archetype title.
+# Skill clusters → a suggested role archetype title. Covers both tech and
+# white-collar functions so the advisory names a sensible role either way.
 _ARCHETYPES: list[tuple[str, set[str]]] = [
     ("Backend Engineer", {"python", "fastapi", "django", "flask", "node.js", "go", "java", "postgresql", "rest"}),
     ("Frontend Engineer", {"react", "next.js", "typescript", "javascript", "tailwind", "html", "css"}),
@@ -25,6 +26,12 @@ _ARCHETYPES: list[tuple[str, set[str]]] = [
     ("DevOps / Platform Engineer", {"docker", "kubernetes", "terraform", "aws", "gcp", "azure", "ci/cd"}),
     ("Data Engineer", {"sql", "pandas", "numpy", "postgresql", "mysql", "mongodb", "redis"}),
     ("Product Manager", {"product management", "project management", "agile"}),
+    ("Account Executive", {"sales", "account management", "negotiation", "crm", "lead generation", "pipeline management", "quota attainment"}),
+    ("Customer Success Manager", {"customer success", "onboarding", "customer support", "churn reduction", "saas"}),
+    ("Finance / FP&A Analyst", {"financial analysis", "financial modeling", "forecasting", "budgeting", "fp&a", "accounting", "valuation"}),
+    ("Marketing Manager", {"digital marketing", "seo", "sem", "content marketing", "social media", "email marketing", "brand management", "campaign management"}),
+    ("Operations Manager", {"operations management", "supply chain", "logistics", "process improvement", "six sigma", "vendor management", "inventory management"}),
+    ("HR / People Partner", {"recruiting", "talent acquisition", "employee relations", "onboarding", "performance management", "hris", "compensation and benefits"}),
 ]
 
 _SENIOR_TERMS = {"senior", "lead", "principal", "staff", "head", "director", "vp", "chief"}
