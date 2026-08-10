@@ -1,0 +1,5 @@
+Bob Draper
+Graphic Designer
+bob@example.com
+
+Skills: Figma, HTML, CSS

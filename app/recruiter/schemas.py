@@ -34,6 +34,37 @@ class AgencyAdminOut(ORMModel):
     created_at: datetime | None = None
 
 
+# ── Clients ───────────────────────────────────────────────────────────────
+class ClientCreate(BaseModel):
+    name: str
+    industry: str | None = None
+
+
+class ClientOut(ORMModel):
+    id: int
+    agency_id: int
+    name: str
+    industry: str | None
+    role_count: int = 0
+
+
+# ── Next-hire advisory (company → next hire) ──────────────────────────────
+class NextHireSuggestionOut(BaseModel):
+    title: str
+    rationale: str
+    skills: list[str]
+    pool_supply: int
+    confidence: str  # low | medium | high
+
+
+class NextHireAdvisoryOut(BaseModel):
+    client_id: int
+    client_name: str
+    roster_roles: int
+    suggestions: list[NextHireSuggestionOut]
+    seniority_note: str | None
+
+
 # ── Recruiter auth ────────────────────────────────────────────────────────
 class RecruiterLoginRequest(BaseModel):
     email: EmailStr
@@ -136,7 +167,20 @@ class CandidateOut(ORMModel):
     location: str | None
     years_experience: float | None
     summary: str | None
+    provisioned_user_id: int | None = None
     skills: list[CandidateSkillOut] = Field(default_factory=list)
+
+
+# ── Provisioning bridge (convert profile → consumer user) ─────────────────
+class ConvertRequest(BaseModel):
+    consent: bool = False
+    email: str | None = None  # optional override when the profile has no email
+
+
+class ConvertResult(BaseModel):
+    candidate_id: int
+    provisioned_user_id: int
+    email: str
 
 
 class IngestResultItem(BaseModel):
@@ -149,6 +193,23 @@ class IngestResultItem(BaseModel):
 class IngestResult(BaseModel):
     ingested: int
     candidates: list[IngestResultItem]
+
+
+# ── Placement (candidate → roles) ─────────────────────────────────────────
+class RoleMatchOut(BaseModel):
+    role_id: int
+    title: str
+    seniority: str | None
+    status: str
+    fit_score: float
+    reasons: list[str]
+    gaps: list[str]
+    score_breakdown: dict
+
+
+class CandidateRoleMatchesOut(BaseModel):
+    candidate_id: int
+    matches: list[RoleMatchOut]
 
 
 # ── Shortlist / matching ──────────────────────────────────────────────────
@@ -166,6 +227,57 @@ class ShortlistOut(ORMModel):
     role_id: int
     created_at: datetime | None = None
     entries: list[ShortlistEntryOut] = Field(default_factory=list)
+
+
+# ── Job listing generation ────────────────────────────────────────────────
+class JobListingOut(BaseModel):
+    role_id: int
+    title: str
+    seniority: str | None
+    location: str | None
+    employment_type: str | None
+    salary_range: str | None
+    summary: str
+    responsibilities: list[str]
+    requirements: list[str]
+    nice_to_have: list[str]
+    top_pool_skills: list[str]
+    candidate_sample: int
+    content_markdown: str
+    polished_by_llm: bool
+
+
+# ── Market analytics ──────────────────────────────────────────────────────
+class SkillDemandSupplyOut(BaseModel):
+    skill: str
+    demand: int
+    supply: int
+    shortage: bool
+
+
+class SalarySummaryOut(BaseModel):
+    count: int
+    avg_min: int | None
+    avg_max: int | None
+    overall_min: int | None
+    overall_max: int | None
+
+
+class StageCountOut(BaseModel):
+    stage: str
+    count: int
+
+
+class MarketOverviewOut(BaseModel):
+    roles_total: int
+    roles_open: int
+    candidates_total: int
+    placements: int
+    time_to_fill_days: float | None
+    skills: list[SkillDemandSupplyOut]
+    shortages: list[SkillDemandSupplyOut]
+    salary: SalarySummaryOut
+    pipeline_funnel: list[StageCountOut]
 
 
 # ── Application (tracking) ─────────────────────────────────────────────────

@@ -148,6 +148,102 @@ def main() -> int:
     top_cand = client.get(f"{BASE}/agencies/{agency_id}/candidates/{top['candidate_id']}", headers=rec_h).json()
     assert top_cand["full_name"] == "Ada Lovelace" and top["fit_score"] >= 60, (top_cand, top)
 
+    # Phase 4 — clients + company→next-hire advisory.
+    client_resp = client.post(
+        f"{BASE}/agencies/{agency_id}/clients", headers=rec_h, json={"name": "Acme Corp", "industry": "SaaS"}
+    )
+    assert client_resp.status_code == 201, client_resp.text
+    client_id = client_resp.json()["id"]
+    # A frontend-heavy role for this client, so backend skills become a benchmark gap.
+    fe_role = client.post(
+        f"{BASE}/agencies/{agency_id}/roles",
+        headers=rec_h,
+        json={"title": "Frontend Engineer", "client_id": client_id, "required_skills": ["React", "TypeScript"]},
+    )
+    assert fe_role.status_code == 201, fe_role.text
+    advisory = client.get(f"{BASE}/agencies/{agency_id}/clients/{client_id}/next-hire", headers=rec_h)
+    assert advisory.status_code == 200, advisory.text
+    aj = advisory.json()
+    assert aj["roster_roles"] == 1 and aj["suggestions"], aj
+    # Backend skills (python/fastapi/postgresql) are in the book but not this client → suggested gap.
+    gap_skills = aj["suggestions"][0]["skills"]
+    assert any(s in gap_skills for s in ("python", "fastapi", "postgresql")), aj["suggestions"]
+
+    # Phase 4 — placement: rank open roles for the top candidate.
+    rm = client.get(
+        f"{BASE}/agencies/{agency_id}/candidates/{top['candidate_id']}/role-matches", headers=rec_h
+    )
+    assert rm.status_code == 200, rm.text
+    matches = rm.json()["matches"]
+    assert matches and matches[0]["role_id"] == role_id and matches[0]["fit_score"] >= 60, matches
+
+    # Phase 3 — grounded job-listing generation.
+    listing = client.post(f"{BASE}/agencies/{agency_id}/roles/{role_id}/listing", headers=rec_h)
+    assert listing.status_code == 200, listing.text
+    lj = listing.json()
+    assert "Senior Backend Engineer" in lj["content_markdown"], lj["content_markdown"][:200]
+    assert any("Python" in r for r in lj["requirements"]), lj["requirements"]
+    assert lj["candidate_sample"] == 2 and lj["polished_by_llm"] is False, lj
+
+    # Domain 2 — tracking-only pipeline: add, list, and move a candidate's stage.
+    app_created = client.post(
+        f"{BASE}/agencies/{agency_id}/applications",
+        headers=rec_h,
+        json={"candidate_id": top["candidate_id"], "role_id": role_id, "job_title": "Senior Backend Engineer", "stage": "sourced"},
+    )
+    assert app_created.status_code == 201, app_created.text
+    app_id = app_created.json()["id"]
+    listed = client.get(f"{BASE}/agencies/{agency_id}/applications", headers=rec_h)
+    assert listed.status_code == 200 and any(a["id"] == app_id for a in listed.json()), listed.text
+    moved = client.patch(
+        f"{BASE}/agencies/{agency_id}/applications/{app_id}/stage", headers=rec_h, json={"stage": "interview"}
+    )
+    assert moved.status_code == 200 and moved.json()["stage"] == "interview", moved.text
+
+    # Phase 3 — self-contained market analytics over the agency's own data.
+    market = client.get(f"{BASE}/agencies/{agency_id}/market", headers=rec_h)
+    assert market.status_code == 200, market.text
+    mj = market.json()
+    assert mj["candidates_total"] == 2 and mj["roles_total"] >= 1, mj
+    # Python is demanded by the role and present in the pool → not a shortage.
+    py = next((s for s in mj["skills"] if s["skill"] == "python"), None)
+    assert py and py["demand"] == 1 and py["supply"] >= 1 and py["shortage"] is False, mj["skills"]
+    # Funnel includes the interview-stage application moved earlier.
+    interview = next((f for f in mj["pipeline_funnel"] if f["stage"] == "interview"), None)
+    assert interview and interview["count"] == 1, mj["pipeline_funnel"]
+
+    # Section 5 — provisioning bridge: convert a profile into a real consumer user.
+    top_id = top["candidate_id"]
+    # Consent is required.
+    no_consent = client.post(
+        f"{BASE}/agencies/{agency_id}/candidates/{top_id}/convert", headers=rec_h, json={"consent": False}
+    )
+    assert no_consent.status_code == 400, no_consent.text
+    conv = client.post(
+        f"{BASE}/agencies/{agency_id}/candidates/{top_id}/convert", headers=rec_h, json={"consent": True}
+    )
+    assert conv.status_code == 201, conv.text
+    new_user_id = conv.json()["provisioned_user_id"]
+    # A real consumer user now exists with the candidate's email + imported profile.
+    from app.models.models import User as _User, UserProfile as _UP, Skill as _Skill
+    _db = SessionLocal()
+    try:
+        u = _db.get(_User, new_user_id)
+        assert u and u.email == "ada@example.com", u
+        prof = _db.query(_UP).filter(_UP.user_id == new_user_id).first()
+        assert prof and prof.full_name == "Ada Lovelace", prof
+        skills = {s.name.lower() for s in _db.query(_Skill).filter(_Skill.user_id == new_user_id).all()}
+        assert "python" in skills, skills
+    finally:
+        _db.close()
+    # The profile is now marked provisioned, and re-converting is refused (one-way).
+    cand_after = client.get(f"{BASE}/agencies/{agency_id}/candidates/{top_id}", headers=rec_h).json()
+    assert cand_after["provisioned_user_id"] == new_user_id, cand_after
+    again = client.post(
+        f"{BASE}/agencies/{agency_id}/candidates/{top_id}/convert", headers=rec_h, json={"consent": True}
+    )
+    assert again.status_code == 409, again.text
+
     # Operator deactivates the recruiter → login is refused.
     upd = client.patch(f"{BASE}/admin/recruiters/{recruiter_id}", headers=admin_h, json={"is_active": False})
     assert upd.status_code == 200 and upd.json()["is_active"] is False, upd.text

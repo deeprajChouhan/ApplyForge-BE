@@ -59,6 +59,13 @@ class Settings(BaseSettings):
     langsmith_project: str = "applyforge"
     langsmith_enabled: bool = True
 
+    # Recruiter → consumer provisioning bridge (Section 5). Left unset in the
+    # integrated deployment (the bridge then calls the provisioning service
+    # in-process). Set these only if the recruiter platform runs as a separate
+    # service that must reach this backend over HTTP.
+    applyforge_provisioning_url: str | None = None
+    applyforge_provisioning_key: SecretStr | None = None
+
     model_config = SettingsConfigDict(env_file=str(_ENV_FILE), extra="ignore")
 
     @property

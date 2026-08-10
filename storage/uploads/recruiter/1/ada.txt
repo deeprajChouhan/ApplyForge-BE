@@ -1,0 +1,6 @@
+Ada Lovelace
+Senior Backend Engineer
+ada@example.com
+
+8 years of Python, FastAPI, PostgreSQL, Docker, Kubernetes, AWS, REST.
+Skills: Python, FastAPI, PostgreSQL, Docker, Kubernetes, AWS, REST

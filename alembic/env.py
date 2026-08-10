@@ -5,6 +5,7 @@ from alembic import context
 from app.core.config import settings
 from app.db.base import Base
 import app.models.models  # noqa
+import app.recruiter.models  # noqa  (register rec_* tables on the shared metadata)
 
 config = context.config
 
