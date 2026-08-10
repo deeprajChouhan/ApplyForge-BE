@@ -16,6 +16,7 @@ from datetime import date, datetime
 
 from sqlalchemy import (
     JSON,
+    Boolean,
     Date,
     DateTime,
     Enum as SAEnum,
@@ -149,6 +150,19 @@ class Role(Base, RecTimestampMixin):
     salary_min: Mapped[int | None] = mapped_column(Integer)
     salary_max: Mapped[int | None] = mapped_column(Integer)
 
+    # Budget the client has committed for this hire (distinct from salary range,
+    # which is what we publish to candidates). Used for margin and reconciliation
+    # against candidate expected budgets.
+    budget_min: Mapped[int | None] = mapped_column(Integer)
+    budget_max: Mapped[int | None] = mapped_column(Integer)
+    budget_currency: Mapped[str] = mapped_column(String(8), default="USD", server_default="USD", nullable=False)
+
+    # Drafts don't show up in active pipeline aggregates and can be shared with
+    # the client for feedback before publishing.
+    is_draft: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
+    market_snapshot: Mapped[dict | None] = mapped_column(JSON)
+    notes: Mapped[str | None] = mapped_column(Text)
+
     embedding: Mapped[list[float] | None] = mapped_column(JSON)
 
     agency: Mapped["Agency"] = relationship(back_populates="roles")
@@ -182,6 +196,14 @@ class CandidateProfile(Base, RecTimestampMixin):
     raw_cv_text: Mapped[str | None] = mapped_column(Text)
     source_file: Mapped[str | None] = mapped_column(String(500))
     embedding: Mapped[list[float] | None] = mapped_column(JSON)
+
+    # Candidate-declared expectations. Populated during ingestion (LLM parse)
+    # or edited manually in the profile drawer; consumed by role-match margin.
+    expected_budget_min: Mapped[int | None] = mapped_column(Integer)
+    expected_budget_max: Mapped[int | None] = mapped_column(Integer)
+    expected_budget_currency: Mapped[str] = mapped_column(
+        String(8), default="USD", server_default="USD", nullable=False
+    )
 
     # Set once converted to a real ApplyForge user (provisioning bridge).
     provisioned_user_id: Mapped[int | None] = mapped_column(Integer)
@@ -317,7 +339,45 @@ class Application(Base, RecTimestampMixin):
     notes: Mapped[str | None] = mapped_column(Text)
     last_activity_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
+    # Cached fit_score from the shortlist entry the candidate was assigned from,
+    # so Kanban cards don't need to re-query the shortlist on every render.
+    fit_score: Mapped[float | None] = mapped_column(Float)
+    added_from_shortlist_id: Mapped[int | None] = mapped_column(Integer)
+
+    # Per-candidate-in-this-role SWOT payload. Shape:
+    #   {"strengths": [str], "weaknesses": [str], "opportunities": [str],
+    #    "threats": [str], "generated_at": iso, "model": str}
+    swot: Mapped[dict | None] = mapped_column(JSON)
+
     candidate: Mapped["CandidateProfile"] = relationship()
+
+
+class MarketSnapshot(Base):
+    """
+    Crawler-sourced compensation & demand data for a role query. Kept as
+    lightweight aggregates (percentiles, top skills, competing titles) so the
+    role-draft screen can show a "market context" panel that clients trust.
+    """
+    __tablename__ = "rec_market_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    agency_id: Mapped[int] = mapped_column(
+        ForeignKey("rec_agencies.id", ondelete="CASCADE"), index=True
+    )
+    role_id: Mapped[int | None] = mapped_column(
+        ForeignKey("rec_roles.id", ondelete="SET NULL"), index=True
+    )
+    query: Mapped[str] = mapped_column(String(300), nullable=False)
+    location: Mapped[str | None] = mapped_column(String(200))
+    sample_size: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    salary_p25: Mapped[int | None] = mapped_column(Integer)
+    salary_p50: Mapped[int | None] = mapped_column(Integer)
+    salary_p75: Mapped[int | None] = mapped_column(Integer)
+    currency: Mapped[str] = mapped_column(String(8), default="USD", server_default="USD")
+    top_skills: Mapped[list[str] | None] = mapped_column(JSON)
+    competing_roles: Mapped[list[str] | None] = mapped_column(JSON)
+    sources: Mapped[list[str] | None] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
 # All recruiter tables — used to create just these on startup without touching
@@ -335,4 +395,5 @@ RECRUITER_TABLES = [
     Application.__table__,
     UsageEvent.__table__,
     AgencyInvite.__table__,
+    MarketSnapshot.__table__,
 ]

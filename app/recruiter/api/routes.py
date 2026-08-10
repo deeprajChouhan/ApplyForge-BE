@@ -10,11 +10,25 @@ from sqlalchemy.orm import Session
 
 from app.db.session import get_db
 from app.recruiter.api.deps import get_agency, require_agency_feature, require_unlocked_agency
-from app.recruiter.models import Agency, Application, CandidateProfile, Client, Role, Shortlist
+from app.recruiter.enums import ApplicationStage
+from app.recruiter.models import (
+    Agency,
+    Application,
+    CandidateProfile,
+    Client,
+    MarketSnapshot,
+    Role,
+    Shortlist,
+    ShortlistEntry,
+)
 from app.recruiter.schemas import (
     ApplicationCreate,
     ApplicationOut,
     ApplicationStageUpdate,
+    AssignCandidatesRequest,
+    AssignCandidatesResult,
+    CandidateBudgetUpdate,
+    CandidateDetailOut,
     CandidateOut,
     CandidateRoleMatchesOut,
     ClientCreate,
@@ -25,12 +39,17 @@ from app.recruiter.schemas import (
     IngestResultItem,
     JobListingOut,
     MarketOverviewOut,
+    MarketSnapshotOut,
     NextHireAdvisoryOut,
     NextHireSuggestionOut,
+    RoleBoardColumn,
+    RoleBoardOut,
     RoleCreate,
     RoleMatchOut,
     RoleOut,
+    RoleUpdate,
     ShortlistOut,
+    SwotOut,
 )
 from app.recruiter.bridge import provision_candidate
 from app.recruiter.enums import UsageKind
@@ -39,10 +58,12 @@ from app.recruiter.services.advisory import next_hire_advisory
 from app.recruiter.services.ingestion import ingest_batch
 from app.recruiter.services.listing import generate_listing
 from app.recruiter.services.market import compute_market
+from app.recruiter.services.market_crawler import crawl_role_market
 from app.recruiter.services.matching import embed_role
 from app.recruiter.services.placement import rank_roles_for_candidate
 from app.recruiter.services.shortlist import generate_shortlist
 from app.recruiter.services.skills import normalize_skill
+from app.recruiter.services.swot import compute_swot
 
 # Agencies are created and listed via the operator/admin routes
 # (app/recruiter/api/admin_routes.py); recruiters get their own agency from
@@ -156,6 +177,11 @@ def create_role(
         min_years_experience=payload.min_years_experience,
         salary_min=payload.salary_min,
         salary_max=payload.salary_max,
+        budget_min=payload.budget_min,
+        budget_max=payload.budget_max,
+        budget_currency=payload.budget_currency or "USD",
+        is_draft=payload.is_draft,
+        notes=payload.notes,
     )
     db.add(role)
     db.flush()
@@ -163,6 +189,57 @@ def create_role(
     db.commit()
     db.refresh(role)
     return role
+
+
+@roles_router.patch("/{role_id}", response_model=RoleOut)
+def update_role(
+    role_id: int,
+    payload: RoleUpdate,
+    agency: Agency = Depends(require_unlocked_agency),
+    db: Session = Depends(get_db),
+):
+    """Partial-update. Re-embeds if any signal used by the vector changed."""
+    role = db.get(Role, role_id)
+    if role is None or role.agency_id != agency.id:
+        raise HTTPException(status_code=404, detail="Role not found")
+
+    reembed = False
+    data = payload.model_dump(exclude_unset=True)
+    if "required_skills" in data:
+        data["required_skills"] = _normalize_skills(data["required_skills"] or [])
+        reembed = True
+    if "preferred_skills" in data:
+        data["preferred_skills"] = _normalize_skills(data["preferred_skills"] or [])
+        reembed = True
+    for k in ("title", "description", "seniority"):
+        if k in data:
+            reembed = True
+
+    for k, v in data.items():
+        setattr(role, k, v)
+
+    if reembed:
+        role.embedding = embed_role(role)
+    db.commit()
+    db.refresh(role)
+    return role
+
+
+@roles_router.post("/{role_id}/market", response_model=MarketSnapshotOut, status_code=201)
+def refresh_market_snapshot(
+    role_id: int,
+    agency: Agency = Depends(require_unlocked_agency),
+    db: Session = Depends(get_db),
+):
+    """
+    Run the market crawler for this role and cache the aggregate on the role
+    itself. Used by the role-draft screen and the client-shareable view.
+    """
+    role = db.get(Role, role_id)
+    if role is None or role.agency_id != agency.id:
+        raise HTTPException(status_code=404, detail="Role not found")
+    snap = crawl_role_market(db, agency.id, role=role)
+    return snap
 
 
 @roles_router.get("", response_model=list[RoleOut])
@@ -239,7 +316,7 @@ def list_candidates(agency: Agency = Depends(get_agency), db: Session = Depends(
     )
 
 
-@candidates_router.get("/{candidate_id}", response_model=CandidateOut)
+@candidates_router.get("/{candidate_id}", response_model=CandidateDetailOut)
 def get_candidate(
     candidate_id: int,
     agency: Agency = Depends(get_agency),
@@ -286,6 +363,24 @@ def convert_candidate(
     db.commit()
     db.refresh(cand)
     return ConvertResult(candidate_id=cand.id, provisioned_user_id=user_id, email=email)
+
+
+@candidates_router.patch("/{candidate_id}/budget", response_model=CandidateOut)
+def update_candidate_budget(
+    candidate_id: int,
+    payload: CandidateBudgetUpdate,
+    agency: Agency = Depends(require_unlocked_agency),
+    db: Session = Depends(get_db),
+):
+    cand = db.get(CandidateProfile, candidate_id)
+    if cand is None or cand.agency_id != agency.id:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+    cand.expected_budget_min = payload.expected_budget_min
+    cand.expected_budget_max = payload.expected_budget_max
+    cand.expected_budget_currency = payload.expected_budget_currency or "USD"
+    db.commit()
+    db.refresh(cand)
+    return cand
 
 
 @candidates_router.get("/{candidate_id}/role-matches", response_model=CandidateRoleMatchesOut)
@@ -421,6 +516,132 @@ def update_stage(
     db.commit()
     db.refresh(app_row)
     return app_row
+
+
+# ── Role pipeline (Kanban board per role) ────────────────────────────────
+pipeline_router = APIRouter(
+    prefix="/agencies/{agency_id}/roles/{role_id}/pipeline", tags=["recruiter: pipeline"]
+)
+
+
+def _application_out(app_row: Application) -> ApplicationOut:
+    return ApplicationOut.model_validate(app_row)
+
+
+@pipeline_router.get("", response_model=RoleBoardOut)
+def role_pipeline(
+    role_id: int,
+    agency: Agency = Depends(get_agency),
+    db: Session = Depends(get_db),
+):
+    """Kanban board: one column per stage, cards ordered by fit_score desc."""
+    role = _load_role(db, agency, role_id)
+    apps = (
+        db.query(Application)
+        .filter(Application.agency_id == agency.id, Application.role_id == role.id)
+        .all()
+    )
+    by_stage: dict[ApplicationStage, list[Application]] = {s: [] for s in ApplicationStage}
+    for a in apps:
+        by_stage.setdefault(a.stage, []).append(a)
+    columns = [
+        RoleBoardColumn(
+            stage=stage,
+            applications=[
+                _application_out(a)
+                for a in sorted(
+                    rows,
+                    key=lambda r: (r.fit_score or -1, r.last_activity_at),
+                    reverse=True,
+                )
+            ],
+        )
+        for stage, rows in by_stage.items()
+    ]
+    return RoleBoardOut(role_id=role.id, columns=columns, total=len(apps))
+
+
+@pipeline_router.post("/assign", response_model=AssignCandidatesResult, status_code=201)
+def assign_candidates_to_role(
+    role_id: int,
+    payload: AssignCandidatesRequest,
+    agency: Agency = Depends(require_unlocked_agency),
+    db: Session = Depends(get_db),
+):
+    """
+    Attach shortlisted candidates to this role's pipeline. Idempotent:
+    candidates already in the pipeline are returned in `skipped_existing`.
+    Caches fit_score on the Application if a shortlist_id is provided.
+    """
+    role = _load_role(db, agency, role_id)
+
+    fit_by_cand: dict[int, float] = {}
+    if payload.shortlist_id is not None:
+        sl = db.get(Shortlist, payload.shortlist_id)
+        if sl is None or sl.agency_id != agency.id or sl.role_id != role.id:
+            raise HTTPException(status_code=404, detail="Shortlist not found for this role")
+        for e in sl.entries:
+            fit_by_cand[e.candidate_id] = e.fit_score
+
+    existing_cand_ids = {
+        a.candidate_id
+        for a in db.query(Application)
+        .filter(Application.agency_id == agency.id, Application.role_id == role.id)
+        .all()
+    }
+
+    added_rows: list[Application] = []
+    skipped: list[int] = []
+    for cand_id in payload.candidate_ids:
+        if cand_id in existing_cand_ids:
+            skipped.append(cand_id)
+            continue
+        cand = db.get(CandidateProfile, cand_id)
+        if cand is None or cand.agency_id != agency.id:
+            skipped.append(cand_id)
+            continue
+        app_row = Application(
+            agency_id=agency.id,
+            candidate_id=cand_id,
+            role_id=role.id,
+            company_name=None,
+            job_title=role.title,
+            stage=payload.stage,
+            fit_score=fit_by_cand.get(cand_id),
+            added_from_shortlist_id=payload.shortlist_id,
+        )
+        db.add(app_row)
+        added_rows.append(app_row)
+
+    db.commit()
+    for a in added_rows:
+        db.refresh(a)
+    return AssignCandidatesResult(
+        added=[_application_out(a) for a in added_rows],
+        skipped_existing=skipped,
+    )
+
+
+@applications_router.post("/{application_id}/swot", response_model=SwotOut)
+def application_swot(
+    application_id: int,
+    agency: Agency = Depends(require_unlocked_agency),
+    db: Session = Depends(get_db),
+):
+    """Generate (or regenerate) a role-aware SWOT for this candidate-in-role."""
+    app_row = db.get(Application, application_id)
+    if app_row is None or app_row.agency_id != agency.id:
+        raise HTTPException(status_code=404, detail="Application not found")
+    if app_row.role_id is None:
+        raise HTTPException(status_code=400, detail="Application is not attached to a role")
+    role = db.get(Role, app_row.role_id)
+    cand = db.get(CandidateProfile, app_row.candidate_id)
+    if role is None or cand is None:
+        raise HTTPException(status_code=404, detail="Role or candidate missing")
+    swot = compute_swot(role, cand, app_row)
+    app_row.swot = swot
+    db.commit()
+    return SwotOut(**swot)
 
 
 # ── Market analytics (self-contained over the agency's own data) ──────────

@@ -10,6 +10,7 @@ from app.recruiter.api.routes import (
     candidates_router,
     clients_router,
     market_router,
+    pipeline_router,
     roles_router,
     shortlist_router,
 )
@@ -25,5 +26,6 @@ recruiter_router.include_router(clients_router)
 recruiter_router.include_router(roles_router)
 recruiter_router.include_router(candidates_router)
 recruiter_router.include_router(shortlist_router)
+recruiter_router.include_router(pipeline_router)
 recruiter_router.include_router(applications_router)
 recruiter_router.include_router(market_router)

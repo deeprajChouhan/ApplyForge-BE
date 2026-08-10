@@ -1,7 +1,7 @@
 """Pydantic request/response schemas for the recruiter API (Phase 1)."""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
@@ -263,6 +263,32 @@ class RoleCreate(BaseModel):
     min_years_experience: float | None = None
     salary_min: int | None = None
     salary_max: int | None = None
+    budget_min: int | None = None
+    budget_max: int | None = None
+    budget_currency: str = "USD"
+    is_draft: bool = False
+    notes: str | None = None
+
+
+class RoleUpdate(BaseModel):
+    """Partial-update payload for the role detail page."""
+    title: str | None = None
+    description: str | None = None
+    client_id: int | None = None
+    status: RoleStatus | None = None
+    employment_type: EmploymentType | None = None
+    location: str | None = None
+    seniority: str | None = None
+    required_skills: list[str] | None = None
+    preferred_skills: list[str] | None = None
+    min_years_experience: float | None = None
+    salary_min: int | None = None
+    salary_max: int | None = None
+    budget_min: int | None = None
+    budget_max: int | None = None
+    budget_currency: str | None = None
+    is_draft: bool | None = None
+    notes: str | None = None
 
 
 class RoleOut(ORMModel):
@@ -280,6 +306,12 @@ class RoleOut(ORMModel):
     min_years_experience: float | None
     salary_min: int | None
     salary_max: int | None
+    budget_min: int | None = None
+    budget_max: int | None = None
+    budget_currency: str = "USD"
+    is_draft: bool = False
+    market_snapshot: dict | None = None
+    notes: str | None = None
 
 
 # ── Candidate ─────────────────────────────────────────────────────────────
@@ -298,7 +330,34 @@ class CandidateOut(ORMModel):
     years_experience: float | None
     summary: str | None
     provisioned_user_id: int | None = None
+    expected_budget_min: int | None = None
+    expected_budget_max: int | None = None
+    expected_budget_currency: str = "USD"
     skills: list[CandidateSkillOut] = Field(default_factory=list)
+
+
+class CandidateBudgetUpdate(BaseModel):
+    expected_budget_min: int | None = None
+    expected_budget_max: int | None = None
+    expected_budget_currency: str = "USD"
+
+
+class CandidateExperienceOut(ORMModel):
+    id: int
+    title: str | None
+    company: str | None
+    start_date: date | None = None
+    end_date: date | None = None
+    description: str | None
+
+
+class CandidateDetailOut(CandidateOut):
+    """Full-profile payload for the shared candidate drawer."""
+    phone: str | None = None
+    location: str | None = None
+    summary: str | None = None
+    source_file: str | None = None
+    experiences: list[CandidateExperienceOut] = Field(default_factory=list)
 
 
 # ── Provisioning bridge (convert profile → consumer user) ─────────────────
@@ -432,4 +491,59 @@ class ApplicationOut(ORMModel):
     job_title: str | None
     stage: ApplicationStage
     notes: str | None
+    fit_score: float | None = None
+    added_from_shortlist_id: int | None = None
+    swot: dict | None = None
     last_activity_at: datetime | None = None
+
+
+class SwotOut(BaseModel):
+    strengths: list[str] = Field(default_factory=list)
+    weaknesses: list[str] = Field(default_factory=list)
+    opportunities: list[str] = Field(default_factory=list)
+    threats: list[str] = Field(default_factory=list)
+    generated_at: datetime
+    model: str
+
+
+class AssignCandidatesRequest(BaseModel):
+    """
+    Attach one or more shortlisted candidates to a role's pipeline. Idempotent:
+    a candidate already in the pipeline is skipped (not duplicated).
+    """
+    candidate_ids: list[int] = Field(default_factory=list, min_length=1)
+    stage: ApplicationStage = ApplicationStage.sourced
+    shortlist_id: int | None = None
+
+
+class AssignCandidatesResult(BaseModel):
+    added: list[ApplicationOut]
+    skipped_existing: list[int]
+
+
+class RoleBoardColumn(BaseModel):
+    stage: ApplicationStage
+    applications: list[ApplicationOut]
+
+
+class RoleBoardOut(BaseModel):
+    """Kanban payload — one column per pipeline stage, ordered by fit."""
+    role_id: int
+    columns: list[RoleBoardColumn]
+    total: int
+
+
+class MarketSnapshotOut(ORMModel):
+    id: int
+    role_id: int | None
+    query: str
+    location: str | None
+    sample_size: int
+    salary_p25: int | None
+    salary_p50: int | None
+    salary_p75: int | None
+    currency: str
+    top_skills: list[str] | None
+    competing_roles: list[str] | None
+    sources: list[str] | None
+    created_at: datetime | None = None
