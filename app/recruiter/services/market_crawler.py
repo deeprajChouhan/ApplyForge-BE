@@ -16,6 +16,7 @@ sources contributed, so the role page can show provenance.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Iterable
@@ -23,8 +24,38 @@ from typing import Callable, Iterable
 from sqlalchemy.orm import Session
 
 from app.recruiter.models import MarketSnapshot, Role
+from app.recruiter.services.skills import normalize_skill
+from app.services.crawler.sources import fetch_arbeitnow, fetch_remoteok
 
 logger = logging.getLogger(__name__)
+
+
+# ── Salary parsing ─────────────────────────────────────────────────────────
+# Consumer crawler returns salary as a human string ("$120,000 – $160,000",
+# "£70k – £90k", "80000+"). Parse both anchors to ints for percentile math.
+_NUM_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*(k|K)?")
+
+
+def _parse_salary_pair(text: str | None) -> tuple[int | None, int | None]:
+    if not text:
+        return None, None
+    nums: list[int] = []
+    for m in _NUM_RE.finditer(text):
+        raw = m.group(1).replace(",", "")
+        try:
+            val = float(raw)
+        except ValueError:
+            continue
+        if m.group(2):  # 'k' suffix
+            val *= 1000
+        # Ignore tiny numbers (like 401k, 2025, etc.) and giant garbage.
+        if 5_000 <= val <= 5_000_000:
+            nums.append(int(val))
+    if not nums:
+        return None, None
+    if len(nums) == 1:
+        return nums[0], nums[0]
+    return min(nums), max(nums)
 
 
 @dataclass
@@ -46,19 +77,73 @@ SourceFetcher = Callable[[str, str | None], list[ExternalPosting]]
 # location) and returns a list of ExternalPosting. Failing fetchers are logged
 # and skipped — one bad source never kills the crawl.
 
-def _fetch_adzuna(query: str, location: str | None) -> list[ExternalPosting]:  # pragma: no cover — stub
-    # TODO: wire Adzuna API using app.core.config.settings when credentials land.
-    return []
+def _country_from_location(location: str | None) -> str | None:
+    """Very light heuristic — turn a role location into a 2-letter country hint."""
+    if not location:
+        return None
+    low = location.lower()
+    for code, kws in {
+        "gb": ("uk", "united kingdom", "london", "manchester"),
+        "us": ("usa", "united states", "new york", "san francisco"),
+        "in": ("india", "bengaluru", "bangalore", "mumbai", "delhi"),
+        "de": ("germany", "berlin", "munich"),
+        "ca": ("canada", "toronto", "vancouver"),
+    }.items():
+        if any(k in low for k in kws):
+            return code
+    return None
 
 
-def _fetch_remoteok(query: str, location: str | None) -> list[ExternalPosting]:  # pragma: no cover
-    # TODO: RemoteOK JSON feed; free, keyless. Salary parsing is fuzzy — worth it.
+def _fetch_remoteok(query: str, location: str | None) -> list[ExternalPosting]:
+    """Free, keyless. Salary strings are fuzzy but usable in aggregate."""
+    jobs = fetch_remoteok([query], work_type="any", country=_country_from_location(location))
+    out: list[ExternalPosting] = []
+    for j in jobs:
+        lo, hi = _parse_salary_pair(j.get("salary_range"))
+        tags = [normalize_skill(t) for t in (j.get("tags") or []) if t]
+        out.append(
+            ExternalPosting(
+                title=j.get("title") or "",
+                salary_min=lo,
+                salary_max=hi,
+                currency="USD",
+                skills=[t for t in tags if t],
+                source="remoteok",
+            )
+        )
+    return out
+
+
+def _fetch_arbeitnow(query: str, location: str | None) -> list[ExternalPosting]:
+    """Global board, paginated. Salaries are frequently blank — we still keep
+    titles + tags for the demand signal."""
+    jobs = fetch_arbeitnow([query], work_type="any", country=_country_from_location(location))
+    out: list[ExternalPosting] = []
+    for j in jobs:
+        lo, hi = _parse_salary_pair(j.get("salary_range"))
+        tags = [normalize_skill(t) for t in (j.get("tags") or []) if t]
+        out.append(
+            ExternalPosting(
+                title=j.get("title") or "",
+                salary_min=lo,
+                salary_max=hi,
+                currency="EUR",  # Arbeitnow tilts EU; downstream code respects role currency
+                skills=[t for t in tags if t],
+                source="arbeitnow",
+            )
+        )
+    return out
+
+
+def _fetch_adzuna(query: str, location: str | None) -> list[ExternalPosting]:  # pragma: no cover
+    # Kept as a stub — Adzuna needs an API key. Wire when credentials are provisioned.
     return []
 
 
 _SOURCES: dict[str, SourceFetcher] = {
-    "adzuna": _fetch_adzuna,
     "remoteok": _fetch_remoteok,
+    "arbeitnow": _fetch_arbeitnow,
+    "adzuna": _fetch_adzuna,
 }
 
 
@@ -197,3 +282,41 @@ def crawl_role_market(
     db.commit()
     db.refresh(snap)
     return snap
+
+
+def crawl_agency_market(
+    db: Session,
+    agency_id: int,
+    *,
+    max_queries: int = 6,
+) -> list[MarketSnapshot]:
+    """
+    Fan-out: crawl the top-N most common titles across the agency's open,
+    non-draft roles. Skips roles missing a title. Returns the snapshots created.
+    """
+    from collections import Counter
+    from app.recruiter.enums import RoleStatus
+
+    roles = (
+        db.query(Role)
+        .filter(Role.agency_id == agency_id, Role.status == RoleStatus.open, Role.is_draft.is_(False))
+        .all()
+    )
+    counter: Counter[str] = Counter()
+    role_by_title: dict[str, Role] = {}
+    for r in roles:
+        if not r.title:
+            continue
+        key = r.title.strip()
+        counter[key] += 1
+        role_by_title.setdefault(key, r)  # pick the first role for a title as the "context"
+
+    snaps: list[MarketSnapshot] = []
+    for title, _n in counter.most_common(max_queries):
+        try:
+            snap = crawl_role_market(db, agency_id, role=role_by_title.get(title), query=title)
+            snaps.append(snap)
+        except Exception:  # pragma: no cover
+            logger.exception("agency market crawl failed for title=%s", title)
+            continue
+    return snaps

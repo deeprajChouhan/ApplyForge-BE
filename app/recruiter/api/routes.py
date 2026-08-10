@@ -8,16 +8,27 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from sqlalchemy.orm import Session
 
+import secrets
+
 from app.db.session import get_db
-from app.recruiter.api.deps import get_agency, require_agency_feature, require_unlocked_agency
+from app.recruiter.api.deps import (
+    RECRUITER_ACCESS,
+    get_agency,
+    oauth2_recruiter,
+    require_agency_feature,
+    require_unlocked_agency,
+)
 from app.recruiter.enums import ApplicationStage
 from app.recruiter.models import (
     Agency,
     Application,
+    ApplicationNote,
     CandidateProfile,
     Client,
     MarketSnapshot,
+    Recruiter,
     Role,
+    RoleShareToken,
     Shortlist,
     ShortlistEntry,
 )
@@ -25,26 +36,33 @@ from app.recruiter.schemas import (
     ApplicationCreate,
     ApplicationOut,
     ApplicationStageUpdate,
+    ApplicationNoteCreate,
+    ApplicationNoteOut,
     AssignCandidatesRequest,
     AssignCandidatesResult,
     CandidateBudgetUpdate,
     CandidateDetailOut,
     CandidateOut,
     CandidateRoleMatchesOut,
+    ClientAnalyticsOut,
     ClientCreate,
     ClientOut,
+    ClientUpdate,
     ConvertRequest,
     ConvertResult,
     IngestResult,
     IngestResultItem,
     JobListingOut,
+    MarketCrawlResult,
     MarketOverviewOut,
     MarketSnapshotOut,
     NextHireAdvisoryOut,
     NextHireSuggestionOut,
+    PublicRoleView,
     RoleBoardColumn,
     RoleBoardOut,
     RoleCreate,
+    RoleShareTokenOut,
     RoleMatchOut,
     RoleOut,
     RoleUpdate,
@@ -55,15 +73,37 @@ from app.recruiter.bridge import provision_candidate
 from app.recruiter.enums import UsageKind
 from app.recruiter.services import usage as usage_service
 from app.recruiter.services.advisory import next_hire_advisory
+from app.recruiter.services.client_analytics import compute_client_analytics
 from app.recruiter.services.ingestion import ingest_batch
 from app.recruiter.services.listing import generate_listing
 from app.recruiter.services.market import compute_market
-from app.recruiter.services.market_crawler import crawl_role_market
+from app.recruiter.services.market_crawler import crawl_agency_market, crawl_role_market
 from app.recruiter.services.matching import embed_role
 from app.recruiter.services.placement import rank_roles_for_candidate
 from app.recruiter.services.shortlist import generate_shortlist
 from app.recruiter.services.skills import normalize_skill
 from app.recruiter.services.swot import compute_swot
+
+from jose import JWTError, jwt
+from app.core.config import settings
+
+
+def _soft_recruiter(
+    token: str | None = Depends(oauth2_recruiter),
+    db: Session = Depends(get_db),
+) -> Recruiter | None:
+    """Best-effort recruiter attribution — returns None for operator callers or
+    unauthenticated flows so notes still record with kind=note but no author."""
+    if not token:
+        return None
+    try:
+        payload = jwt.decode(token, settings.secret_key, algorithms=[settings.jwt_algorithm])
+        if payload.get("type") != RECRUITER_ACCESS:
+            return None
+        rec = db.get(Recruiter, int(payload.get("sub")))
+        return rec if rec and rec.is_active else None
+    except (JWTError, ValueError):
+        return None
 
 # Agencies are created and listed via the operator/admin routes
 # (app/recruiter/api/admin_routes.py); recruiters get their own agency from
@@ -81,6 +121,12 @@ def _client_out(db: Session, client: Client) -> ClientOut:
         name=client.name,
         industry=client.industry,
         role_count=count,
+        primary_contact_name=client.primary_contact_name,
+        contact_email=client.contact_email,
+        contact_phone=client.contact_phone,
+        website=client.website,
+        address=client.address,
+        notes=client.notes,
     )
 
 
@@ -113,6 +159,33 @@ def _load_client(db: Session, agency: Agency, client_id: int) -> Client:
 @clients_router.get("/{client_id}", response_model=ClientOut)
 def get_client(client_id: int, agency: Agency = Depends(get_agency), db: Session = Depends(get_db)):
     return _client_out(db, _load_client(db, agency, client_id))
+
+
+@clients_router.patch("/{client_id}", response_model=ClientOut)
+def update_client(
+    client_id: int,
+    payload: ClientUpdate,
+    agency: Agency = Depends(require_unlocked_agency),
+    db: Session = Depends(get_db),
+):
+    client = _load_client(db, agency, client_id)
+    data = payload.model_dump(exclude_unset=True)
+    for k, v in data.items():
+        setattr(client, k, v)
+    db.commit()
+    db.refresh(client)
+    return _client_out(db, client)
+
+
+@clients_router.get("/{client_id}/analytics", response_model=ClientAnalyticsOut)
+def client_analytics(
+    client_id: int,
+    agency: Agency = Depends(get_agency),
+    db: Session = Depends(get_db),
+):
+    """Fulfilment metrics, pipeline health, top skills, and recent placements."""
+    client = _load_client(db, agency, client_id)
+    return ClientAnalyticsOut(**compute_client_analytics(db, client))
 
 
 @clients_router.get("/{client_id}/next-hire", response_model=NextHireAdvisoryOut)
@@ -223,6 +296,85 @@ def update_role(
     db.commit()
     db.refresh(role)
     return role
+
+
+@roles_router.get("/{role_id}/share", response_model=RoleShareTokenOut | None)
+def get_role_share(
+    role_id: int,
+    agency: Agency = Depends(get_agency),
+    db: Session = Depends(get_db),
+):
+    role = db.get(Role, role_id)
+    if role is None or role.agency_id != agency.id:
+        raise HTTPException(status_code=404, detail="Role not found")
+    tok = (
+        db.query(RoleShareToken)
+        .filter(RoleShareToken.role_id == role.id, RoleShareToken.is_active.is_(True))
+        .order_by(RoleShareToken.id.desc())
+        .first()
+    )
+    if not tok:
+        return None
+    return _share_out(tok)
+
+
+@roles_router.post("/{role_id}/share", response_model=RoleShareTokenOut, status_code=201)
+def create_role_share(
+    role_id: int,
+    agency: Agency = Depends(require_unlocked_agency),
+    db: Session = Depends(get_db),
+):
+    """Mint (or rotate) a public share token. Any previous active token is revoked."""
+    role = db.get(Role, role_id)
+    if role is None or role.agency_id != agency.id:
+        raise HTTPException(status_code=404, detail="Role not found")
+    # Revoke any existing active tokens so the old URL stops working.
+    (
+        db.query(RoleShareToken)
+        .filter(RoleShareToken.role_id == role.id, RoleShareToken.is_active.is_(True))
+        .update({RoleShareToken.is_active: False})
+    )
+    tok = RoleShareToken(
+        agency_id=agency.id,
+        role_id=role.id,
+        token=secrets.token_urlsafe(24),
+        is_active=True,
+    )
+    db.add(tok)
+    db.commit()
+    db.refresh(tok)
+    return _share_out(tok)
+
+
+@roles_router.delete("/{role_id}/share", status_code=204)
+def revoke_role_share(
+    role_id: int,
+    agency: Agency = Depends(require_unlocked_agency),
+    db: Session = Depends(get_db),
+):
+    role = db.get(Role, role_id)
+    if role is None or role.agency_id != agency.id:
+        raise HTTPException(status_code=404, detail="Role not found")
+    (
+        db.query(RoleShareToken)
+        .filter(RoleShareToken.role_id == role.id, RoleShareToken.is_active.is_(True))
+        .update({RoleShareToken.is_active: False})
+    )
+    db.commit()
+    return None
+
+
+def _share_out(tok: RoleShareToken) -> RoleShareTokenOut:
+    return RoleShareTokenOut(
+        id=tok.id,
+        role_id=tok.role_id,
+        token=tok.token,
+        is_active=tok.is_active,
+        view_count=tok.view_count,
+        last_viewed_at=tok.last_viewed_at,
+        created_at=tok.created_at,
+        share_url=None,  # frontend appends origin
+    )
 
 
 @roles_router.post("/{role_id}/market", response_model=MarketSnapshotOut, status_code=201)
@@ -506,16 +658,94 @@ def update_stage(
     application_id: int,
     payload: ApplicationStageUpdate,
     agency: Agency = Depends(require_unlocked_agency),
+    recruiter: Recruiter | None = Depends(_soft_recruiter),
     db: Session = Depends(get_db),
 ):
     app_row = db.get(Application, application_id)
     if app_row is None or app_row.agency_id != agency.id:
         raise HTTPException(status_code=404, detail="Application not found")
+    prev_stage = app_row.stage
     app_row.stage = payload.stage
     app_row.last_activity_at = datetime.utcnow()
+    # Auto-log the transition so the activity tab always tells the story of the
+    # candidate's journey, even for stage moves the recruiter forgets to note.
+    if prev_stage != payload.stage:
+        db.add(
+            ApplicationNote(
+                agency_id=agency.id,
+                application_id=app_row.id,
+                author_recruiter_id=recruiter.id if recruiter else None,
+                author_name=(recruiter.full_name or recruiter.email) if recruiter else None,
+                kind="system",
+                body=f"Stage moved {prev_stage.value} → {payload.stage.value}",
+            )
+        )
     db.commit()
     db.refresh(app_row)
     return app_row
+
+
+# ── Application activity notes ──────────────────────────────────────────
+@applications_router.get("/{application_id}/notes", response_model=list[ApplicationNoteOut])
+def list_application_notes(
+    application_id: int,
+    agency: Agency = Depends(get_agency),
+    db: Session = Depends(get_db),
+):
+    app_row = db.get(Application, application_id)
+    if app_row is None or app_row.agency_id != agency.id:
+        raise HTTPException(status_code=404, detail="Application not found")
+    return (
+        db.query(ApplicationNote)
+        .filter(ApplicationNote.application_id == application_id)
+        .order_by(ApplicationNote.id.desc())
+        .all()
+    )
+
+
+@applications_router.post("/{application_id}/notes", response_model=ApplicationNoteOut, status_code=201)
+def create_application_note(
+    application_id: int,
+    payload: ApplicationNoteCreate,
+    agency: Agency = Depends(require_unlocked_agency),
+    recruiter: Recruiter | None = Depends(_soft_recruiter),
+    db: Session = Depends(get_db),
+):
+    app_row = db.get(Application, application_id)
+    if app_row is None or app_row.agency_id != agency.id:
+        raise HTTPException(status_code=404, detail="Application not found")
+    note = ApplicationNote(
+        agency_id=agency.id,
+        application_id=application_id,
+        author_recruiter_id=recruiter.id if recruiter else None,
+        author_name=(recruiter.full_name or recruiter.email) if recruiter else None,
+        kind="note",
+        body=payload.body.strip(),
+    )
+    db.add(note)
+    app_row.last_activity_at = datetime.utcnow()
+    db.commit()
+    db.refresh(note)
+    return note
+
+
+@applications_router.delete("/{application_id}/notes/{note_id}", status_code=204)
+def delete_application_note(
+    application_id: int,
+    note_id: int,
+    agency: Agency = Depends(require_unlocked_agency),
+    db: Session = Depends(get_db),
+):
+    note = db.get(ApplicationNote, note_id)
+    if (
+        note is None
+        or note.agency_id != agency.id
+        or note.application_id != application_id
+    ):
+        raise HTTPException(status_code=404, detail="Note not found")
+    db.delete(note)
+    db.commit()
+    return None
 
 
 # ── Role pipeline (Kanban board per role) ────────────────────────────────
@@ -644,6 +874,48 @@ def application_swot(
     return SwotOut(**swot)
 
 
+# ── Public share (unauthenticated, token-guarded) ────────────────────────
+public_router = APIRouter(prefix="/public", tags=["recruiter: public"])
+
+
+@public_router.get("/roles/{token}", response_model=PublicRoleView)
+def public_role_view(token: str, db: Session = Depends(get_db)):
+    """Client-safe read-only role view. Bumps view_count for the recruiter's
+    engagement tracking. Returns 404 if the token was revoked or never existed."""
+    tok = (
+        db.query(RoleShareToken)
+        .filter(RoleShareToken.token == token, RoleShareToken.is_active.is_(True))
+        .first()
+    )
+    if tok is None:
+        raise HTTPException(status_code=404, detail="Share link is not active")
+    role = db.get(Role, tok.role_id)
+    if role is None:
+        raise HTTPException(status_code=404, detail="Role no longer exists")
+    agency = db.get(Agency, role.agency_id)
+
+    tok.view_count += 1
+    tok.last_viewed_at = datetime.utcnow()
+    db.commit()
+
+    return PublicRoleView(
+        role_id=role.id,
+        title=role.title,
+        seniority=role.seniority,
+        location=role.location,
+        employment_type=role.employment_type.value if role.employment_type else None,
+        description=role.description,
+        required_skills=role.required_skills or [],
+        preferred_skills=role.preferred_skills or [],
+        min_years_experience=role.min_years_experience,
+        salary_min=role.salary_min,
+        salary_max=role.salary_max,
+        market_snapshot=role.market_snapshot,
+        is_draft=role.is_draft,
+        agency_name=agency.name if agency else "",
+    )
+
+
 # ── Market analytics (self-contained over the agency's own data) ──────────
 market_router = APIRouter(prefix="/agencies/{agency_id}/market", tags=["recruiter: market"])
 
@@ -655,3 +927,33 @@ def market_overview(
 ):
     """Demand vs supply, skill shortages, salary bands, and pipeline health."""
     return MarketOverviewOut(**asdict(compute_market(db, agency.id)))
+
+
+@market_router.get("/snapshots", response_model=list[MarketSnapshotOut])
+def list_market_snapshots(
+    limit: int = Query(default=20, ge=1, le=100),
+    agency: Agency = Depends(require_agency_feature("market")),
+    db: Session = Depends(get_db),
+):
+    """Recent crawler snapshots across the agency's roles, newest first."""
+    rows = (
+        db.query(MarketSnapshot)
+        .filter(MarketSnapshot.agency_id == agency.id)
+        .order_by(MarketSnapshot.id.desc())
+        .limit(limit)
+        .all()
+    )
+    return rows
+
+
+@market_router.post("/crawl", response_model=MarketCrawlResult, status_code=201)
+def crawl_agency_market_endpoint(
+    agency: Agency = Depends(require_agency_feature("market", write=True)),
+    db: Session = Depends(get_db),
+):
+    """Fan-out crawl over the agency's most-common open-role titles."""
+    snaps = crawl_agency_market(db, agency.id)
+    return MarketCrawlResult(
+        snapshots=[MarketSnapshotOut.model_validate(s) for s in snaps],
+        total=len(snaps),
+    )

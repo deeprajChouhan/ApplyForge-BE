@@ -125,6 +125,15 @@ class Client(Base, RecTimestampMixin):
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     industry: Mapped[str | None] = mapped_column(String(120))
 
+    # Relationship contact block — a single primary contact is enough for now;
+    # add a `ClientContact` child table if a client outgrows one point of contact.
+    primary_contact_name: Mapped[str | None] = mapped_column(String(200))
+    contact_email: Mapped[str | None] = mapped_column(String(255))
+    contact_phone: Mapped[str | None] = mapped_column(String(60))
+    website: Mapped[str | None] = mapped_column(String(300))
+    address: Mapped[str | None] = mapped_column(String(500))
+    notes: Mapped[str | None] = mapped_column(Text)
+
     agency: Mapped["Agency"] = relationship(back_populates="clients")
     roles: Mapped[list["Role"]] = relationship(back_populates="client")
 
@@ -352,6 +361,53 @@ class Application(Base, RecTimestampMixin):
     candidate: Mapped["CandidateProfile"] = relationship()
 
 
+class ApplicationNote(Base):
+    """
+    A single entry in an application's activity log. Two kinds:
+      - "note"   : recruiter-authored free text (screen call, feedback, etc.)
+      - "system" : auto-log of a stage change or SWOT regeneration.
+    Kept separate from Application.notes (the legacy single-string field) so the
+    log is append-only and preserves recruiter-by-recruiter attribution.
+    """
+    __tablename__ = "rec_application_notes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    agency_id: Mapped[int] = mapped_column(
+        ForeignKey("rec_agencies.id", ondelete="CASCADE"), index=True
+    )
+    application_id: Mapped[int] = mapped_column(
+        ForeignKey("rec_applications.id", ondelete="CASCADE"), index=True
+    )
+    author_recruiter_id: Mapped[int | None] = mapped_column(Integer)
+    author_name: Mapped[str | None] = mapped_column(String(200))
+    kind: Mapped[str] = mapped_column(String(20), default="note", server_default="note", nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class RoleShareToken(Base):
+    """
+    A public read-only share link for a role — used to send a draft (or an
+    active role) to a client with market context attached. Rotating the token
+    revokes the previous URL. View count is bumped on every public GET so
+    recruiters can see if the client actually opened it.
+    """
+    __tablename__ = "rec_role_share_tokens"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    agency_id: Mapped[int] = mapped_column(
+        ForeignKey("rec_agencies.id", ondelete="CASCADE"), index=True
+    )
+    role_id: Mapped[int] = mapped_column(
+        ForeignKey("rec_roles.id", ondelete="CASCADE"), index=True
+    )
+    token: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true", nullable=False)
+    view_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    last_viewed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
 class MarketSnapshot(Base):
     """
     Crawler-sourced compensation & demand data for a role query. Kept as
@@ -393,6 +449,8 @@ RECRUITER_TABLES = [
     Shortlist.__table__,
     ShortlistEntry.__table__,
     Application.__table__,
+    ApplicationNote.__table__,
+    RoleShareToken.__table__,
     UsageEvent.__table__,
     AgencyInvite.__table__,
     MarketSnapshot.__table__,

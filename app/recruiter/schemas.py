@@ -176,6 +176,59 @@ class ClientOut(ORMModel):
     name: str
     industry: str | None
     role_count: int = 0
+    primary_contact_name: str | None = None
+    contact_email: str | None = None
+    contact_phone: str | None = None
+    website: str | None = None
+    address: str | None = None
+    notes: str | None = None
+
+
+class ClientUpdate(BaseModel):
+    """Partial update for the client detail contact card."""
+    name: str | None = None
+    industry: str | None = None
+    primary_contact_name: str | None = None
+    contact_email: str | None = None
+    contact_phone: str | None = None
+    website: str | None = None
+    address: str | None = None
+    notes: str | None = None
+
+
+class ClientRoleOut(BaseModel):
+    """Compact role row for the client detail roles table."""
+    id: int
+    title: str
+    status: str
+    is_draft: bool = False
+    seniority: str | None = None
+    active_pipeline: int = 0
+    placed: int = 0
+    created_at: datetime | None = None
+
+
+class ClientPlacementOut(BaseModel):
+    application_id: int
+    candidate_id: int
+    candidate_name: str | None
+    role_id: int | None
+    role_title: str | None
+    placed_at: datetime | None
+
+
+class ClientAnalyticsOut(BaseModel):
+    client_id: int
+    roles_open: int
+    roles_filled: int
+    roles_draft: int
+    roles_on_hold: int
+    active_pipeline: int
+    placements_total: int
+    avg_time_to_fill_days: float | None
+    top_skills: list[str]
+    recent_placements: list[ClientPlacementOut]
+    roles: list[ClientRoleOut]
 
 
 # ── Next-hire advisory (company → next hire) ──────────────────────────────
@@ -469,6 +522,11 @@ class MarketOverviewOut(BaseModel):
     pipeline_funnel: list[StageCountOut]
 
 
+class MarketCrawlResult(BaseModel):
+    snapshots: list[MarketSnapshotOut]
+    total: int
+
+
 # ── Application (tracking) ─────────────────────────────────────────────────
 class ApplicationCreate(BaseModel):
     candidate_id: int
@@ -531,6 +589,51 @@ class RoleBoardOut(BaseModel):
     role_id: int
     columns: list[RoleBoardColumn]
     total: int
+
+
+class ApplicationNoteOut(ORMModel):
+    id: int
+    application_id: int
+    author_recruiter_id: int | None
+    author_name: str | None
+    kind: str
+    body: str
+    created_at: datetime | None = None
+
+
+class ApplicationNoteCreate(BaseModel):
+    body: str = Field(min_length=1, max_length=8000)
+
+
+class RoleShareTokenOut(ORMModel):
+    id: int
+    role_id: int
+    token: str
+    is_active: bool
+    view_count: int
+    last_viewed_at: datetime | None = None
+    created_at: datetime | None = None
+    # Convenience — the URL is assembled server-side using the request base if
+    # available; frontend fallbacks to `${window.location.origin}/public/roles/{token}`.
+    share_url: str | None = None
+
+
+class PublicRoleView(BaseModel):
+    """Client-safe payload — no candidate PII, no client budget internals."""
+    role_id: int
+    title: str
+    seniority: str | None
+    location: str | None
+    employment_type: str | None
+    description: str | None
+    required_skills: list[str]
+    preferred_skills: list[str]
+    min_years_experience: float | None
+    salary_min: int | None
+    salary_max: int | None
+    market_snapshot: dict | None
+    is_draft: bool
+    agency_name: str
 
 
 class MarketSnapshotOut(ORMModel):
