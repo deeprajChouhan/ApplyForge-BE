@@ -66,7 +66,35 @@ class Settings(BaseSettings):
     applyforge_provisioning_url: str | None = None
     applyforge_provisioning_key: SecretStr | None = None
 
+    # ── Stripe billing for recruiter agencies (Phase 5.4) ──
+    # Billing is disabled unless STRIPE_SECRET_KEY is set. Each plan has a price
+    # for both models — flat (fixed monthly) and per-seat (quantity = seats).
+    stripe_secret_key: SecretStr | None = None
+    stripe_webhook_secret: SecretStr | None = None
+    stripe_price_pro_flat: str | None = None
+    stripe_price_pro_seat: str | None = None
+    stripe_price_enterprise_flat: str | None = None
+    stripe_price_enterprise_seat: str | None = None
+    billing_success_url: str = "https://recruiter.applyforge.pro/team?billing=success"
+    billing_cancel_url: str = "https://recruiter.applyforge.pro/team?billing=cancel"
+    billing_portal_return_url: str = "https://recruiter.applyforge.pro/team"
+
+    # ── Self-serve onboarding (Phase 5.5) ──
+    # When False (default) signups create a *pending* agency the operator must
+    # approve before its owner can log in. Set True for fully open self-serve.
+    recruiter_signup_open: bool = False
+    # Public base URL of the recruiter app — used to build invite/claim links.
+    recruiter_app_url: str = "https://recruiter.applyforge.pro"
+
     model_config = SettingsConfigDict(env_file=str(_ENV_FILE), extra="ignore")
+
+    @property
+    def stripe_secret_key_value(self) -> str:
+        return self.stripe_secret_key.get_secret_value() if self.stripe_secret_key else ""
+
+    @property
+    def stripe_webhook_secret_value(self) -> str:
+        return self.stripe_webhook_secret.get_secret_value() if self.stripe_webhook_secret else ""
 
     @property
     def cors_origin_list(self) -> list[str]:

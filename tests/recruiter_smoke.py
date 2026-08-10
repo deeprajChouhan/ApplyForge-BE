@@ -121,6 +121,27 @@ def main() -> int:
     # Recruiter cannot touch another agency.
     assert client.get(f"{BASE}/agencies/{rival_id}/candidates", headers=rec_h).status_code == 403
 
+    # Phase 5.1 — plans & seats. Agency defaults to the free plan (2 seats).
+    ag = client.get(f"{BASE}/admin/agencies", headers=admin_h).json()
+    talent = next(a for a in ag if a["id"] == agency_id)
+    assert talent["plan"] == "free" and talent["seat_limit"] == 2 and talent["seats_used"] == 1, talent
+    # Fill the second seat, then the third must be rejected.
+    assert client.post(
+        f"{BASE}/admin/recruiters", headers=admin_h,
+        json={"agency_id": agency_id, "email": "seat2@talent.co", "password": "recruiterpass"},
+    ).status_code == 201
+    third = client.post(
+        f"{BASE}/admin/recruiters", headers=admin_h,
+        json={"agency_id": agency_id, "email": "seat3@talent.co", "password": "recruiterpass"},
+    )
+    assert third.status_code == 409, third.text
+    # Free plan gates the AI-insight features (market/listings/advisory).
+    assert client.get(f"{BASE}/agencies/{agency_id}/market", headers=rec_h).status_code == 403
+    # Operator upgrades to pro → gating lifts and seat cap rises.
+    upgraded = client.patch(f"{BASE}/admin/agencies/{agency_id}", headers=admin_h, json={"plan": "pro"})
+    assert upgraded.status_code == 200 and upgraded.json()["plan"] == "pro" and upgraded.json()["seat_limit"] == 10, upgraded.text
+    assert client.get(f"{BASE}/agencies/{agency_id}/market", headers=rec_h).status_code == 200
+
     # Recruiter works within their own agency: role → ingest → shortlist.
     role = client.post(
         f"{BASE}/agencies/{agency_id}/roles",
@@ -244,6 +265,146 @@ def main() -> int:
     )
     assert again.status_code == 409, again.text
 
+    # Phase 5.2 — usage metering rolled up for the operator. By now the recruiter
+    # has ingested CVs, generated a shortlist, drafted a listing, run role-matches
+    # and an advisory — each should be metered.
+    usage = client.get(f"{BASE}/admin/agencies/{agency_id}/usage", headers=admin_h)
+    assert usage.status_code == 200, usage.text
+    uk = usage.json()["by_kind"]
+    assert uk["cv_ingested"] == 2, uk
+    assert uk["shortlist_generated"] >= 1 and uk["listing_drafted"] >= 1, uk
+    assert uk["role_match_run"] >= 1 and uk["advisory_run"] >= 1, uk
+    assert usage.json()["total"] >= 6, usage.json()
+
+    # Phase 5.3 — agency-admin tier. Operator provisions an owner; the owner
+    # self-serves their team; a non-owner recruiter is blocked.
+    client.post(
+        f"{BASE}/admin/recruiters", headers=admin_h,
+        json={"agency_id": agency_id, "email": "owner@talent.co", "full_name": "Olga Owner",
+              "password": "ownerpass1", "role": "owner"},
+    )
+    owner_tok = client.post(
+        f"{BASE}/auth/login", json={"email": "owner@talent.co", "password": "ownerpass1"}
+    ).json()["access_token"]
+    owner_h = {"Authorization": f"Bearer {owner_tok}"}
+
+    ov = client.get(f"{BASE}/agency/overview", headers=owner_h)
+    assert ov.status_code == 200 and ov.json()["plan"] == "pro" and ov.json()["seat_limit"] == 10, ov.text
+    team_before = client.get(f"{BASE}/agency/team", headers=owner_h).json()
+    assert any(m["email"] == "owner@talent.co" for m in team_before), team_before
+    added = client.post(
+        f"{BASE}/agency/team", headers=owner_h,
+        json={"email": "hire@talent.co", "full_name": "New Hire", "password": "hirepass1"},
+    )
+    assert added.status_code == 201, added.text
+    # Owner can deactivate a member but not themselves.
+    assert client.patch(f"{BASE}/agency/team/{added.json()['id']}", headers=owner_h, json={"is_active": False}).status_code == 200
+    owner_self = next(m for m in team_before if m["email"] == "owner@talent.co")["id"]
+    assert client.patch(f"{BASE}/agency/team/{owner_self}", headers=owner_h, json={"is_active": False}).status_code == 400
+    # A plain recruiter is not an owner → 403 on agency-admin endpoints.
+    assert client.get(f"{BASE}/agency/team", headers=rec_h).status_code == 403
+    # Owner sees their own agency usage.
+    assert client.get(f"{BASE}/agency/usage", headers=owner_h).status_code == 200
+
+    # Phase 5.4 — billing. Operator sets the per-agency billing model.
+    setb = client.patch(f"{BASE}/admin/agencies/{agency_id}", headers=admin_h, json={"plan": "pro", "billing_model": "per_seat"})
+    assert setb.status_code == 200 and setb.json()["billing_model"] == "per_seat", setb.text
+    ov2 = client.get(f"{BASE}/agency/overview", headers=owner_h).json()
+    assert ov2["billing_model"] == "per_seat" and ov2["billing_enabled"] is False and "subscription_status" in ov2, ov2
+    # With Stripe unconfigured, checkout is refused cleanly and the webhook is disabled.
+    assert client.post(f"{BASE}/agency/billing/checkout", headers=owner_h, json={"plan": "pro"}).status_code == 400
+    assert client.post(f"{BASE}/billing/webhook", data=b"{}").status_code == 503
+
+    # ── Phase 5.5 — self-serve onboarding (operator-approved + trial lock) ──
+    signup = client.post(
+        f"{BASE}/auth/signup",
+        json={"agency_name": "Nimbus Talent", "owner_email": "lead@nimbus.io",
+              "owner_full_name": "Nadia Lead", "password": "nimbuspass1"},
+    )
+    assert signup.status_code == 201, signup.text
+    sj = signup.json()
+    assert sj["pending_approval"] is True and sj["status"] == "pending", sj
+    new_agency_id = sj["agency_id"]
+    # Pending agency can't log in yet.
+    pending_login = client.post(f"{BASE}/auth/login", json={"email": "lead@nimbus.io", "password": "nimbuspass1"})
+    assert pending_login.status_code == 403, pending_login.text
+    # Duplicate signup email is refused.
+    assert client.post(
+        f"{BASE}/auth/signup",
+        json={"agency_name": "Dupe", "owner_email": "lead@nimbus.io", "password": "nimbuspass1"},
+    ).status_code == 400
+
+    # Operator approves it (5.6) → owner can now log in.
+    appr = client.post(f"{BASE}/admin/agencies/{new_agency_id}/approve", headers=admin_h)
+    assert appr.status_code == 200 and appr.json()["status"] == "active", appr.text
+    nimbus_tok = client.post(
+        f"{BASE}/auth/login", json={"email": "lead@nimbus.io", "password": "nimbuspass1"}
+    ).json()["access_token"]
+    nimbus_h = {"Authorization": f"Bearer {nimbus_tok}"}
+    nov = client.get(f"{BASE}/agency/overview", headers=nimbus_h).json()
+    assert nov["status"] == "active" and nov["trial_days_left"] is not None and nov["locked"] is False, nov
+
+    # Invite/claim: owner invites a recruiter, recipient claims the token.
+    inv = client.post(f"{BASE}/agency/invites", headers=nimbus_h, json={"email": "rec2@nimbus.io"})
+    assert inv.status_code == 201 and inv.json()["invite_url"], inv.text
+    token = inv.json()["invite_url"].rsplit("/", 1)[-1]
+    pub = client.get(f"{BASE}/auth/invite/{token}").json()
+    assert pub["valid"] is True and pub["email"] == "rec2@nimbus.io" and pub["agency_name"] == "Nimbus Talent", pub
+    accepted = client.post(f"{BASE}/auth/invite/{token}/accept", json={"password": "rec2pass12", "full_name": "Reed Two"})
+    assert accepted.status_code == 200 and accepted.json()["access_token"], accepted.text
+    # The claimed seat can log in.
+    assert client.post(f"{BASE}/auth/login", json={"email": "rec2@nimbus.io", "password": "rec2pass12"}).status_code == 200
+    # Reusing the same token now fails.
+    assert client.post(f"{BASE}/auth/invite/{token}/accept", json={"password": "again1234"}).status_code == 400
+    # Free plan = 2 seats; owner + claimed seat fill it, so a new invite is capped.
+    assert client.post(f"{BASE}/agency/invites", headers=nimbus_h, json={"email": "rec3@nimbus.io"}).status_code == 400
+
+    # Trial lock: force the trial to have ended with no active subscription.
+    from app.recruiter.models import Agency as _Agency
+    _db2 = SessionLocal()
+    try:
+        _ag = _db2.get(_Agency, new_agency_id)
+        _ag.trial_ends_at = _ag.created_at.__class__(2000, 1, 1)  # far past
+        _db2.commit()
+    finally:
+        _db2.close()
+    locked_ov = client.get(f"{BASE}/agency/overview", headers=nimbus_h).json()
+    assert locked_ov["locked"] is True, locked_ov
+    # A write is blocked with 402 while locked...
+    assert client.post(
+        f"{BASE}/agencies/{new_agency_id}/roles", headers=nimbus_h,
+        json={"title": "Blocked Role", "required_skills": ["x"]},
+    ).status_code == 402
+    # ...but the owner can still log in and read (to go pay).
+    assert client.post(f"{BASE}/auth/login", json={"email": "lead@nimbus.io", "password": "nimbuspass1"}).status_code == 200
+    # Simulate a paid subscription → unlock, writes flow again.
+    _db3 = SessionLocal()
+    try:
+        _ag = _db3.get(_Agency, new_agency_id)
+        _ag.subscription_status = "active"
+        _db3.commit()
+    finally:
+        _db3.close()
+    assert client.get(f"{BASE}/agency/overview", headers=nimbus_h).json()["locked"] is False
+    assert client.post(
+        f"{BASE}/agencies/{new_agency_id}/roles", headers=nimbus_h,
+        json={"title": "Unblocked Role", "required_skills": ["x"]},
+    ).status_code == 201
+
+    # ── Phase 5.6 — operator oversight ──
+    summ = client.get(f"{BASE}/admin/billing/summary", headers=admin_h)
+    assert summ.status_code == 200, summ.text
+    sm = summ.json()
+    assert sm["agencies_total"] >= 3 and sm["active_subscriptions"] >= 1, sm
+    assert "active" in sm["by_status"] and sm["seats_used"] >= 1, sm
+    # Suspend the agency → login blocked; reactivate → restored.
+    susp = client.patch(f"{BASE}/admin/agencies/{new_agency_id}/status", headers=admin_h, json={"status": "suspended"})
+    assert susp.status_code == 200 and susp.json()["status"] == "suspended", susp.text
+    assert client.post(f"{BASE}/auth/login", json={"email": "lead@nimbus.io", "password": "nimbuspass1"}).status_code == 403
+    react = client.patch(f"{BASE}/admin/agencies/{new_agency_id}/status", headers=admin_h, json={"status": "active"})
+    assert react.status_code == 200 and react.json()["status"] == "active", react.text
+    assert client.post(f"{BASE}/auth/login", json={"email": "lead@nimbus.io", "password": "nimbuspass1"}).status_code == 200
+
     # Operator deactivates the recruiter → login is refused.
     upd = client.patch(f"{BASE}/admin/recruiters/{recruiter_id}", headers=admin_h, json={"is_active": False})
     assert upd.status_code == 200 and upd.json()["is_active"] is False, upd.text
@@ -255,6 +416,40 @@ def main() -> int:
 
     # Operator (admin token) can still act across agencies.
     assert client.get(f"{BASE}/agencies/{agency_id}/candidates", headers=admin_h).status_code == 200
+
+    # ── Intelligence upgrade — LLM CV parse merge (stubbed provider) ──
+    # With no real LLM configured the heuristic path is used (verified implicitly
+    # above: Ada matched via dictionary skills). Here we stub the LLM parse to
+    # confirm the merge overlays rich fields: novel + aliased skills normalise and
+    # union, and dated experiences persist.
+    from app.recruiter.services import parsing as _parsing
+    from app.recruiter.services.parsing import parse_cv as _parse_cv, ParsedExperience as _PE  # noqa: F401
+    _orig = _parsing.llm_parse_cv
+    _parsing.llm_parse_cv = lambda text: {
+        "full_name": "Grace Hopper",
+        "email": "grace@navy.mil",
+        "seniority": "principal",
+        "years_experience": 12,
+        "skills": ["Python", "cobol", "k8s"],  # alias k8s→kubernetes; cobol is novel (not in dict)
+        "experiences": [
+            {"title": "Principal Engineer", "company": "Navy", "start_date": "2015-03", "end_date": None,
+             "description": "Compilers."},
+        ],
+    }
+    try:
+        parsed = _parse_cv(b"Grace Hopper\nPrincipal Engineer\ngrace@navy.mil\n", "grace.txt")
+        assert parsed.parsed_by_llm is True, parsed
+        assert parsed.years_experience == 12 and parsed.seniority == "principal", parsed
+        assert "kubernetes" in parsed.skills and "cobol" in parsed.skills and "python" in parsed.skills, parsed.skills
+        assert len(parsed.experiences) == 1 and parsed.experiences[0].company == "Navy", parsed.experiences
+        assert parsed.experiences[0].start_date is not None and parsed.experiences[0].start_date.year == 2015, parsed.experiences
+    finally:
+        _parsing.llm_parse_cv = _orig
+    # Malformed / missing JSON → parser returns None → heuristic fallback (no crash).
+    from app.recruiter.services import ai_support as _ai
+    assert _ai._extract_json("not json at all") is None
+    assert _ai._extract_json('```json\n{"a": 1}\n```') == {"a": 1}
+    assert _ai._extract_json('prefix {"skills": ["x"]} suffix') == {"skills": ["x"]}
 
     print("RECRUITER AUTH SMOKE TEST PASSED")
     print(f"  admin → agency → recruiter provisioned; recruiter scoped to agency {agency_id}")

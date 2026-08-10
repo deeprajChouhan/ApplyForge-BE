@@ -5,7 +5,15 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
-from app.recruiter.enums import ApplicationStage, EmploymentType, RecruiterSeatRole, RoleStatus
+from app.recruiter.enums import (
+    AgencyPlan,
+    AgencyStatus,
+    ApplicationStage,
+    BillingModel,
+    EmploymentType,
+    RecruiterSeatRole,
+    RoleStatus,
+)
 
 
 class ORMModel(BaseModel):
@@ -22,16 +30,138 @@ class AgencyOut(ORMModel):
     id: int
     name: str
     slug: str
+    plan: AgencyPlan = AgencyPlan.free
     created_at: datetime | None = None
 
 
 class AgencyAdminOut(ORMModel):
-    """Agency row for the operator console, with a live recruiter count."""
+    """Agency row for the operator console, with plan + seat usage + billing."""
     id: int
     name: str
     slug: str
+    plan: AgencyPlan = AgencyPlan.free
+    billing_model: BillingModel = BillingModel.flat
+    subscription_status: str = "inactive"
+    status: AgencyStatus = AgencyStatus.active
+    trial_ends_at: datetime | None = None
+    locked: bool = False
+    seat_limit: int | None = None       # effective limit (None = unlimited)
+    seats_used: int = 0
+    features: list[str] = Field(default_factory=list)
     recruiter_count: int = 0
     created_at: datetime | None = None
+
+
+class AgencyPlanUpdate(BaseModel):
+    plan: AgencyPlan
+    # Optional per-agency seat override (e.g. custom enterprise). Omit to use the
+    # plan default.
+    seat_limit: int | None = None
+    # Optional per-agency billing model (flat vs per-seat). Omit to leave as-is.
+    billing_model: BillingModel | None = None
+
+
+class AgencyStatusUpdate(BaseModel):
+    """Operator lifecycle control: approve/suspend/reactivate an agency."""
+    status: AgencyStatus
+
+
+class BillingSummaryOut(BaseModel):
+    """Cross-agency oversight snapshot for the operator console (Phase 5.6)."""
+    agencies_total: int
+    by_status: dict[str, int]
+    by_plan: dict[str, int]
+    pending_approval: int
+    locked: int
+    active_subscriptions: int
+    seats_used: int
+
+
+# ── Self-serve onboarding (Phase 5.5) ─────────────────────────────────────
+class AgencySignupRequest(BaseModel):
+    agency_name: str
+    owner_email: EmailStr
+    owner_full_name: str | None = None
+    password: str = Field(min_length=8)
+    slug: str | None = None
+
+
+class SignupResult(BaseModel):
+    agency_id: int
+    status: AgencyStatus
+    pending_approval: bool
+    message: str
+
+
+class InviteCreate(BaseModel):
+    email: EmailStr
+
+
+class InviteOut(ORMModel):
+    id: int
+    email: str
+    role: RecruiterSeatRole
+    status: str
+    expires_at: datetime | None = None
+    created_at: datetime | None = None
+    invite_url: str | None = None
+
+
+class InvitePublicOut(BaseModel):
+    """Safe, unauthenticated view of an invite for the claim page."""
+    agency_name: str
+    email: str
+    valid: bool
+    reason: str | None = None
+
+
+class InviteAccept(BaseModel):
+    password: str = Field(min_length=8)
+    full_name: str | None = None
+
+
+class BillingCheckoutRequest(BaseModel):
+    plan: AgencyPlan
+
+
+class BillingUrlOut(BaseModel):
+    url: str
+
+
+class UsageSummaryOut(BaseModel):
+    agency_id: int
+    month: str
+    by_kind: dict[str, int]
+    total: int
+
+
+# ── Agency-admin tier (owner-scoped, Phase 5.3) ───────────────────────────
+class AgencyOverviewOut(BaseModel):
+    id: int
+    name: str
+    slug: str
+    plan: AgencyPlan
+    billing_model: BillingModel
+    subscription_status: str
+    billing_enabled: bool
+    status: AgencyStatus = AgencyStatus.active
+    trial_ends_at: datetime | None = None
+    trial_days_left: int | None = None
+    locked: bool = False
+    seat_limit: int | None
+    seats_used: int
+    features: list[str]
+
+
+class TeamMemberCreate(BaseModel):
+    email: EmailStr
+    full_name: str | None = None
+    password: str = Field(min_length=8)
+
+
+class TeamMemberUpdate(BaseModel):
+    full_name: str | None = None
+    is_active: bool | None = None
 
 
 # ── Clients ───────────────────────────────────────────────────────────────

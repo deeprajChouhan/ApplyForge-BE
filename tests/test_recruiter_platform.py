@@ -114,6 +114,10 @@ def setup(client, admin_headers):
         f"{BASE}/admin/agencies", headers=admin_headers, json={"name": "Rival", "slug": "rival"}
     ).json()["id"]
 
+    # Upgrade to pro so the gated AI-insight features (listings/market/advisory)
+    # are available to the feature tests below.
+    client.patch(f"{BASE}/admin/agencies/{agency_id}", headers=admin_headers, json={"plan": "pro"})
+
     client.post(
         f"{BASE}/admin/recruiters",
         headers=admin_headers,
@@ -251,6 +255,35 @@ def test_next_hire_advisory_flags_gap(client, setup):
     assert any(
         s in aj["suggestions"][0]["skills"] for s in ("python", "fastapi", "postgresql")
     )
+
+
+# ── Plans & seats (Phase 5.1) ─────────────────────────────────────────────
+def test_free_plan_seats_and_gating(client, admin_headers):
+    agency_id = client.post(
+        f"{BASE}/admin/agencies", headers=admin_headers, json={"name": "Cap Co", "slug": "cap-co"}
+    ).json()["id"]
+    # Free plan → 2 seats, no gated features.
+    ag = next(a for a in client.get(f"{BASE}/admin/agencies", headers=admin_headers).json() if a["id"] == agency_id)
+    assert ag["plan"] == "free" and ag["seat_limit"] == 2 and ag["features"] == []
+
+    for i in (1, 2):
+        assert client.post(
+            f"{BASE}/admin/recruiters", headers=admin_headers,
+            json={"agency_id": agency_id, "email": f"seat{i}@cap.co", "password": "recruiterpass"},
+        ).status_code == 201
+    # Third seat is over the cap.
+    assert client.post(
+        f"{BASE}/admin/recruiters", headers=admin_headers,
+        json={"agency_id": agency_id, "email": "seat3@cap.co", "password": "recruiterpass"},
+    ).status_code == 409
+
+    # Gating: free agency is blocked from market; upgrading to pro lifts it.
+    tok = client.post(f"{BASE}/auth/login", json={"email": "seat1@cap.co", "password": "recruiterpass"}).json()["access_token"]
+    h = {"Authorization": f"Bearer {tok}"}
+    assert client.get(f"{BASE}/agencies/{agency_id}/market", headers=h).status_code == 403
+    up = client.patch(f"{BASE}/admin/agencies/{agency_id}", headers=admin_headers, json={"plan": "pro"})
+    assert up.status_code == 200 and up.json()["seat_limit"] == 10
+    assert client.get(f"{BASE}/agencies/{agency_id}/market", headers=h).status_code == 200
 
 
 # ── Provisioning bridge ───────────────────────────────────────────────────

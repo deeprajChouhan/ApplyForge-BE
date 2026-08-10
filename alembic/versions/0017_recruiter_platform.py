@@ -22,6 +22,14 @@ def _enum(*values: str, name: str) -> sa.Enum:
 
 
 def upgrade() -> None:
+    # Idempotency guard: some deployments created the rec_* schema via the app's
+    # startup bootstrap (create_all with checkfirst) before this migration
+    # existed. In that case the tables are already present and identical to what
+    # this migration would build, so skip creation and just let Alembic advance
+    # the version. On a fresh database none exist and the full schema is created.
+    if sa.inspect(op.get_bind()).has_table("rec_agencies"):
+        return
+
     op.create_table(
         "rec_agencies",
         sa.Column("id", sa.Integer(), primary_key=True),

@@ -9,12 +9,23 @@ from __future__ import annotations
 import io
 import re
 from dataclasses import dataclass, field
+from datetime import date
 
-from app.recruiter.services.skills import extract_skills
+from app.recruiter.services.llm_parse import llm_parse_cv
+from app.recruiter.services.skills import extract_skills, normalize_skill
 
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 _PHONE_RE = re.compile(r"(?:(?:\+\d{1,3}[\s-]?)?(?:\(?\d{2,4}\)?[\s-]?){2,4}\d{2,4})")
 _YOE_RE = re.compile(r"(\d{1,2})\+?\s*years?", re.IGNORECASE)
+
+
+@dataclass
+class ParsedExperience:
+    title: str | None = None
+    company: str | None = None
+    start_date: date | None = None
+    end_date: date | None = None
+    description: str | None = None
 
 
 @dataclass
@@ -28,6 +39,9 @@ class ParsedCV:
     summary: str | None = None
     skills: list[str] = field(default_factory=list)
     raw_text: str = ""
+    seniority: str | None = None
+    experiences: list[ParsedExperience] = field(default_factory=list)
+    parsed_by_llm: bool = False
 
 
 def extract_text(content: bytes, filename: str) -> str:
@@ -62,8 +76,7 @@ def _guess_name(lines: list[str], email: str | None) -> str | None:
     return None
 
 
-def parse_cv(content: bytes, filename: str) -> ParsedCV:
-    text = extract_text(content, filename)
+def _heuristic_parse(text: str) -> ParsedCV:
     lines = [ln for ln in text.splitlines() if ln.strip()]
 
     email_match = _EMAIL_RE.search(text)
@@ -103,3 +116,97 @@ def parse_cv(content: bytes, filename: str) -> ParsedCV:
         skills=skills,
         raw_text=text,
     )
+
+
+def _coerce_date(value) -> date | None:
+    """Loosely parse 'YYYY', 'YYYY-MM', or 'YYYY-MM-DD' into a date; else None."""
+    if not value or not isinstance(value, str):
+        return None
+    m = re.match(r"\s*(\d{4})(?:-(\d{1,2}))?(?:-(\d{1,2}))?", value.strip())
+    if not m:
+        return None
+    try:
+        year = int(m.group(1))
+        month = int(m.group(2)) if m.group(2) else 1
+        day = int(m.group(3)) if m.group(3) else 1
+        month = min(max(month, 1), 12)
+        day = min(max(day, 1), 28)
+        return date(year, month, day)
+    except (ValueError, TypeError):
+        return None
+
+
+def _clean_str(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    return s or None
+
+
+def _merge_skills(heuristic: list[str], llm_skills) -> list[str]:
+    """Normalise + union skills from both sources so any named skill counts."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for source in (llm_skills or [], heuristic or []):
+        for raw in source:
+            if not isinstance(raw, str):
+                continue
+            norm = normalize_skill(raw)
+            if norm and norm not in seen:
+                seen.add(norm)
+                out.append(norm)
+    return out
+
+
+def _apply_llm(base: ParsedCV, data: dict) -> ParsedCV:
+    """Overlay trusted LLM fields onto the heuristic baseline."""
+    base.full_name = _clean_str(data.get("full_name")) or base.full_name
+    base.email = _clean_str(data.get("email")) or base.email
+    base.phone = _clean_str(data.get("phone")) or base.phone
+    base.headline = _clean_str(data.get("headline")) or base.headline
+    base.location = _clean_str(data.get("location")) or base.location
+    base.seniority = _clean_str(data.get("seniority")) or base.seniority
+    base.summary = _clean_str(data.get("summary")) or base.summary
+
+    yoe = data.get("years_experience")
+    if isinstance(yoe, (int, float)) and yoe >= 0:
+        base.years_experience = float(yoe)
+
+    base.skills = _merge_skills(base.skills, data.get("skills"))
+
+    experiences: list[ParsedExperience] = []
+    for item in data.get("experiences") or []:
+        if not isinstance(item, dict):
+            continue
+        experiences.append(
+            ParsedExperience(
+                title=_clean_str(item.get("title")),
+                company=_clean_str(item.get("company")),
+                start_date=_coerce_date(item.get("start_date")),
+                end_date=_coerce_date(item.get("end_date")),
+                description=_clean_str(item.get("description")),
+            )
+        )
+    base.experiences = experiences
+    base.parsed_by_llm = True
+    return base
+
+
+def parse_cv(content: bytes, filename: str) -> ParsedCV:
+    """
+    Parse a CV into structured fields. Runs the fast heuristic as a baseline,
+    then — when a real LLM is configured — overlays a richer structured parse
+    (real skills, dated work history, seniority). Falls back cleanly to the
+    heuristic whenever the LLM is unavailable or its output can't be trusted.
+    """
+    text = extract_text(content, filename)
+    parsed = _heuristic_parse(text)
+    parsed.raw_text = text
+
+    data = llm_parse_cv(text)
+    if isinstance(data, dict):
+        try:
+            parsed = _apply_llm(parsed, data)
+        except Exception:
+            pass  # keep the heuristic result if the overlay misbehaves
+    return parsed

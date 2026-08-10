@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.recruiter.enums import CandidateSource
-from app.recruiter.models import CandidateProfile, CandidateSkill
+from app.recruiter.models import CandidateExperience, CandidateProfile, CandidateSkill
 from app.recruiter.services.matching import embed_candidate
 from app.recruiter.services.parsing import parse_cv
 
@@ -59,6 +59,19 @@ def ingest_cv(db: Session, agency_id: int, filename: str, content: bytes) -> Ing
 
     for skill in parsed.skills:
         db.add(CandidateSkill(candidate_id=profile.id, name=skill))
+
+    # Dated work history — only produced by the LLM parse; heuristic yields none.
+    for exp in parsed.experiences:
+        db.add(
+            CandidateExperience(
+                candidate_id=profile.id,
+                title=exp.title,
+                company=exp.company,
+                start_date=exp.start_date,
+                end_date=exp.end_date,
+                description=exp.description,
+            )
+        )
     db.flush()
     db.refresh(profile)
 

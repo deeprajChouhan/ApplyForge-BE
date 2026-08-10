@@ -30,7 +30,10 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
 from app.recruiter.enums import (
+    AgencyPlan,
+    AgencyStatus,
     ApplicationStage,
+    BillingModel,
     CandidateSource,
     EmploymentType,
     RecruiterSeatRole,
@@ -51,6 +54,30 @@ class Agency(Base, RecTimestampMixin):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     slug: Mapped[str] = mapped_column(String(120), unique=True, nullable=False)
+
+    # Billing tier (Phase 5). seat_limit NULL = unlimited; when NULL for a set
+    # plan the effective limit falls back to the plan default.
+    plan: Mapped[AgencyPlan] = mapped_column(
+        SAEnum(AgencyPlan), default=AgencyPlan.free, nullable=False, server_default=AgencyPlan.free.value
+    )
+    seat_limit: Mapped[int | None] = mapped_column(Integer)
+
+    # Billing (Phase 5.4). billing_model is chosen per agency by the operator.
+    billing_model: Mapped[BillingModel] = mapped_column(
+        SAEnum(BillingModel), default=BillingModel.flat, nullable=False, server_default=BillingModel.flat.value
+    )
+    subscription_status: Mapped[str] = mapped_column(
+        String(30), default="inactive", nullable=False, server_default="inactive"
+    )
+    stripe_customer_id: Mapped[str | None] = mapped_column(String(64))
+    stripe_subscription_id: Mapped[str | None] = mapped_column(String(64))
+
+    # Onboarding lifecycle (Phase 5.5). Operator-created agencies default to
+    # active with no trial; self-serve signups start pending with a trial clock.
+    status: Mapped[AgencyStatus] = mapped_column(
+        SAEnum(AgencyStatus), default=AgencyStatus.active, nullable=False, server_default=AgencyStatus.active.value
+    )
+    trial_ends_at: Mapped[datetime | None] = mapped_column(DateTime)
 
     recruiters: Mapped[list["Recruiter"]] = relationship(
         back_populates="agency", cascade="all, delete-orphan"
@@ -232,6 +259,45 @@ class ShortlistEntry(Base):
     shortlist: Mapped["Shortlist"] = relationship(back_populates="entries")
 
 
+class UsageEvent(Base):
+    """
+    Append-only per-agency usage metering (Phase 5.2). Each billable action
+    records one row; monthly rollups drive the operator console and, later,
+    usage-based billing.
+    """
+    __tablename__ = "rec_usage_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    agency_id: Mapped[int] = mapped_column(
+        ForeignKey("rec_agencies.id", ondelete="CASCADE"), index=True
+    )
+    kind: Mapped[str] = mapped_column(String(40), index=True)
+    quantity: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), index=True)
+
+
+class AgencyInvite(Base):
+    """
+    A pending recruiter-seat invite (Phase 5.5). An owner creates one; the
+    recipient claims it via a one-time token to set their own password. Kept
+    inside the data wall — no consumer references.
+    """
+    __tablename__ = "rec_agency_invites"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    agency_id: Mapped[int] = mapped_column(
+        ForeignKey("rec_agencies.id", ondelete="CASCADE"), index=True
+    )
+    email: Mapped[str] = mapped_column(String(255), index=True, nullable=False)
+    role: Mapped[RecruiterSeatRole] = mapped_column(
+        SAEnum(RecruiterSeatRole), default=RecruiterSeatRole.recruiter, nullable=False
+    )
+    token: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
 class Application(Base, RecTimestampMixin):
     """Tracking-only pipeline record (Domain 2). Never a live submission."""
     __tablename__ = "rec_applications"
@@ -267,4 +333,6 @@ RECRUITER_TABLES = [
     Shortlist.__table__,
     ShortlistEntry.__table__,
     Application.__table__,
+    UsageEvent.__table__,
+    AgencyInvite.__table__,
 ]

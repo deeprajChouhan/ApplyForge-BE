@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
-from app.recruiter.api.deps import get_agency
+from app.recruiter.api.deps import get_agency, require_agency_feature, require_unlocked_agency
 from app.recruiter.models import Agency, Application, CandidateProfile, Client, Role, Shortlist
 from app.recruiter.schemas import (
     ApplicationCreate,
@@ -33,6 +33,8 @@ from app.recruiter.schemas import (
     ShortlistOut,
 )
 from app.recruiter.bridge import provision_candidate
+from app.recruiter.enums import UsageKind
+from app.recruiter.services import usage as usage_service
 from app.recruiter.services.advisory import next_hire_advisory
 from app.recruiter.services.ingestion import ingest_batch
 from app.recruiter.services.listing import generate_listing
@@ -64,7 +66,7 @@ def _client_out(db: Session, client: Client) -> ClientOut:
 @clients_router.post("", response_model=ClientOut, status_code=201)
 def create_client(
     payload: ClientCreate,
-    agency: Agency = Depends(get_agency),
+    agency: Agency = Depends(require_unlocked_agency),
     db: Session = Depends(get_db),
 ):
     client = Client(agency_id=agency.id, name=payload.name, industry=payload.industry)
@@ -93,10 +95,15 @@ def get_client(client_id: int, agency: Agency = Depends(get_agency), db: Session
 
 
 @clients_router.get("/{client_id}/next-hire", response_model=NextHireAdvisoryOut)
-def client_next_hire(client_id: int, agency: Agency = Depends(get_agency), db: Session = Depends(get_db)):
+def client_next_hire(
+    client_id: int,
+    agency: Agency = Depends(require_agency_feature("advisory")),
+    db: Session = Depends(get_db),
+):
     """Advisory: infer this client's likely next hire from their roster + benchmarks."""
     client = _load_client(db, agency, client_id)
     advisory = next_hire_advisory(db, agency.id, client)
+    usage_service.record(db, agency.id, UsageKind.advisory_run)
     return NextHireAdvisoryOut(
         client_id=advisory.client_id,
         client_name=advisory.client_name,
@@ -132,7 +139,7 @@ def _normalize_skills(skills: list[str]) -> list[str]:
 @roles_router.post("", response_model=RoleOut, status_code=201)
 def create_role(
     payload: RoleCreate,
-    agency: Agency = Depends(get_agency),
+    agency: Agency = Depends(require_unlocked_agency),
     db: Session = Depends(get_db),
 ):
     role = Role(
@@ -172,12 +179,17 @@ def get_role(role_id: int, agency: Agency = Depends(get_agency), db: Session = D
 
 
 @roles_router.post("/{role_id}/listing", response_model=JobListingOut)
-def draft_listing(role_id: int, agency: Agency = Depends(get_agency), db: Session = Depends(get_db)):
+def draft_listing(
+    role_id: int,
+    agency: Agency = Depends(require_agency_feature("listings", write=True)),
+    db: Session = Depends(get_db),
+):
     """Draft a job listing for this role, grounded in the agency's pool patterns."""
     role = db.get(Role, role_id)
     if role is None or role.agency_id != agency.id:
         raise HTTPException(status_code=404, detail="Role not found")
     listing = generate_listing(db, role)
+    usage_service.record(db, agency.id, UsageKind.listing_drafted)
     return JobListingOut(**listing.__dict__)
 
 
@@ -190,7 +202,7 @@ candidates_router = APIRouter(
 @candidates_router.post("/ingest", response_model=IngestResult, status_code=201)
 async def ingest_cvs(
     files: list[UploadFile] = File(...),
-    agency: Agency = Depends(get_agency),
+    agency: Agency = Depends(require_unlocked_agency),
     db: Session = Depends(get_db),
 ):
     """Bulk-CV ingestion: parse each uploaded CV into the agency's pool."""
@@ -202,6 +214,7 @@ async def ingest_cvs(
         payload.append((f.filename or "cv.txt", await f.read()))
 
     ingested = ingest_batch(db, agency.id, payload)
+    usage_service.record(db, agency.id, UsageKind.cv_ingested, len(ingested))
     return IngestResult(
         ingested=len(ingested),
         candidates=[
@@ -242,7 +255,7 @@ def get_candidate(
 def convert_candidate(
     candidate_id: int,
     payload: ConvertRequest,
-    agency: Agency = Depends(get_agency),
+    agency: Agency = Depends(require_unlocked_agency),
     db: Session = Depends(get_db),
 ):
     """
@@ -288,6 +301,7 @@ def candidate_role_matches(
     if cand is None or cand.agency_id != agency.id:
         raise HTTPException(status_code=404, detail="Candidate not found")
     matches = rank_roles_for_candidate(db, agency.id, cand, include_closed=include_closed, limit=limit)
+    usage_service.record(db, agency.id, UsageKind.role_match_run)
     return CandidateRoleMatchesOut(
         candidate_id=candidate_id,
         matches=[
@@ -323,12 +337,14 @@ def _load_role(db: Session, agency: Agency, role_id: int) -> Role:
 def create_shortlist(
     role_id: int,
     limit: int | None = Query(default=None, ge=1, le=500),
-    agency: Agency = Depends(get_agency),
+    agency: Agency = Depends(require_unlocked_agency),
     db: Session = Depends(get_db),
 ):
     """Run inverted matching for this role and save the ranked shortlist."""
     role = _load_role(db, agency, role_id)
-    return generate_shortlist(db, role, limit=limit)
+    shortlist = generate_shortlist(db, role, limit=limit)
+    usage_service.record(db, agency.id, UsageKind.shortlist_generated)
+    return shortlist
 
 
 @shortlist_router.get("/latest", response_model=ShortlistOut)
@@ -358,7 +374,7 @@ applications_router = APIRouter(
 @applications_router.post("", response_model=ApplicationOut, status_code=201)
 def create_application(
     payload: ApplicationCreate,
-    agency: Agency = Depends(get_agency),
+    agency: Agency = Depends(require_unlocked_agency),
     db: Session = Depends(get_db),
 ):
     cand = db.get(CandidateProfile, payload.candidate_id)
@@ -394,7 +410,7 @@ def list_applications(agency: Agency = Depends(get_agency), db: Session = Depend
 def update_stage(
     application_id: int,
     payload: ApplicationStageUpdate,
-    agency: Agency = Depends(get_agency),
+    agency: Agency = Depends(require_unlocked_agency),
     db: Session = Depends(get_db),
 ):
     app_row = db.get(Application, application_id)
@@ -412,6 +428,9 @@ market_router = APIRouter(prefix="/agencies/{agency_id}/market", tags=["recruite
 
 
 @market_router.get("", response_model=MarketOverviewOut)
-def market_overview(agency: Agency = Depends(get_agency), db: Session = Depends(get_db)):
+def market_overview(
+    agency: Agency = Depends(require_agency_feature("market")),
+    db: Session = Depends(get_db),
+):
     """Demand vs supply, skill shortages, salary bands, and pipeline health."""
     return MarketOverviewOut(**asdict(compute_market(db, agency.id)))

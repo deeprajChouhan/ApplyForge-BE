@@ -24,7 +24,9 @@ from app.core.security import create_token
 from app.db.session import get_db
 from app.models.enums import UserRole
 from app.models.models import User
+from app.recruiter.enums import RecruiterSeatRole, plan_has_feature
 from app.recruiter.models import Agency, Recruiter
+from app.recruiter.services import access as access_service
 
 RECRUITER_ACCESS = "recruiter_access"
 RECRUITER_REFRESH = "recruiter_refresh"
@@ -122,3 +124,47 @@ def get_agency(
     if agency is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agency not found")
     return agency
+
+
+def require_owner(recruiter: Recruiter = Depends(get_current_recruiter)) -> Recruiter:
+    """Agency-admin gate: only an agency's owner may manage their tenant (5.3)."""
+    if recruiter.role != RecruiterSeatRole.owner:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only an agency owner can manage the team.",
+        )
+    return recruiter
+
+
+def ensure_unlocked(agency: Agency) -> None:
+    """Raise 402 when a trial has ended with no active subscription (Phase 5.5)."""
+    if access_service.is_locked(agency):
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail="Your trial has ended. Upgrade your plan to keep using this feature.",
+        )
+
+
+def require_unlocked_agency(agency: Agency = Depends(get_agency)) -> Agency:
+    """Tenant-isolated agency that must not be trial-locked (write endpoints)."""
+    ensure_unlocked(agency)
+    return agency
+
+
+def require_agency_feature(feature: str, *, write: bool = False):
+    """
+    Dependency factory that gates a route behind the agency's plan (Phase 5.1).
+    Reuses get_agency (so tenant isolation still applies), then checks the plan.
+    Pass write=True for mutating routes so trial-locked agencies are blocked (402).
+    """
+    def _dep(agency: Agency = Depends(get_agency)) -> Agency:
+        if not plan_has_feature(agency.plan, feature):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"The '{feature}' feature is not available on the {agency.plan.value} plan. Upgrade to unlock it.",
+            )
+        if write:
+            ensure_unlocked(agency)
+        return agency
+
+    return _dep

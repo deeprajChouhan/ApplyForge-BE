@@ -9,11 +9,13 @@ phrase these later; the signals are computed here.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 
 from sqlalchemy.orm import Session
 
 from app.recruiter.models import CandidateProfile, Client, Role
+from app.recruiter.services import ai_support
 
 # Skill clusters → a suggested role archetype title.
 _ARCHETYPES: list[tuple[str, set[str]]] = [
@@ -63,6 +65,43 @@ def _is_senior(role: Role) -> bool:
     return any(t in hay for t in _SENIOR_TERMS)
 
 
+def _polish_rationales(advisory: NextHireAdvisory, client: Client) -> NextHireAdvisory:
+    """
+    Optionally replace the templated rationales with LLM-written reasoning that is
+    grounded strictly in the computed signals (roster gap, benchmark skills, pool
+    supply, confidence). No-ops without a real LLM, and never invents facts.
+    """
+    if not ai_support.llm_enabled() or not advisory.suggestions:
+        return advisory
+
+    facts = [
+        {
+            "title": s.title,
+            "skills": s.skills,
+            "pool_candidates_available": s.pool_supply,
+            "confidence": s.confidence,
+        }
+        for s in advisory.suggestions
+    ]
+    system = (
+        "You are a staffing strategy advisor. For each suggested next hire, write a "
+        "crisp 1-2 sentence rationale a recruiter could say to their client. Ground it "
+        "ONLY in the provided facts: the client's roster gap, skills in demand across "
+        "the agency's book, and how many pool candidates are available. Do NOT invent "
+        "numbers, clients, or skills. Return a STRICT JSON array of strings, one per "
+        "suggestion, in the same order."
+    )
+    user = json.dumps(
+        {"client": client.name, "roster_roles": advisory.roster_roles, "suggestions": facts}
+    )
+    out = ai_support.generate_json(system, user)
+    if isinstance(out, list) and len(out) == len(advisory.suggestions):
+        for suggestion, text in zip(advisory.suggestions, out):
+            if isinstance(text, str) and text.strip():
+                suggestion.rationale = text.strip()
+    return advisory
+
+
 def next_hire_advisory(db: Session, agency_id: int, client: Client) -> NextHireAdvisory:
     agency_roles = db.query(Role).filter(Role.agency_id == agency_id).all()
     client_roles = [r for r in agency_roles if r.client_id == client.id]
@@ -107,7 +146,7 @@ def next_hire_advisory(db: Session, agency_id: int, client: Client) -> NextHireA
                 confidence="medium" if pool else "low",
             )
         )
-        return advisory
+        return _polish_rationales(advisory, client)
 
     # Gap skills: common across the book but absent from this client.
     gaps = sorted(
@@ -138,7 +177,7 @@ def next_hire_advisory(db: Session, agency_id: int, client: Client) -> NextHireA
             f"a senior hire may be the next step."
         )
 
-    return advisory
+    return _polish_rationales(advisory, client)
 
 
 def _pool_covering(db: Session, agency_id: int, skills: list[str]) -> int:
