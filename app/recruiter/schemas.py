@@ -323,6 +323,55 @@ class RoleCreate(BaseModel):
     notes: str | None = None
 
 
+class ParseJDRequest(BaseModel):
+    text: str = Field(min_length=10, max_length=20_000)
+
+
+class ParseJDResult(BaseModel):
+    title: str | None = None
+    seniority: str | None = None
+    employment_type: str | None = None
+    location: str | None = None
+    min_years_experience: float | None = None
+    salary_min: int | None = None
+    salary_max: int | None = None
+    budget_currency: str | None = None
+    required_skills: list[str] = Field(default_factory=list)
+    preferred_skills: list[str] = Field(default_factory=list)
+    description: str | None = None
+    notes: str | None = None
+    used_llm: bool = False
+
+
+class ScreeningQuestion(BaseModel):
+    text: str
+    intent: str | None = None  # short label: "gap probe", "seniority check", etc.
+
+
+class ScreeningQuestionsOut(BaseModel):
+    questions: list[ScreeningQuestion]
+    generated_at: datetime
+    used_llm: bool
+
+
+class AskCandidateRequest(BaseModel):
+    question: str = Field(min_length=3, max_length=2000)
+    role_id: int | None = None
+
+
+class EvidenceRef(BaseModel):
+    id: str
+    label: str
+
+
+class AskCandidateResult(BaseModel):
+    answer: str
+    citations: list[str] = Field(default_factory=list)
+    evidence: list[EvidenceRef] = Field(default_factory=list)
+    generated_at: datetime
+    used_llm: bool
+
+
 class RoleUpdate(BaseModel):
     """Partial-update payload for the role detail page."""
     title: str | None = None
@@ -618,6 +667,16 @@ class RoleShareTokenOut(ORMModel):
     share_url: str | None = None
 
 
+class PublicShortlistCandidate(BaseModel):
+    """Client-facing shortlist row — first-name-only, no email/phone."""
+    candidate_id: int
+    display_name: str
+    headline: str | None
+    years_experience: float | None
+    fit_score: float
+    top_skills: list[str]
+
+
 class PublicRoleView(BaseModel):
     """Client-safe payload — no candidate PII, no client budget internals."""
     role_id: int
@@ -634,6 +693,24 @@ class PublicRoleView(BaseModel):
     market_snapshot: dict | None
     is_draft: bool
     agency_name: str
+    shortlist: list[PublicShortlistCandidate] = Field(default_factory=list)
+
+
+class PublicFeedbackCreate(BaseModel):
+    candidate_id: int | None = None
+    sentiment: int | None = None  # +1 / 0 / -1
+    body: str | None = None
+    client_name: str | None = None
+
+
+class RoleFeedbackOut(ORMModel):
+    id: int
+    role_id: int
+    candidate_id: int | None
+    sentiment: int | None
+    body: str | None
+    client_name: str | None
+    created_at: datetime | None = None
 
 
 class MarketSnapshotOut(ORMModel):

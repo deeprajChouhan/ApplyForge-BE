@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from typing import Iterable
 
 from app.recruiter.models import Application, CandidateProfile, Role
+from app.recruiter.services import ai_support
 from app.recruiter.services.skills import normalize_skill
 
 
@@ -138,7 +139,7 @@ def compute_swot(role: Role, cand: CandidateProfile, app_row: Application) -> di
     if not threats:
         threats.append("No structural risks flagged from data; verify motivation in screen")
 
-    return {
+    payload = {
         "strengths": strengths,
         "weaknesses": weaknesses,
         "opportunities": opportunities,
@@ -146,3 +147,100 @@ def compute_swot(role: Role, cand: CandidateProfile, app_row: Application) -> di
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "model": "heuristic-v1",
     }
+
+    # If a real LLM is configured, polish the bullets through it. The LLM only
+    # rewrites; it never invents new items or changes the count. Any failure
+    # (rate limit, malformed output, missing keys) leaves the heuristic payload
+    # untouched, so the caller always gets a working SWOT.
+    polished = _llm_polish(role, cand, app_row, payload)
+    return polished or payload
+
+
+# ── LLM polish ──────────────────────────────────────────────────────────
+_SYSTEM = (
+    "You are a senior technical recruiter writing internal notes on a candidate "
+    "for a specific role. You rewrite terse bullet points into sharp, hiring-manager-"
+    "ready lines: precise, evidence-oriented, one line each. You never invent new "
+    "facts, never add or remove bullets, and never contradict the input. Return "
+    "STRICT JSON only — no prose, no markdown."
+)
+
+
+def _bullet_hint(items: list[str]) -> str:
+    return "\n".join(f"- {x}" for x in items) if items else "(none)"
+
+
+def _llm_polish(
+    role: Role,
+    cand: CandidateProfile,
+    app_row: Application,
+    heuristic: dict,
+) -> dict | None:
+    if not ai_support.llm_enabled():
+        return None
+
+    ctx_lines = [
+        f"Role: {role.title or 'Untitled'}"
+        + (f" ({role.seniority})" if role.seniority else ""),
+        f"Required skills: {', '.join(role.required_skills or []) or 'unspecified'}",
+        f"Preferred skills: {', '.join(role.preferred_skills or []) or 'unspecified'}",
+        f"Min experience: {role.min_years_experience} yrs" if role.min_years_experience else "Min experience: unspecified",
+        f"Location: {role.location or 'unspecified'}",
+    ]
+    if role.budget_min or role.budget_max:
+        ctx_lines.append(
+            f"Client budget: {role.budget_currency} "
+            f"{(role.budget_min or 0):,}–{(role.budget_max or 0):,}"
+        )
+    ctx_lines.append("")
+    ctx_lines.append(
+        f"Candidate: {cand.full_name or 'unnamed'}"
+        + (f" — {cand.headline}" if cand.headline else "")
+    )
+    ctx_lines.append(
+        f"Experience: {cand.years_experience} yrs" if cand.years_experience is not None else "Experience: unknown"
+    )
+    ctx_lines.append(f"Location: {cand.location or 'unknown'}")
+    ctx_lines.append(
+        f"Skills: {', '.join(sorted({(s.name or '').strip() for s in (cand.skills or []) if s.name})) or 'unknown'}"
+    )
+    if cand.expected_budget_min or cand.expected_budget_max:
+        ctx_lines.append(
+            f"Expected pay: {cand.expected_budget_currency} "
+            f"{(cand.expected_budget_min or 0):,}–{(cand.expected_budget_max or 0):,}"
+        )
+    if app_row.fit_score is not None:
+        ctx_lines.append(f"Model fit score: {round(app_row.fit_score)}/100")
+
+    user = (
+        "Polish these heuristic bullets into recruiter-ready lines. Keep the same "
+        "number of items per section, keep their intent, and stay grounded in the "
+        "facts below. Return JSON with keys strengths, weaknesses, opportunities, "
+        "threats — each a list of strings.\n\n"
+        f"Context:\n{chr(10).join(ctx_lines)}\n\n"
+        f"Strengths:\n{_bullet_hint(heuristic['strengths'])}\n\n"
+        f"Weaknesses:\n{_bullet_hint(heuristic['weaknesses'])}\n\n"
+        f"Opportunities:\n{_bullet_hint(heuristic['opportunities'])}\n\n"
+        f"Threats:\n{_bullet_hint(heuristic['threats'])}"
+    )
+
+    data = ai_support.generate_json(_SYSTEM, user)
+    if not isinstance(data, dict):
+        return None
+
+    def _clean(key: str) -> list[str] | None:
+        v = data.get(key)
+        if not isinstance(v, list):
+            return None
+        out = [str(x).strip() for x in v if isinstance(x, (str, int, float)) and str(x).strip()]
+        return out or None
+
+    polished = {
+        "strengths": _clean("strengths") or heuristic["strengths"],
+        "weaknesses": _clean("weaknesses") or heuristic["weaknesses"],
+        "opportunities": _clean("opportunities") or heuristic["opportunities"],
+        "threats": _clean("threats") or heuristic["threats"],
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "model": "llm-polish-v1",
+    }
+    return polished

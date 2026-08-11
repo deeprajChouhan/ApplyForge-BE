@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile
 from sqlalchemy.orm import Session
 
 import secrets
@@ -28,6 +28,7 @@ from app.recruiter.models import (
     MarketSnapshot,
     Recruiter,
     Role,
+    RoleFeedback,
     RoleShareToken,
     Shortlist,
     ShortlistEntry,
@@ -38,6 +39,8 @@ from app.recruiter.schemas import (
     ApplicationStageUpdate,
     ApplicationNoteCreate,
     ApplicationNoteOut,
+    AskCandidateRequest,
+    AskCandidateResult,
     AssignCandidatesRequest,
     AssignCandidatesResult,
     CandidateBudgetUpdate,
@@ -58,7 +61,14 @@ from app.recruiter.schemas import (
     MarketSnapshotOut,
     NextHireAdvisoryOut,
     NextHireSuggestionOut,
+    ParseJDRequest,
+    ParseJDResult,
+    PublicFeedbackCreate,
     PublicRoleView,
+    PublicShortlistCandidate,
+    RoleFeedbackOut,
+    ScreeningQuestion,
+    ScreeningQuestionsOut,
     RoleBoardColumn,
     RoleBoardOut,
     RoleCreate,
@@ -82,6 +92,10 @@ from app.recruiter.services.matching import embed_role
 from app.recruiter.services.placement import rank_roles_for_candidate
 from app.recruiter.services.shortlist import generate_shortlist
 from app.recruiter.services.skills import normalize_skill
+from app.recruiter.services.candidate_chat import ask_about_candidate
+from app.recruiter.services.jd_parse import parse_jd
+from app.recruiter.services.proposal_pdf import render_role_proposal_pdf
+from app.recruiter.services.screening import draft_screening_questions
 from app.recruiter.services.swot import compute_swot
 
 from jose import JWTError, jwt
@@ -296,6 +310,39 @@ def update_role(
     db.commit()
     db.refresh(role)
     return role
+
+
+@roles_router.get("/{role_id}/proposal.pdf")
+def role_proposal_pdf(
+    role_id: int,
+    agency: Agency = Depends(get_agency),
+    db: Session = Depends(get_db),
+):
+    """Client-safe proposal PDF for this role — signed-ready cover doc."""
+    role = db.get(Role, role_id)
+    if role is None or role.agency_id != agency.id:
+        raise HTTPException(status_code=404, detail="Role not found")
+    client = db.get(Client, role.client_id) if role.client_id else None
+    pdf_bytes = render_role_proposal_pdf(role, agency, client)
+    safe_title = "".join(c if c.isalnum() or c in "-_" else "_" for c in (role.title or "role"))[:60]
+    filename = f"{safe_title}-proposal.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@roles_router.post("/parse-jd", response_model=ParseJDResult)
+def parse_jd_to_role(
+    payload: ParseJDRequest,
+    agency: Agency = Depends(require_unlocked_agency),  # noqa: ARG001 — agency-gate only
+):
+    """
+    Turn a pasted JD or client email into a role-draft payload the frontend can
+    pre-fill. Fail-soft: returns an empty draft if the LLM isn't configured.
+    """
+    return ParseJDResult(**parse_jd(payload.text))
 
 
 @roles_router.get("/{role_id}/share", response_model=RoleShareTokenOut | None)
@@ -515,6 +562,30 @@ def convert_candidate(
     db.commit()
     db.refresh(cand)
     return ConvertResult(candidate_id=cand.id, provisioned_user_id=user_id, email=email)
+
+
+@candidates_router.post("/{candidate_id}/ask", response_model=AskCandidateResult)
+def ask_candidate(
+    candidate_id: int,
+    payload: AskCandidateRequest,
+    agency: Agency = Depends(require_unlocked_agency),
+    db: Session = Depends(get_db),
+):
+    """
+    Grounded QA over one candidate — CV + skills + experiences + activity
+    notes + optional role context. Fail-soft: returns keyword-scan matches
+    when the LLM isn't configured.
+    """
+    cand = db.get(CandidateProfile, candidate_id)
+    if cand is None or cand.agency_id != agency.id:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+    role: Role | None = None
+    if payload.role_id is not None:
+        role = db.get(Role, payload.role_id)
+        if role is None or role.agency_id != agency.id:
+            raise HTTPException(status_code=404, detail="Role not found for this agency")
+    result = ask_about_candidate(db, cand, payload.question, role=role)
+    return AskCandidateResult(**result)
 
 
 @candidates_router.patch("/{candidate_id}/budget", response_model=CandidateOut)
@@ -852,6 +923,30 @@ def assign_candidates_to_role(
     )
 
 
+@applications_router.post("/{application_id}/screening-questions", response_model=ScreeningQuestionsOut)
+def application_screening_questions(
+    application_id: int,
+    agency: Agency = Depends(require_unlocked_agency),
+    db: Session = Depends(get_db),
+):
+    """Generate 6-8 role-aware screening questions grounded on candidate gaps."""
+    app_row = db.get(Application, application_id)
+    if app_row is None or app_row.agency_id != agency.id:
+        raise HTTPException(status_code=404, detail="Application not found")
+    if app_row.role_id is None:
+        raise HTTPException(status_code=400, detail="Application is not attached to a role")
+    role = db.get(Role, app_row.role_id)
+    cand = db.get(CandidateProfile, app_row.candidate_id)
+    if role is None or cand is None:
+        raise HTTPException(status_code=404, detail="Role or candidate missing")
+    result = draft_screening_questions(role, cand, app_row)
+    return ScreeningQuestionsOut(
+        questions=[ScreeningQuestion(**q) for q in result["questions"]],
+        generated_at=result["generated_at"],
+        used_llm=result["used_llm"],
+    )
+
+
 @applications_router.post("/{application_id}/swot", response_model=SwotOut)
 def application_swot(
     application_id: int,
@@ -876,6 +971,50 @@ def application_swot(
 
 # ── Public share (unauthenticated, token-guarded) ────────────────────────
 public_router = APIRouter(prefix="/public", tags=["recruiter: public"])
+
+
+def _client_display_name(full_name: str | None, cid: int) -> str:
+    """Client-facing name: keep first name only for privacy on the public page."""
+    if not full_name:
+        return f"Candidate {cid}"
+    parts = full_name.strip().split()
+    if not parts:
+        return f"Candidate {cid}"
+    first = parts[0]
+    last_initial = parts[-1][0] + "." if len(parts) > 1 else ""
+    return f"{first} {last_initial}".strip()
+
+
+def _public_shortlist(db: Session, role: Role, limit: int = 5) -> list[PublicShortlistCandidate]:
+    sl = (
+        db.query(Shortlist)
+        .filter(Shortlist.role_id == role.id, Shortlist.agency_id == role.agency_id)
+        .order_by(Shortlist.id.desc())
+        .first()
+    )
+    if sl is None:
+        return []
+    entries = sl.entries[:limit]
+    cand_ids = [e.candidate_id for e in entries]
+    cand_map = {
+        c.id: c
+        for c in db.query(CandidateProfile).filter(CandidateProfile.id.in_(cand_ids)).all()
+    }
+    out: list[PublicShortlistCandidate] = []
+    for e in entries:
+        c = cand_map.get(e.candidate_id)
+        skills = sorted({(s.name or "").strip() for s in (c.skills if c else []) if s.name})
+        out.append(
+            PublicShortlistCandidate(
+                candidate_id=e.candidate_id,
+                display_name=_client_display_name(c.full_name if c else None, e.candidate_id),
+                headline=c.headline if c else None,
+                years_experience=c.years_experience if c else None,
+                fit_score=e.fit_score,
+                top_skills=skills[:8],
+            )
+        )
+    return out
 
 
 @public_router.get("/roles/{token}", response_model=PublicRoleView)
@@ -913,6 +1052,72 @@ def public_role_view(token: str, db: Session = Depends(get_db)):
         market_snapshot=role.market_snapshot,
         is_draft=role.is_draft,
         agency_name=agency.name if agency else "",
+        shortlist=_public_shortlist(db, role),
+    )
+
+
+@public_router.post("/roles/{token}/feedback", response_model=RoleFeedbackOut, status_code=201)
+def public_role_feedback(
+    token: str,
+    payload: PublicFeedbackCreate,
+    db: Session = Depends(get_db),
+):
+    """Client submits sentiment/comment through the share link."""
+    tok = (
+        db.query(RoleShareToken)
+        .filter(RoleShareToken.token == token, RoleShareToken.is_active.is_(True))
+        .first()
+    )
+    if tok is None:
+        raise HTTPException(status_code=404, detail="Share link is not active")
+
+    # Basic guard: at least one of sentiment or body must be provided.
+    if payload.sentiment is None and not (payload.body and payload.body.strip()):
+        raise HTTPException(status_code=400, detail="Add a comment or a 👍/👎 to submit feedback")
+    if payload.sentiment is not None and payload.sentiment not in (-1, 0, 1):
+        raise HTTPException(status_code=400, detail="Sentiment must be -1, 0, or 1")
+
+    # If the client identified a candidate, verify it's on the current shortlist
+    # for this role — no drive-by feedback on random ids.
+    if payload.candidate_id is not None:
+        sl = (
+            db.query(Shortlist)
+            .filter(Shortlist.role_id == tok.role_id)
+            .order_by(Shortlist.id.desc())
+            .first()
+        )
+        if sl is None or payload.candidate_id not in {e.candidate_id for e in sl.entries}:
+            raise HTTPException(status_code=400, detail="Candidate is not on the current shortlist")
+
+    fb = RoleFeedback(
+        agency_id=tok.agency_id,
+        role_id=tok.role_id,
+        share_token_id=tok.id,
+        candidate_id=payload.candidate_id,
+        sentiment=payload.sentiment,
+        body=(payload.body or "").strip() or None,
+        client_name=(payload.client_name or "").strip() or None,
+    )
+    db.add(fb)
+    db.commit()
+    db.refresh(fb)
+    return fb
+
+
+@roles_router.get("/{role_id}/feedback", response_model=list[RoleFeedbackOut])
+def list_role_feedback(
+    role_id: int,
+    agency: Agency = Depends(get_agency),
+    db: Session = Depends(get_db),
+):
+    role = db.get(Role, role_id)
+    if role is None or role.agency_id != agency.id:
+        raise HTTPException(status_code=404, detail="Role not found")
+    return (
+        db.query(RoleFeedback)
+        .filter(RoleFeedback.role_id == role.id)
+        .order_by(RoleFeedback.id.desc())
+        .all()
     )
 
 

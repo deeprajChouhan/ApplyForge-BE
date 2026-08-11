@@ -408,6 +408,32 @@ class RoleShareToken(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
+class RoleFeedback(Base):
+    """
+    Client-side sentiment (👍 / meh / 👎) plus optional comment on a role or
+    on a specific shortlisted candidate. Submitted through the public share
+    token — we store which token was used so a revoked link can't accept new
+    feedback (checked in the endpoint).
+    """
+    __tablename__ = "rec_role_feedback"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    agency_id: Mapped[int] = mapped_column(
+        ForeignKey("rec_agencies.id", ondelete="CASCADE"), index=True
+    )
+    role_id: Mapped[int] = mapped_column(
+        ForeignKey("rec_roles.id", ondelete="CASCADE"), index=True
+    )
+    share_token_id: Mapped[int | None] = mapped_column(
+        ForeignKey("rec_role_share_tokens.id", ondelete="SET NULL")
+    )
+    candidate_id: Mapped[int | None] = mapped_column(Integer)
+    sentiment: Mapped[int | None] = mapped_column(Integer)  # +1 / 0 / -1
+    body: Mapped[str | None] = mapped_column(Text)
+    client_name: Mapped[str | None] = mapped_column(String(200))
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
 class MarketSnapshot(Base):
     """
     Crawler-sourced compensation & demand data for a role query. Kept as
@@ -451,6 +477,7 @@ RECRUITER_TABLES = [
     Application.__table__,
     ApplicationNote.__table__,
     RoleShareToken.__table__,
+    RoleFeedback.__table__,
     UsageEvent.__table__,
     AgencyInvite.__table__,
     MarketSnapshot.__table__,
