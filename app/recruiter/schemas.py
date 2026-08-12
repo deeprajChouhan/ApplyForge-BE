@@ -151,6 +151,59 @@ class AgencyOverviewOut(BaseModel):
     seat_limit: int | None
     seats_used: int
     features: list[str]
+    # Branding for the CV/spec-sheet export (Phase 1 feature 2).
+    logo_url: str | None = None
+    primary_color: str | None = None
+    footer_text: str | None = None
+    spec_sheet_template_id: int | None = None
+
+
+class AgencyBrandingUpdate(BaseModel):
+    """Owner-scoped update for the agency's export branding.
+
+    Any field left unset keeps its current value; setting a field to an empty
+    string clears it (so the agency can remove a logo, for example). The
+    default spec-sheet template is set separately by omitting or passing an
+    integer; pass 0 or null explicitly to clear.
+    """
+    logo_url: str | None = None
+    primary_color: str | None = None
+    footer_text: str | None = None
+    spec_sheet_template_id: int | None = None
+
+
+# ── Spec-sheet templates (Phase 1 feature 2) ──────────────────────────────
+class SpecSheetTemplateCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    logo_url: str | None = None
+    primary_color: str | None = None
+    header_text: str | None = None
+    footer_text: str | None = None
+    body_intro: str | None = None
+    anonymise_by_default: bool = False
+
+
+class SpecSheetTemplateUpdate(BaseModel):
+    """PATCH — any omitted field is left as-is."""
+    name: str | None = Field(default=None, max_length=200)
+    logo_url: str | None = None
+    primary_color: str | None = None
+    header_text: str | None = None
+    footer_text: str | None = None
+    body_intro: str | None = None
+    anonymise_by_default: bool | None = None
+
+
+class SpecSheetTemplateOut(ORMModel):
+    id: int
+    agency_id: int
+    name: str
+    logo_url: str | None = None
+    primary_color: str | None = None
+    header_text: str | None = None
+    footer_text: str | None = None
+    body_intro: str | None = None
+    anonymise_by_default: bool = False
 
 
 class TeamMemberCreate(BaseModel):
@@ -484,6 +537,46 @@ class IngestResultItem(BaseModel):
 class IngestResult(BaseModel):
     ingested: int
     candidates: list[IngestResultItem]
+
+
+# ── LinkedIn capture (Chrome extension → pool) ────────────────────────────
+class LinkedInCaptureExperience(BaseModel):
+    title: str | None = None
+    company: str | None = None
+    # Loose date strings — LinkedIn typically exposes "YYYY-MM"; the service
+    # coerces "YYYY", "YYYY-MM", or "YYYY-MM-DD".
+    start_date: str | None = None
+    end_date: str | None = None
+    description: str | None = None
+
+
+class LinkedInCaptureRequest(BaseModel):
+    """Payload posted by the recruiter Chrome extension after scraping a
+    public linkedin.com/in/<slug> page. All fields except linkedin_url are
+    best-effort — real profiles vary widely and the scraper degrades gracefully."""
+    linkedin_url: str
+    full_name: str | None = None
+    headline: str | None = None
+    location: str | None = None
+    about: str | None = None
+    email: str | None = None
+    phone: str | None = None
+    skills: list[str] = Field(default_factory=list)
+    experiences: list[LinkedInCaptureExperience] = Field(default_factory=list)
+    # Optional: attach the captured candidate to this role's pipeline at
+    # stage=sourced. Idempotent — the same (role, candidate) pair is not
+    # duplicated on re-capture.
+    role_id: int | None = None
+
+
+class LinkedInCaptureResult(BaseModel):
+    candidate_id: int
+    full_name: str | None
+    email: str | None
+    linkedin_url: str
+    skill_count: int
+    created: bool                 # True on first capture; False on dedup/refresh
+    application_id: int | None = None
 
 
 # ── Placement (candidate → roles) ─────────────────────────────────────────

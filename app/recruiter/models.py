@@ -80,6 +80,20 @@ class Agency(Base, RecTimestampMixin):
     )
     trial_ends_at: Mapped[datetime | None] = mapped_column(DateTime)
 
+    # Branding — applied to exported CV/spec-sheet documents (Phase 1 feature 2).
+    # logo_url: URL of an agency-hosted PNG/JPG (we embed it in exports; the
+    #   agency uploads/hosts it themselves rather than us running an asset store).
+    # primary_color: hex like "#0f766e" — used for headings + accent bars.
+    # footer_text: one-line legal/contact footer printed on every export.
+    # spec_sheet_template_id: default SpecSheetTemplate for this agency, if any;
+    #   the export endpoint falls back to agency defaults when no template is set.
+    logo_url: Mapped[str | None] = mapped_column(String(500))
+    primary_color: Mapped[str | None] = mapped_column(String(9))
+    footer_text: Mapped[str | None] = mapped_column(String(500))
+    spec_sheet_template_id: Mapped[int | None] = mapped_column(
+        ForeignKey("rec_spec_sheet_templates.id", ondelete="SET NULL"), index=True
+    )
+
     recruiters: Mapped[list["Recruiter"]] = relationship(
         back_populates="agency", cascade="all, delete-orphan"
     )
@@ -201,6 +215,11 @@ class CandidateProfile(Base, RecTimestampMixin):
     location: Mapped[str | None] = mapped_column(String(200))
     years_experience: Mapped[float | None] = mapped_column(Float)
     summary: Mapped[str | None] = mapped_column(Text)
+
+    # Canonical public URL of the source profile (linkedin.com/in/<slug>).
+    # Set for source=linkedin captures; used as the per-agency dedup key so the
+    # same profile clicked twice updates in place rather than creating a duplicate.
+    linkedin_url: Mapped[str | None] = mapped_column(String(500), index=True)
 
     raw_cv_text: Mapped[str | None] = mapped_column(Text)
     source_file: Mapped[str | None] = mapped_column(String(500))
@@ -462,6 +481,41 @@ class MarketSnapshot(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
+class SpecSheetTemplate(Base, RecTimestampMixin):
+    """
+    Agency-owned CV / spec-sheet export template (Phase 1 feature 2).
+
+    A template layers on top of the agency's default branding — any of the
+    override fields left NULL falls back to the agency values (or to the
+    renderer defaults if the agency hasn't set them either). This lets a
+    single agency have, say, one "internal shortlist" template and one
+    "client-safe anonymised" template without maintaining full duplicates.
+    """
+    __tablename__ = "rec_spec_sheet_templates"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    agency_id: Mapped[int] = mapped_column(
+        ForeignKey("rec_agencies.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+
+    # Branding overrides — NULL means "inherit from agency defaults".
+    logo_url: Mapped[str | None] = mapped_column(String(500))
+    primary_color: Mapped[str | None] = mapped_column(String(9))
+    header_text: Mapped[str | None] = mapped_column(String(300))
+    footer_text: Mapped[str | None] = mapped_column(String(500))
+    # Free-form intro paragraph rendered above the candidate's summary
+    # (e.g. "Prepared for {client_name} — {agency} candidate submission").
+    body_intro: Mapped[str | None] = mapped_column(Text)
+
+    # If true, the template defaults `anonymise` to true on the export
+    # endpoint when the caller doesn't pass a value. A convenience for
+    # agencies that maintain a dedicated "anonymised" template.
+    anonymise_by_default: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="0", nullable=False
+    )
+
+
 # All recruiter tables — used to create just these on startup without touching
 # the consumer schema.
 RECRUITER_TABLES = [
@@ -481,4 +535,5 @@ RECRUITER_TABLES = [
     UsageEvent.__table__,
     AgencyInvite.__table__,
     MarketSnapshot.__table__,
+    SpecSheetTemplate.__table__,
 ]

@@ -41,6 +41,8 @@ app/recruiter/
     matching.py        inverted matching — score a candidate against a role
     shortlist.py       persist a ranked matching run
     ingestion.py       bulk-CV → CandidateProfile
+    linkedin_capture.py  LinkedIn /in/* scrape → CandidateProfile (dedup on linkedin_url)
+    spec_sheet.py      CandidateProfile → agency-branded CV/spec-sheet (PDF + DOCX; anonymisation)
     listing.py         grounded job-listing generation
     market.py          demand/supply, salary, funnel, time-to-fill
     placement.py       candidate → best-fit open roles
@@ -65,11 +67,12 @@ app/api/v1/routes/provisioning.py      the single additive /provisioning endpoin
 | Recruiter | `rec_recruiters` | a seat **with its own login** (password_hash, is_active) |
 | Client | `rec_clients` | a hiring company the agency serves |
 | Role | `rec_roles` | open position; required/preferred skills, cached embedding |
-| CandidateProfile | `rec_candidate_profiles` | agency-owned CRM record, no login; `provisioned_user_id` once converted |
+| CandidateProfile | `rec_candidate_profiles` | agency-owned CRM record, no login; `provisioned_user_id` once converted. Sourced from bulk CV upload OR the recruiter Chrome extension (`source=linkedin`, deduped per agency on `linkedin_url`) |
 | CandidateSkill | `rec_candidate_skills` | normalised skill tokens |
 | CandidateExperience | `rec_work_experiences` | class renamed to avoid clashing with the consumer `WorkExperience` on the shared Base |
 | Shortlist / Entry | `rec_shortlists` / `rec_shortlist_entries` | a saved matching run + ranked entries |
 | Application | `rec_applications` | tracking-only pipeline record (stage) |
+| SpecSheetTemplate | `rec_spec_sheet_templates` | agency-owned CV/spec-sheet template with per-template branding overrides + `anonymise_by_default` toggle; referenced from `rec_agencies.spec_sheet_template_id` (SET NULL on delete) |
 
 Class names are unique across the shared declarative Base (e.g. the recruiter
 "work experience" is `CandidateExperience`) so relationship string resolution is
@@ -136,8 +139,18 @@ All optional — the module runs with defaults:
 - `agencies/{id}/clients` (GET, POST, GET one), `.../{cid}/next-hire`
 - `agencies/{id}/roles` (GET, POST, GET one), `.../{rid}/listing`,
   `.../{rid}/shortlist` (POST, latest)
-- `agencies/{id}/candidates` (GET, GET one), `.../ingest`, `.../{cid}/convert`,
-  `.../{cid}/role-matches`
+- `agencies/{id}/candidates` (GET, GET one), `.../ingest`,
+  `.../capture-linkedin` (Chrome-extension one-click capture; dedups on
+  canonical `linkedin_url` per agency; optional `role_id` attaches at
+  `ApplicationStage.sourced`), `.../{cid}/spec-sheet.pdf` +
+  `.../{cid}/spec-sheet.docx` (agency-branded CV export; `?anonymise=true`
+  strips identity, `?role_id=` adds a fit-panel, `?template_id=` overrides
+  the agency's default template; meters as `spec_sheet_exported`),
+  `.../{cid}/convert`, `.../{cid}/role-matches`
+- `agency/branding` (PATCH; owner-scoped update of `logo_url` /
+  `primary_color` / `footer_text` / `spec_sheet_template_id`)
+- `agency/spec-sheet-templates` (owner-scoped CRUD: GET list, POST create,
+  PATCH one, DELETE one)
 - `agencies/{id}/applications` (GET, POST, PATCH stage)
 - `agencies/{id}/market`
 
@@ -151,6 +164,18 @@ migrations; in production, migrations are the source of truth.
 ## Tests
 
 `tests/test_recruiter_platform.py` is a pytest suite (SQLite + mock providers)
-covering auth/isolation, ingestion + matching, listing, market, placement,
-advisory, tracking, and the provisioning bridge. `tests/recruiter_smoke.py` is
-the equivalent runnable script.
+covering auth/isolation, ingestion + matching, LinkedIn capture (create /
+dedup on recapture / URL validation / tenant isolation / role attach),
+spec-sheet export (PDF via reportlab + text-extraction via pypdf, DOCX
+via python-docx, anonymisation, role-fit panel, tenant isolation, template
+CRUD + override), listing, market, placement, advisory, tracking, and the
+provisioning bridge. `tests/recruiter_smoke.py` is the equivalent runnable script.
+
+## Companion Chrome extension
+
+The `extension-recruiter/` folder at the repo root is a Manifest V3 Chrome
+extension for the LinkedIn capture flow. It is separate from `extension/`,
+which is the shipped consumer-side job-clipper. The recruiter extension
+authenticates against `/api/v1/recruiter/auth/login`, keeps tokens in
+`chrome.storage.local`, and POSTs scraped `/in/*` payloads to the
+`capture-linkedin` endpoint above. See `extension-recruiter/README.md`.

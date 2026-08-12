@@ -18,8 +18,9 @@ from app.db.session import get_db
 from app.recruiter.api.admin_routes import _recruiter_out, effective_seat_limit
 from app.recruiter.api.deps import require_owner
 from app.recruiter.enums import PLAN_FEATURES, InviteStatus, RecruiterSeatRole
-from app.recruiter.models import Agency, AgencyInvite, Recruiter
+from app.recruiter.models import Agency, AgencyInvite, Recruiter, SpecSheetTemplate
 from app.recruiter.schemas import (
+    AgencyBrandingUpdate,
     AgencyOverviewOut,
     BillingCheckoutRequest,
     BillingUrlOut,
@@ -27,6 +28,9 @@ from app.recruiter.schemas import (
     InviteOut,
     RecruiterAdminOut,
     RecruiterPasswordReset,
+    SpecSheetTemplateCreate,
+    SpecSheetTemplateOut,
+    SpecSheetTemplateUpdate,
     TeamMemberCreate,
     TeamMemberUpdate,
     UsageSummaryOut,
@@ -67,7 +71,127 @@ def overview(owner: Recruiter = Depends(require_owner), db: Session = Depends(ge
         seat_limit=effective_seat_limit(agency),
         seats_used=seats_used,
         features=sorted(PLAN_FEATURES.get(agency.plan, set())),
+        logo_url=agency.logo_url,
+        primary_color=agency.primary_color,
+        footer_text=agency.footer_text,
+        spec_sheet_template_id=agency.spec_sheet_template_id,
     )
+
+
+# ── Branding (Phase 1 feature 2) ──────────────────────────────────────────
+@router.patch("/branding", response_model=AgencyOverviewOut)
+def update_branding(
+    payload: AgencyBrandingUpdate,
+    owner: Recruiter = Depends(require_owner),
+    db: Session = Depends(get_db),
+):
+    """
+    Owner-scoped update of the export branding used by the CV/spec-sheet
+    exporter. Fields left unset in the payload are unchanged; passing an
+    explicit empty string clears a field. Passing spec_sheet_template_id=0
+    clears the default template.
+    """
+    agency = _agency(db, owner)
+    data = payload.model_dump(exclude_unset=True)
+
+    if "logo_url" in data:
+        agency.logo_url = (data["logo_url"] or None) if data["logo_url"] != "" else None
+    if "primary_color" in data:
+        agency.primary_color = data["primary_color"] or None
+    if "footer_text" in data:
+        agency.footer_text = data["footer_text"] or None
+    if "spec_sheet_template_id" in data:
+        tid = data["spec_sheet_template_id"]
+        if tid in (None, 0):
+            agency.spec_sheet_template_id = None
+        else:
+            tmpl = db.get(SpecSheetTemplate, tid)
+            if tmpl is None or tmpl.agency_id != agency.id:
+                raise HTTPException(status_code=404, detail="Spec-sheet template not found for this agency")
+            agency.spec_sheet_template_id = tid
+
+    db.commit()
+    db.refresh(agency)
+    return overview(owner=owner, db=db)
+
+
+# ── Spec-sheet templates (Phase 1 feature 2) ──────────────────────────────
+@router.get("/spec-sheet-templates", response_model=list[SpecSheetTemplateOut])
+def list_spec_sheet_templates(
+    owner: Recruiter = Depends(require_owner),
+    db: Session = Depends(get_db),
+):
+    return (
+        db.query(SpecSheetTemplate)
+        .filter(SpecSheetTemplate.agency_id == owner.agency_id)
+        .order_by(SpecSheetTemplate.id.desc())
+        .all()
+    )
+
+
+@router.post(
+    "/spec-sheet-templates",
+    response_model=SpecSheetTemplateOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_spec_sheet_template(
+    payload: SpecSheetTemplateCreate,
+    owner: Recruiter = Depends(require_owner),
+    db: Session = Depends(get_db),
+):
+    tmpl = SpecSheetTemplate(
+        agency_id=owner.agency_id,
+        name=payload.name,
+        logo_url=payload.logo_url,
+        primary_color=payload.primary_color,
+        header_text=payload.header_text,
+        footer_text=payload.footer_text,
+        body_intro=payload.body_intro,
+        anonymise_by_default=payload.anonymise_by_default,
+    )
+    db.add(tmpl)
+    db.commit()
+    db.refresh(tmpl)
+    return tmpl
+
+
+def _load_template(db: Session, owner: Recruiter, template_id: int) -> SpecSheetTemplate:
+    tmpl = db.get(SpecSheetTemplate, template_id)
+    if tmpl is None or tmpl.agency_id != owner.agency_id:
+        raise HTTPException(status_code=404, detail="Spec-sheet template not found")
+    return tmpl
+
+
+@router.patch("/spec-sheet-templates/{template_id}", response_model=SpecSheetTemplateOut)
+def update_spec_sheet_template(
+    template_id: int,
+    payload: SpecSheetTemplateUpdate,
+    owner: Recruiter = Depends(require_owner),
+    db: Session = Depends(get_db),
+):
+    tmpl = _load_template(db, owner, template_id)
+    for field_name, value in payload.model_dump(exclude_unset=True).items():
+        setattr(tmpl, field_name, value)
+    db.commit()
+    db.refresh(tmpl)
+    return tmpl
+
+
+@router.delete("/spec-sheet-templates/{template_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_spec_sheet_template(
+    template_id: int,
+    owner: Recruiter = Depends(require_owner),
+    db: Session = Depends(get_db),
+):
+    tmpl = _load_template(db, owner, template_id)
+    # Clear the agency's default reference if it pointed here (FK ondelete
+    # SET NULL handles this at the DB level too, but do it in Python so
+    # the response reflects immediately).
+    agency = _agency(db, owner)
+    if agency.spec_sheet_template_id == tmpl.id:
+        agency.spec_sheet_template_id = None
+    db.delete(tmpl)
+    db.commit()
 
 
 @router.post("/billing/checkout", response_model=BillingUrlOut)

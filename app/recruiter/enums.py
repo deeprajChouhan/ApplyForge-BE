@@ -72,6 +72,7 @@ class UsageKind(str, enum.Enum):
     listing_drafted = "listing_drafted"
     role_match_run = "role_match_run"
     advisory_run = "advisory_run"
+    spec_sheet_exported = "spec_sheet_exported"   # branded CV/spec-sheet PDF or DOCX
 
 
 def plan_has_feature(plan: AgencyPlan, feature: str) -> bool:
@@ -94,8 +95,9 @@ class EmploymentType(str, enum.Enum):
 
 
 class CandidateSource(str, enum.Enum):
-    """How a CandidateProfile entered the pool. Phase 1 ships bulk_cv only."""
+    """How a CandidateProfile entered the pool."""
     bulk_cv = "bulk_cv"
+    linkedin = "linkedin"   # captured from linkedin.com/in/* via the recruiter Chrome extension
     manual = "manual"
     ats_sync = "ats_sync"
     referral = "referral"

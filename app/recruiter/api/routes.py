@@ -32,6 +32,7 @@ from app.recruiter.models import (
     RoleShareToken,
     Shortlist,
     ShortlistEntry,
+    SpecSheetTemplate,
 )
 from app.recruiter.schemas import (
     ApplicationCreate,
@@ -56,6 +57,8 @@ from app.recruiter.schemas import (
     IngestResult,
     IngestResultItem,
     JobListingOut,
+    LinkedInCaptureRequest,
+    LinkedInCaptureResult,
     MarketCrawlResult,
     MarketOverviewOut,
     MarketSnapshotOut,
@@ -85,6 +88,7 @@ from app.recruiter.services import usage as usage_service
 from app.recruiter.services.advisory import next_hire_advisory
 from app.recruiter.services.client_analytics import compute_client_analytics
 from app.recruiter.services.ingestion import ingest_batch
+from app.recruiter.services.linkedin_capture import capture_linkedin_profile
 from app.recruiter.services.listing import generate_listing
 from app.recruiter.services.market import compute_market
 from app.recruiter.services.market_crawler import crawl_agency_market, crawl_role_market
@@ -96,6 +100,12 @@ from app.recruiter.services.candidate_chat import ask_about_candidate
 from app.recruiter.services.jd_parse import parse_jd
 from app.recruiter.services.proposal_pdf import render_role_proposal_pdf
 from app.recruiter.services.screening import draft_screening_questions
+from app.recruiter.services.spec_sheet import (
+    build_spec_sheet_docx,
+    build_spec_sheet_pdf,
+    filename_for,
+    resolve_branding,
+)
 from app.recruiter.services.swot import compute_swot
 
 from jose import JWTError, jwt
@@ -505,6 +515,55 @@ async def ingest_cvs(
     )
 
 
+@candidates_router.post(
+    "/capture-linkedin", response_model=LinkedInCaptureResult, status_code=201
+)
+def capture_linkedin(
+    payload: LinkedInCaptureRequest,
+    agency: Agency = Depends(require_unlocked_agency),
+    db: Session = Depends(get_db),
+):
+    """
+    One-click LinkedIn capture from the recruiter Chrome extension.
+
+    Deduplicates on canonical `linkedin_url` within the agency: re-capturing
+    the same profile refreshes the pool copy in place (skills + experiences
+    replaced from the fresh scrape) instead of creating a second row. When
+    `role_id` is set, also attaches the candidate to that role's pipeline at
+    stage `sourced` (idempotent per role).
+    """
+    role: Role | None = None
+    if payload.role_id is not None:
+        role = db.get(Role, payload.role_id)
+        if role is None or role.agency_id != agency.id:
+            raise HTTPException(status_code=404, detail="Role not found for this agency")
+
+    try:
+        result = capture_linkedin_profile(
+            db,
+            agency.id,
+            payload.model_dump(exclude_none=False),
+            role=role,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    # Only meter the first-time capture — re-clicks that dedup shouldn't
+    # double-charge an agency for the same profile.
+    if result.created:
+        usage_service.record(db, agency.id, UsageKind.cv_ingested, 1)
+
+    return LinkedInCaptureResult(
+        candidate_id=result.candidate_id,
+        full_name=result.full_name,
+        email=result.email,
+        linkedin_url=result.linkedin_url,
+        skill_count=result.skill_count,
+        created=result.created,
+        application_id=result.application_id,
+    )
+
+
 @candidates_router.get("", response_model=list[CandidateOut])
 def list_candidates(agency: Agency = Depends(get_agency), db: Session = Depends(get_db)):
     return (
@@ -525,6 +584,102 @@ def get_candidate(
     if cand is None or cand.agency_id != agency.id:
         raise HTTPException(status_code=404, detail="Candidate not found")
     return cand
+
+
+def _load_export_context(
+    db: Session,
+    agency: Agency,
+    candidate_id: int,
+    role_id: int | None,
+    template_id: int | None,
+) -> tuple[CandidateProfile, Role | None, SpecSheetTemplate | None]:
+    """
+    Resolve + tenant-check the candidate, optional role, and optional
+    template used by both export endpoints (.pdf / .docx). Extracted so
+    both endpoints stay tiny and identical in their error surface.
+    """
+    cand = db.get(CandidateProfile, candidate_id)
+    if cand is None or cand.agency_id != agency.id:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+
+    role: Role | None = None
+    if role_id is not None:
+        role = db.get(Role, role_id)
+        if role is None or role.agency_id != agency.id:
+            raise HTTPException(status_code=404, detail="Role not found for this agency")
+
+    template: SpecSheetTemplate | None = None
+    effective_template_id = template_id if template_id is not None else agency.spec_sheet_template_id
+    if effective_template_id:
+        template = db.get(SpecSheetTemplate, effective_template_id)
+        if template is None or template.agency_id != agency.id:
+            raise HTTPException(status_code=404, detail="Spec-sheet template not found for this agency")
+    return cand, role, template
+
+
+def _resolve_anonymise(explicit: bool | None, template: SpecSheetTemplate | None) -> bool:
+    """The `anonymise` query param overrides the template default when set."""
+    if explicit is not None:
+        return explicit
+    if template is not None:
+        return bool(template.anonymise_by_default)
+    return False
+
+
+@candidates_router.get("/{candidate_id}/spec-sheet.pdf")
+def export_spec_sheet_pdf(
+    candidate_id: int,
+    anonymise: bool | None = Query(default=None),
+    role_id: int | None = Query(default=None, ge=1),
+    template_id: int | None = Query(default=None, ge=1),
+    agency: Agency = Depends(require_unlocked_agency),
+    db: Session = Depends(get_db),
+):
+    """
+    Render this candidate as an agency-branded CV / spec-sheet PDF.
+
+    - `anonymise=true` strips name/email/phone/exact companies; the resolved
+      value is (query param) OR (template default) OR false.
+    - `role_id` adds a "Fit against role" panel (matched skills + gaps).
+    - `template_id` overrides the agency's default template.
+    """
+    cand, role, template = _load_export_context(db, agency, candidate_id, role_id, template_id)
+    is_anon = _resolve_anonymise(anonymise, template)
+    branding = resolve_branding(agency, template)
+    pdf_bytes = build_spec_sheet_pdf(cand, agency, anonymise=is_anon, role=role, template=template)
+    usage_service.record(db, agency.id, UsageKind.spec_sheet_exported, 1)
+    fname = filename_for(cand, branding, extension="pdf", anonymise=is_anon)
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
+@candidates_router.get("/{candidate_id}/spec-sheet.docx")
+def export_spec_sheet_docx(
+    candidate_id: int,
+    anonymise: bool | None = Query(default=None),
+    role_id: int | None = Query(default=None, ge=1),
+    template_id: int | None = Query(default=None, ge=1),
+    agency: Agency = Depends(require_unlocked_agency),
+    db: Session = Depends(get_db),
+):
+    """
+    Same content as spec-sheet.pdf, produced as an editable Word document
+    so the recruiter can tweak wording before sending it to the client.
+    """
+    cand, role, template = _load_export_context(db, agency, candidate_id, role_id, template_id)
+    is_anon = _resolve_anonymise(anonymise, template)
+    branding = resolve_branding(agency, template)
+    docx_bytes = build_spec_sheet_docx(cand, agency, anonymise=is_anon, role=role, template=template)
+    usage_service.record(db, agency.id, UsageKind.spec_sheet_exported, 1)
+    fname = filename_for(cand, branding, extension="docx", anonymise=is_anon)
+    return Response(
+        content=docx_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
 
 
 @candidates_router.post("/{candidate_id}/convert", response_model=ConvertResult, status_code=201)
