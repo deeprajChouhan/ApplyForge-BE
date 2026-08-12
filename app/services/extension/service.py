@@ -11,7 +11,7 @@ from app.models.models import UserExtensionState
 
 def frontend_base_url() -> str:
     """Best-effort public web-app origin for building open_url links."""
-    for origin in settings.cors_origin_list():
+    for origin in settings.cors_origin_list:
         if origin.startswith("https://"):
             return origin.rstrip("/")
     return "https://applyforge.pro"
