@@ -14,7 +14,7 @@ def frontend_base_url() -> str:
     for origin in settings.cors_origin_list:
         if origin.startswith("https://"):
             return origin.rstrip("/")
-    return "https://applyforge.pro"
+    return "https://applyforge.co.uk"
 
 
 def score_confidence(description: str, source_site: str = "") -> str:

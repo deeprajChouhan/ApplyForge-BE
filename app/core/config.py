@@ -75,16 +75,16 @@ class Settings(BaseSettings):
     stripe_price_pro_seat: str | None = None
     stripe_price_enterprise_flat: str | None = None
     stripe_price_enterprise_seat: str | None = None
-    billing_success_url: str = "https://recruiter.applyforge.pro/team?billing=success"
-    billing_cancel_url: str = "https://recruiter.applyforge.pro/team?billing=cancel"
-    billing_portal_return_url: str = "https://recruiter.applyforge.pro/team"
+    billing_success_url: str = "https://recruiter.applyforge.co.uk/team?billing=success"
+    billing_cancel_url: str = "https://recruiter.applyforge.co.uk/team?billing=cancel"
+    billing_portal_return_url: str = "https://recruiter.applyforge.co.uk/team"
 
     # ── Self-serve onboarding (Phase 5.5) ──
     # When False (default) signups create a *pending* agency the operator must
     # approve before its owner can log in. Set True for fully open self-serve.
     recruiter_signup_open: bool = False
     # Public base URL of the recruiter app — used to build invite/claim links.
-    recruiter_app_url: str = "https://recruiter.applyforge.pro"
+    recruiter_app_url: str = "https://recruiter.applyforge.co.uk"
 
     model_config = SettingsConfigDict(env_file=str(_ENV_FILE), extra="ignore")
 

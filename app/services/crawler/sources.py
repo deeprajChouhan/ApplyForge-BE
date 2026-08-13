@@ -25,7 +25,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 _HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; ApplyForge-Crawler/1.0; +https://applyforge.pro)",
+    "User-Agent": "Mozilla/5.0 (compatible; ApplyForge-Crawler/1.0; +https://applyforge.co.uk)",
     "Accept": "application/json, text/html, */*",
 }
 

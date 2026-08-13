@@ -14,11 +14,12 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origin_list,
     # Allow any Chrome/Firefox extension origin (IDs change per install), plus any
-    # applyforge.pro subdomain (recruiter, admin, etc.) so new frontends don't need
+    # applyforge.pro/applyforge.co.uk subdomain (recruiter, admin, etc.) so new frontends don't need
     # a CORS_ORIGINS change. The JWT still enforces auth on every actual request.
     allow_origin_regex=(
         r"chrome-extension://.*|moz-extension://.*|"
-        r"https://([a-z0-9-]+\.)*applyforge\.pro"
+        r"https://([a-z0-9-]+\.)*applyforge\.pro|"
+        r"https://([a-z0-9-]+\.)*applyforge\.co\.uk"
     ),
     allow_credentials=True,
     allow_methods=["*"],

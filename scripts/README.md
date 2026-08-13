@@ -56,7 +56,7 @@ Notes:
 - Candidates/roles are embedded with whatever AI provider is configured. With an
   OpenAI key set, matching is fully semantic; without one, a deterministic
   offline fallback still ranks sensibly.
-- After seeding, log in at `recruiter.applyforge.pro` as `owner@northwind.demo`.
+- After seeding, log in at `recruiter.applyforge.co.uk` as `owner@northwind.demo`.
 - Cleanup when done: `--reset` removes the tenant, or suspend it from the admin
   console (Agencies → Suspend).
 

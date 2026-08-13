@@ -187,7 +187,7 @@ class JobFeedService:
                 country=country,
                 work_type=wt,
                 source="demo",
-                source_url="https://applyforge.pro/jobs/demo",
+                source_url="https://applyforge.co.uk/jobs/demo",
                 description=description,
                 posted_at=None,
                 match_score=score,
