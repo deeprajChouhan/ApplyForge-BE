@@ -10,6 +10,10 @@ from app.api.v1.routes import analytics
 from app.api.v1.routes import support
 from app.api.v1.routes import extension
 from app.api.v1.routes import provisioning
+from app.api.v1.routes import answers
+from app.api.v1.routes import kits
+from app.api.v1.routes import auto_apply
+from app.api.v1.routes import application_actions
 from app.recruiter.api.router import recruiter_router
 
 api_router = APIRouter()
@@ -32,4 +36,8 @@ api_router.include_router(analytics.router)
 api_router.include_router(support.router)
 api_router.include_router(extension.router)
 api_router.include_router(provisioning.router)
+api_router.include_router(answers.router)
+api_router.include_router(kits.router)
+api_router.include_router(auto_apply.router)
+api_router.include_router(application_actions.router)
 api_router.include_router(recruiter_router)

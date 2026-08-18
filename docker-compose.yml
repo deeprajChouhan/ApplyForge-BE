@@ -9,8 +9,71 @@ services:
         condition: service_completed_successfully
       seaweedfs-init:
         condition: service_completed_successfully
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     volumes:
       - ./storage:/app/storage
+    networks:
+      - default
+      - dokploy-network
+
+  # ── Local MySQL for development (prod uses managed Dokploy DB) ──────────────
+  mysql:
+    image: mysql:8
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: applyforge
+      MYSQL_USER: applyforge
+      MYSQL_PASSWORD: applyforge
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # ── Redis: Celery broker + result backend ───────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── Celery worker: ATS pollers + auto-apply orchestrator ────────────────────
+  worker:
+    build: .
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+    command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=4
+    volumes:
+      - ./storage:/app/storage
+    networks:
+      - default
+      - dokploy-network
+
+  # ── Celery beat: schedules the pollers ──────────────────────────────────────
+  beat:
+    build: .
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: celery -A app.workers.celery_app beat --loglevel=info
     networks:
       - default
       - dokploy-network
@@ -68,6 +131,8 @@ services:
 volumes:
   qdrant_data:
   seaweed_data:
+  mysql_data:
+  redis_data:
 
 networks:
   dokploy-network:

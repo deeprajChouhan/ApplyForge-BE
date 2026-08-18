@@ -1,0 +1,23 @@
+Apply manually: add the following to the `[tool.poetry.dependencies]` table
+(or the equivalent `[project.dependencies]` array if the project uses
+PEP 621 / a non-Poetry backend) in backend/pyproject.toml.
+
+--- a/backend/pyproject.toml
++++ b/backend/pyproject.toml
+@@ -1,6 +1,10 @@
+ [tool.poetry.dependencies]
+ python = "^3.10"
+ fastapi = "*"
+ uvicorn = "*"
++celery = {extras = ["redis"], version = ">=5.3"}
++redis = ">=5.0"
++aiolimiter = ">=1.1"
++httpx = ">=0.27"
+
+If this project instead uses PEP 621-style [project] dependencies, add
+these lines to the `dependencies = [...]` array instead:
+
++    "celery[redis]>=5.3",
++    "redis>=5.0",
++    "aiolimiter>=1.1",
++    "httpx>=0.27",

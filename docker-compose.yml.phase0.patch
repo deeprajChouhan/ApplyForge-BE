@@ -1,0 +1,49 @@
+Apply manually: add the following services to backend/docker-compose.yml,
+alongside the existing `app`/`db` services. Adjust the `env_file` path and
+Dockerfile `context`/`dockerfile` to match the existing `app` service if
+they differ.
+
+--- a/backend/docker-compose.yml
++++ b/backend/docker-compose.yml
+@@ services:
++  redis:
++    image: redis:7-alpine
++    restart: unless-stopped
++    ports:
++      - "6379:6379"
++    healthcheck:
++      test: ["CMD", "redis-cli", "ping"]
++      interval: 10s
++      timeout: 5s
++      retries: 5
++    volumes:
++      - redis-data:/data
++
++  worker:
++    build:
++      context: .
++      dockerfile: Dockerfile
++    command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=4
++    restart: unless-stopped
++    depends_on:
++      redis:
++        condition: service_healthy
++      db:
++        condition: service_started
++    env_file:
++      - .env
++
++  beat:
++    build:
++      context: .
++      dockerfile: Dockerfile
++    command: celery -A app.workers.celery_app beat --loglevel=info
++    restart: unless-stopped
++    depends_on:
++      redis:
++        condition: service_healthy
++    env_file:
++      - .env
++
++volumes:
++  redis-data:
