@@ -66,13 +66,15 @@ services:
       - dokploy-network
 
   # ── Celery beat: schedules the pollers ──────────────────────────────────────
+  # --schedule points at /tmp because the app runtime user can't write to /app
+  # (which is where beat defaults its persistent dbm schedule file).
   beat:
     build: .
     env_file: .env
     depends_on:
       redis:
         condition: service_healthy
-    command: celery -A app.workers.celery_app beat --loglevel=info
+    command: celery -A app.workers.celery_app beat --loglevel=info --schedule=/tmp/celerybeat-schedule
     networks:
       - default
       - dokploy-network
