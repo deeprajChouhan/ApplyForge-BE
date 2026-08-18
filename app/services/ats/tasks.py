@@ -21,7 +21,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.core.celery_app import celery_app  # TODO(phase2): verify import path.
+from app.workers.celery_app import celery_app
 from app.db.session import SessionLocal
 from app.models.company import Company  # TODO(phase2): verify model location/fields.
 from app.models.job import Job  # TODO(phase2): verify model location/fields.
