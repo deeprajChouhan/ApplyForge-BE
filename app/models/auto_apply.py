@@ -41,6 +41,11 @@ class AutoApplySettings(Base, TimestampMixin):
     default_kit_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     fully_automatic: Mapped[bool] = mapped_column(Boolean, default=False)
     paused_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # Migration 0004_auto_apply_extra_fields — all nullable, no data migration.
+    willing_to_relocate: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    min_salary: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    salary_currency: Mapped[Optional[str]] = mapped_column(String(3), nullable=True)
+    default_resume_parse_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
 
 class ApplicationEvent(Base):

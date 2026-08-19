@@ -32,6 +32,10 @@ class AutoApplySettingsOut(BaseModel):
     default_kit_id: Optional[int] = None
     fully_automatic: bool
     paused_at: Optional[datetime] = None
+    willing_to_relocate: Optional[bool] = None
+    min_salary: Optional[int] = None
+    salary_currency: Optional[str] = None
+    default_resume_parse_id: Optional[int] = None
     created_at: datetime
     updated_at: datetime
 
@@ -51,6 +55,10 @@ class AutoApplySettingsUpdate(BaseModel):
     default_kit_id: Optional[int] = None
     fully_automatic: Optional[bool] = None
     paused_at: Optional[datetime] = None
+    willing_to_relocate: Optional[bool] = None
+    min_salary: Optional[int] = None
+    salary_currency: Optional[str] = None
+    default_resume_parse_id: Optional[int] = None
 
 
 class AutoApplyQueueItem(BaseModel):
