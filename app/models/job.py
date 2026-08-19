@@ -60,7 +60,15 @@ class Job(Base):
     location: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     remote_mode: Mapped[RemoteMode] = mapped_column(
-        SAEnum(RemoteMode, name="job_remote_mode"),
+        SAEnum(
+            RemoteMode,
+            name="job_remote_mode",
+            # Store lowercase values (matches the MySQL ENUM created by the
+            # 0001_auto_apply_core migration). Without values_callable,
+            # SQLAlchemy stores enum NAMES (UNKNOWN) and cannot read back
+            # rows that providers wrote as lowercase.
+            values_callable=lambda x: [e.value for e in x],
+        ),
         nullable=False,
         default=RemoteMode.UNKNOWN,
         server_default=RemoteMode.UNKNOWN.value,
@@ -79,7 +87,11 @@ class Job(Base):
     apply_url: Mapped[str] = mapped_column(String(2048), nullable=False)
 
     submit_method: Mapped[SubmitMethod] = mapped_column(
-        SAEnum(SubmitMethod, name="job_submit_method"),
+        SAEnum(
+            SubmitMethod,
+            name="job_submit_method",
+            values_callable=lambda x: [e.value for e in x],
+        ),
         nullable=False,
         default=SubmitMethod.MANUAL,
         server_default=SubmitMethod.MANUAL.value,
