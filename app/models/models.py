@@ -198,6 +198,15 @@ class JobApplication(Base, TimestampMixin):
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
     deleted_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     delete_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # Auto-apply columns (Phase 3 — migration 0003_auto_apply_engine adds them).
+    # All nullable so pre-existing rows remain valid.
+    auto_apply_stage: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    match_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    match_reasons_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    submit_method: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    submission_evidence_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    job_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
 
 
 class GeneratedDocument(Base, TimestampMixin):
