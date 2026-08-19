@@ -68,7 +68,7 @@ class AutoApplyQueueItem(BaseModel):
     company_name: Optional[str] = None
     role_title: Optional[str] = None
     match_score: Optional[int] = None
-    match_reasons: Optional[list[str]] = None
+    match_reasons: Optional[list[dict[str, Any]]] = None
     auto_apply_stage: Optional[AutoApplyStage] = None
     updated_at: Optional[datetime] = None
     apply_url: Optional[str] = None
