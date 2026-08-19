@@ -81,7 +81,7 @@ def tick_user(user_id: int) -> Dict[str, Any]:
             daily_cap = getattr(settings, "daily_cap", 0) or 0
             if today_count >= daily_cap:
                 run.finished_at = datetime.utcnow()
-                _set_run_counters(run, jobs_scanned=0, jobs_queued=0, jobs_skipped=0)
+                _set_run_counters(run, jobs_considered=0, jobs_queued=0, jobs_skipped=0)
                 db.add(run)
                 db.commit()
                 return {
@@ -109,13 +109,13 @@ def tick_user(user_id: int) -> Dict[str, Any]:
             min_match_score = getattr(settings, "min_match_score", 60) or 60
             remaining_slots = max(0, daily_cap - today_count)
 
-            jobs_scanned = 0
+            jobs_considered = 0
             jobs_queued = 0
             jobs_skipped = 0
             newly_queued_ids: List[int] = []
 
             for job in candidates:
-                jobs_scanned += 1
+                jobs_considered += 1
                 if jobs_queued >= remaining_slots:
                     jobs_skipped += 1
                     continue
@@ -152,7 +152,7 @@ def tick_user(user_id: int) -> Dict[str, Any]:
             run.finished_at = datetime.utcnow()
             _set_run_counters(
                 run,
-                jobs_scanned=jobs_scanned,
+                jobs_considered=jobs_considered,
                 jobs_queued=jobs_queued,
                 jobs_skipped=jobs_skipped,
             )
@@ -165,7 +165,7 @@ def tick_user(user_id: int) -> Dict[str, Any]:
 
             return {
                 "user_id": user_id,
-                "jobs_scanned": jobs_scanned,
+                "jobs_considered": jobs_considered,
                 "jobs_queued": jobs_queued,
                 "jobs_skipped": jobs_skipped,
             }
@@ -174,10 +174,10 @@ def tick_user(user_id: int) -> Dict[str, Any]:
         return {"error": str(exc), "user_id": user_id}
 
 
-def _set_run_counters(run: AutoApplyRun, jobs_scanned: int, jobs_queued: int, jobs_skipped: int) -> None:
+def _set_run_counters(run: AutoApplyRun, jobs_considered: int, jobs_queued: int, jobs_skipped: int) -> None:
     """Populate counters on an AutoApplyRun, tolerant of the actual column names."""
     for attr, value in (
-        ("jobs_scanned", jobs_scanned),
+        ("jobs_considered", jobs_considered),
         ("jobs_queued", jobs_queued),
         ("jobs_skipped", jobs_skipped),
     ):
