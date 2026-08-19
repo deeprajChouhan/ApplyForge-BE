@@ -194,7 +194,26 @@ def get_queue(
     )
     counts: Dict[str, int] = {stage_name: count for stage_name, count in counts_rows}
 
-    items = [AutoApplyQueueItem.model_validate(row) for row in rows]
+    # Build items explicitly — the ORM field is `id` but the API contract
+    # exposes it as `application_id`, so a bare model_validate would fail.
+    items = [
+        AutoApplyQueueItem(
+            application_id=row.id,
+            company_name=row.company_name,
+            role_title=row.role_title,
+            match_score=row.match_score,
+            match_reasons=(
+                row.match_reasons_json
+                if isinstance(row.match_reasons_json, list)
+                else None
+            ),
+            auto_apply_stage=row.auto_apply_stage,
+            updated_at=row.updated_at,
+            apply_url=None,  # TODO: join to jobs table to surface job.apply_url
+            job_id=row.job_id,
+        )
+        for row in rows
+    ]
 
     return AutoApplyQueueOut(items=items, next_cursor=next_cursor, counts=counts)
 

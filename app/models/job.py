@@ -16,7 +16,6 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
-from sqlalchemy import Enum as SAEnum
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -59,19 +58,12 @@ class Job(Base):
     title: Mapped[str] = mapped_column(String(512), nullable=False)
     location: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
-    remote_mode: Mapped[RemoteMode] = mapped_column(
-        SAEnum(
-            RemoteMode,
-            name="job_remote_mode",
-            # Store lowercase values (matches the MySQL ENUM created by the
-            # 0001_auto_apply_core migration). Without values_callable,
-            # SQLAlchemy stores enum NAMES (UNKNOWN) and cannot read back
-            # rows that providers wrote as lowercase.
-            values_callable=lambda x: [e.value for e in x],
-        ),
-        nullable=False,
-        default=RemoteMode.UNKNOWN,
-        server_default=RemoteMode.UNKNOWN.value,
+    # NOTE: the underlying MySQL column is ENUM('onsite','hybrid','remote','unknown')
+    # from migration 0001_auto_apply_core. We read/write via plain String(32)
+    # to bypass SQLAlchemy's enum name/value mapping brittleness. MySQL
+    # continues to validate the column values against the ENUM at write time.
+    remote_mode: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="unknown", server_default="unknown"
     )
 
     employment_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -86,15 +78,8 @@ class Job(Base):
 
     apply_url: Mapped[str] = mapped_column(String(2048), nullable=False)
 
-    submit_method: Mapped[SubmitMethod] = mapped_column(
-        SAEnum(
-            SubmitMethod,
-            name="job_submit_method",
-            values_callable=lambda x: [e.value for e in x],
-        ),
-        nullable=False,
-        default=SubmitMethod.MANUAL,
-        server_default=SubmitMethod.MANUAL.value,
+    submit_method: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="manual", server_default="manual"
     )
 
     jd_analysis_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
