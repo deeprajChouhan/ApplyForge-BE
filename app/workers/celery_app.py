@@ -27,6 +27,16 @@ celery_app.autodiscover_tasks(
     ]
 )
 
+# `autodiscover_tasks(packages=[...])` only picks up `<package>/tasks.py`
+# submodules. Our @shared_task decorators also live in orchestrator.py and
+# dispatcher.py, so import them explicitly here to force task registration
+# on worker boot. Without this, beat sends tasks and the worker raises
+# `KeyError: 'app.services.auto_apply.orchestrator.tick_all'` and drops them.
+import app.services.ats.tasks  # noqa: E402,F401
+import app.services.auto_apply.orchestrator  # noqa: E402,F401
+import app.services.auto_apply.dispatcher  # noqa: E402,F401
+import app.workers.tasks  # noqa: E402,F401
+
 celery_app.conf.update(
     task_serializer="json",
     accept_content=["json"],
