@@ -201,7 +201,7 @@ async def _poll(provider_name: str) -> dict[str, int]:
     }
 
 
-@celery_app.task(name="ats.poll_provider")
+@celery_app.task(name="app.services.ats.tasks.poll_provider")
 def poll_provider(provider_name: str) -> dict[str, int]:
     """Poll a single ATS provider: upsert its companies + jobs, and mark
     long-unseen jobs for those companies as inactive.
