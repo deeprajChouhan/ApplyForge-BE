@@ -35,7 +35,9 @@ def score_job_for_user(user: Any, job: Any, settings: Any) -> Dict[str, Any]:
         }
     """
     reasons: List[Dict[str, Any]] = []
-    score = 50
+    # Start LOW so a job that matches nothing scores ~20 (weak) instead of 50.
+    # A job that matches at least one target title climbs into good/strong.
+    score = 20
 
     job_title = _lower(getattr(job, "title", None))
     job_description = _lower(getattr(job, "description", None))
@@ -51,16 +53,37 @@ def score_job_for_user(user: Any, job: Any, settings: Any) -> Dict[str, Any]:
     excluded_keywords = _safe_list(getattr(settings, "excluded_keywords_json", None))
     remote_only = bool(getattr(settings, "remote_only", False))
 
-    # Title match.
+    # Title match — big signal. Each matched title token adds up to +55.
+    # If user set target_titles but none match, cap the final score at 20
+    # (weak) so unrelated roles never make it through auto-apply.
+    title_matched = False
     if job_title and target_titles:
         for title in target_titles:
             title_l = _lower(title)
-            if title_l and title_l in job_title:
-                score += 25
+            if not title_l:
+                continue
+            # Match on any target-title WORD present in the job title, not
+            # just the whole phrase (so "AI Engineer" matches "Senior AI
+            # Platform Engineer"). Require ALL words of the target to hit.
+            tokens = [t for t in title_l.split() if len(t) > 1]
+            if tokens and all(tok in job_title for tok in tokens):
+                score += 55
                 reasons.append(
-                    {"kind": "title_match", "detail": f"title contains '{title}'", "delta": 25}
+                    {"kind": "title_match", "detail": f"title matches '{title}'", "delta": 55}
                 )
+                title_matched = True
                 break
+
+    # Hard filter: if target_titles is set and nothing matched, cap at weak.
+    if target_titles and not title_matched:
+        reasons.append(
+            {
+                "kind": "title_mismatch",
+                "detail": "job title does not match any target title",
+                "delta": 0,
+            }
+        )
+        return {"score": min(score, 20), "band": "weak", "reasons": reasons}
 
     # Remote-only mismatch.
     if remote_only and job_remote_mode != "remote":
