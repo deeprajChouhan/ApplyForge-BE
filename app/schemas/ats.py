@@ -43,14 +43,23 @@ class NormalizedCompany(BaseModel):
 
 
 class NormalizedJob(BaseModel):
-    """Normalized job payload produced by an ATS provider adapter."""
+    """Normalized job payload produced by an ATS provider adapter.
+
+    Providers pass company info as flat fields (`company_ats_slug`,
+    `company_name`) rather than a nested NormalizedCompany, so the upsert
+    layer in `tasks.py` can look up the company by (ats_provider, ats_slug)
+    without instantiating the whole company each time.
+    """
 
     model_config = ConfigDict(from_attributes=True)
 
-    company: NormalizedCompany
-
     ats_provider: str
     external_id: str
+
+    # Provider identifies the owning company via these two flat fields; the
+    # upsert layer resolves them to a `companies` row.
+    company_ats_slug: str
+    company_name: str
 
     title: str
     location: str | None = None
@@ -71,6 +80,7 @@ class NormalizedJob(BaseModel):
 
     jd_analysis_json: dict | None = None
 
+    posted_at: datetime | None = None
     first_seen_at: datetime | None = None
     last_seen_at: datetime | None = None
     is_active: bool = True
