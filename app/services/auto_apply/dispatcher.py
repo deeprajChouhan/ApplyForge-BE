@@ -184,6 +184,7 @@ def _build_submit_context(db, ja):
     (linked Job, applicant email, resume) are missing."""
     from app.models.job import Job
     from app.models.models import GeneratedDocument, ParsedResumeData, UploadedFile, User, UserProfile
+    from app.models.auto_apply import AutoApplySettings
     from app.models.enums import DocumentType
     from app.services.ats.submitters.base import SubmitContext
 
@@ -199,12 +200,20 @@ def _build_submit_context(db, ja):
 
     profile = db.query(UserProfile).filter(UserProfile.user_id == user.id).first()
 
-    # Pick the parsed resume: application-specific selection, else the
-    # user's most recent parsed resume.
+    # Pick the parsed resume:
+    # 1. Application-specific selection
+    # 2. User's default resume set under Preferences (AutoApplySettings)
+    # 3. User's most recent parsed resume fallback
     parsed = None
     sel_id = getattr(ja, "selected_resume_id", None)
     if sel_id:
         parsed = db.get(ParsedResumeData, sel_id)
+
+    if parsed is None:
+        auto_settings = db.query(AutoApplySettings).filter(AutoApplySettings.user_id == user.id).first()
+        if auto_settings and auto_settings.default_resume_parse_id:
+            parsed = db.get(ParsedResumeData, auto_settings.default_resume_parse_id)
+
     if parsed is None:
         parsed = (
             db.query(ParsedResumeData)
@@ -212,6 +221,7 @@ def _build_submit_context(db, ja):
             .order_by(ParsedResumeData.id.desc())
             .first()
         )
+
     if parsed is None or not parsed.uploaded_file_id:
         return None
 
@@ -219,8 +229,7 @@ def _build_submit_context(db, ja):
     if upload is None:
         return None
 
-    # Resume bytes — read from storage. `UploadedFile.path` holds the URI
-    # (local path or s3://... key) that the storage backend understands.
+    # Resume bytes — read from storage.
     try:
         from app.services.storage import get_storage_service
         storage = get_storage_service()
@@ -229,8 +238,7 @@ def _build_submit_context(db, ja):
         logger.warning("submit.resume_download_failed", app_id=ja.id, error=str(exc))
         return None
 
-    # GeneratedDocument uses `version` (no is_current flag) — highest
-    # version that hasn't been soft-deleted is the active one.
+    # GeneratedDocument uses `version` (no is_current flag)
     cover_doc = (
         db.query(GeneratedDocument)
         .filter(
@@ -245,9 +253,38 @@ def _build_submit_context(db, ja):
     company = getattr(job, "company", None)
     company_slug = getattr(company, "ats_slug", None) or ""
 
-    name_str = (profile.full_name if profile and profile.full_name else None) or getattr(user, "full_name", None) or getattr(user, "name", None) or user.email.split("@")[0]
-    phone_str = (profile.phone_number if profile and profile.phone_number else None) or getattr(user, "phone", None) or getattr(user, "phone_number", None)
-    location_str = (profile.location if profile and profile.location else None) or ""
+    # Parse resume structured_json for contact fallbacks (name, phone, location)
+    resume_info = {}
+    if parsed and parsed.structured_json:
+        try:
+            import json
+            resume_info = json.loads(parsed.structured_json) if isinstance(parsed.structured_json, str) else (parsed.structured_json or {})
+        except Exception:
+            resume_info = {}
+
+    contact_info = resume_info.get("contact_info") or resume_info.get("personal_information") or resume_info.get("personal_info") or resume_info
+
+    name_str = (
+        (profile.full_name if profile and profile.full_name else None)
+        or (contact_info.get("name") if isinstance(contact_info, dict) else None)
+        or (contact_info.get("full_name") if isinstance(contact_info, dict) else None)
+        or getattr(user, "full_name", None)
+        or user.email.split("@")[0]
+    )
+
+    phone_str = (
+        (profile.phone_number if profile and profile.phone_number else None)
+        or (contact_info.get("phone") if isinstance(contact_info, dict) else None)
+        or (contact_info.get("phone_number") if isinstance(contact_info, dict) else None)
+        or getattr(user, "phone", None)
+    )
+
+    location_str = (
+        (profile.location if profile and profile.location else None)
+        or (contact_info.get("location") if isinstance(contact_info, dict) else None)
+        or (contact_info.get("city") if isinstance(contact_info, dict) else None)
+        or ""
+    )
 
     extras = {}
     if location_str:
