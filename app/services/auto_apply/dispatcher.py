@@ -217,12 +217,12 @@ def _build_submit_context(db, ja):
     if upload is None:
         return None
 
-    # Resume bytes — read from storage via the existing file service so
-    # SeaweedFS / local both work. Import lazily to avoid a top-level cycle.
+    # Resume bytes — read from storage. `UploadedFile.path` holds the URI
+    # (local path or s3://... key) that the storage backend understands.
     try:
-        from app.services.files.service import FileService
-        file_svc = FileService(db)
-        resume_bytes = file_svc.download(upload.id)
+        from app.services.storage import get_storage_service
+        storage = get_storage_service()
+        resume_bytes = storage.download_bytes(upload.path)
     except Exception as exc:
         logger.warning("submit.resume_download_failed", app_id=ja.id, error=str(exc))
         return None
