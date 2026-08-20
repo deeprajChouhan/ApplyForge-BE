@@ -58,7 +58,35 @@ _LABEL_HEURISTICS: dict[str, list[str]] = {
     "auth": ["authoriz", "work permit", "sponsorship"],
 }
 
-_CAPTCHA_MARKERS = ("recaptcha", "hcaptcha", "cf-turnstile", "captcha")
+def _has_active_captcha(page) -> bool:
+    """Check if an active, visible CAPTCHA widget or challenge frame is present.
+
+    Avoids false positives from passive script tags (e.g. Greenhouse embedding
+    <script src="...recaptcha/api.js"> on every job board page).
+    """
+    try:
+        captcha_selectors = [
+            'iframe[src*="challenges.cloudflare.com"]',
+            'iframe[src*="recaptcha/api2/anchor"]',
+            'iframe[src*="recaptcha/enterprise"]',
+            'iframe[src*="hcaptcha.com"]',
+            '.g-recaptcha',
+            '#g-recaptcha',
+            '.h-captcha',
+            '#cf-turnstile',
+        ]
+        for sel in captcha_selectors:
+            loc = page.locator(sel)
+            if loc.count() > 0:
+                for i in range(loc.count()):
+                    try:
+                        if loc.nth(i).is_visible():
+                            return True
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+    return False
 
 
 def _profile_value(ctx: SubmitContext, key: str) -> str | None:
@@ -139,9 +167,8 @@ class PlaywrightSubmitter:
                         evidence_url=ctx.apply_url,
                     )
 
-                # CAPTCHA short-circuit — no point filling a form we can't submit.
-                html_lower = (page.content() or "").lower()
-                if any(m in html_lower for m in _CAPTCHA_MARKERS):
+                # CAPTCHA short-circuit — check for visible/active challenge widgets only.
+                if _has_active_captcha(page):
                     browser.close()
                     return SubmitResult(
                         outcome=SubmitOutcome.NEEDS_MANUAL,
