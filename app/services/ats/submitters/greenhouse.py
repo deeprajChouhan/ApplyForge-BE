@@ -54,10 +54,11 @@ class GreenhouseSubmitter:
         board_keys = _load_board_keys()
         api_key = board_keys.get(ctx.ats_company_slug.lower())
         if not api_key:
-            # No API key configured for this board — surface as NEEDS_MANUAL
-            # rather than silently failing so the user can finish it.
+            # No API key configured for this board — signal NOT_SUPPORTED
+            # so the dispatcher falls through to the Playwright submitter,
+            # which can drive the public Greenhouse form directly.
             return SubmitResult(
-                outcome=SubmitOutcome.NEEDS_MANUAL,
+                outcome=SubmitOutcome.NOT_SUPPORTED,
                 method=self.method,
                 error="no_board_api_key_configured",
                 evidence_url=ctx.apply_url,
