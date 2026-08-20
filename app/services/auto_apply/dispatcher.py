@@ -125,18 +125,24 @@ def submit_application(app_id: int) -> Dict[str, Any]:
                 emit(db, ja.id, "submit_prereq_missing", {})
                 return {"app_id": app_id, "stage": ja.auto_apply_stage, "reason": "missing_prereqs"}
 
-            from app.services.ats.submitters import get_submitter
+            from app.services.ats.submitters.registry import get_submitter, get_fallback_submitter
             from app.services.ats.submitters.base import SubmitOutcome
 
+            # Try the provider-native HTTP submitter first. If it doesn't
+            # exist for this provider, or if it returns NOT_SUPPORTED for
+            # this specific posting, fall through to the Playwright
+            # browser-automation submitter which works on almost any form.
             submitter = get_submitter(ctx.ats_provider)
-            if submitter is None:
-                ja.auto_apply_stage = "awaiting_review"
-                db.add(ja)
-                db.commit()
-                emit(db, ja.id, "submit_not_supported", {"provider": ctx.ats_provider})
-                return {"app_id": app_id, "stage": ja.auto_apply_stage, "reason": "no_submitter"}
+            result = None
+            if submitter is not None:
+                result = submitter.submit(ctx)
+                if result.outcome == SubmitOutcome.NOT_SUPPORTED:
+                    # HTTP submitter bailed — try browser automation.
+                    result = None
 
-            result = submitter.submit(ctx)
+            if result is None:
+                emit(db, ja.id, "submit_fallback_playwright", {"provider": ctx.ats_provider})
+                result = get_fallback_submitter().submit(ctx)
 
             if result.outcome == SubmitOutcome.SUBMITTED:
                 ja.auto_apply_stage = "submitted"
