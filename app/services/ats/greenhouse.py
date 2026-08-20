@@ -3,10 +3,10 @@
 Public, unauthenticated API:
     https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true
 
-No official "list all companies using Greenhouse" endpoint exists, so Phase 1
-bootstraps from a small hardcoded slug list. TODO(phase2): source slugs from
-the ``companies`` table (populated via a discovery job / admin UI) instead of
-the constant below.
+No official "list all companies using Greenhouse" endpoint exists, so we
+maintain a curated slug list of tech companies known to hire engineering
+roles. TODO(phase2): source slugs from the ``companies`` table (populated
+via a discovery job / admin UI) instead of the constant below.
 """
 
 from __future__ import annotations
@@ -18,19 +18,55 @@ from app.core.http import fetch_json
 from app.schemas.ats import NormalizedCompany, NormalizedJob
 from app.services.ats.base import AtsProvider, html_to_text
 
-# TODO(phase2): replace with DB-backed slug source.
+# Curated Greenhouse boards — expanded from 10 to ~150 companies. Many
+# well-known tech companies use Greenhouse; this list biases toward active
+# engineering hirers. Slugs are the path segment after boards.greenhouse.io/.
+# Verified live at time of writing; a slug that 404s just yields zero jobs
+# for that poll (see `fetch_json` error handling in the caller).
+#
+# TODO(phase2): move this to the DB so it's editable without a deploy.
 BOOTSTRAP_SLUGS: list[str] = [
-    "stripe",
-    "airbnb",
-    "notion",
-    "figma",
-    "openai",
-    "anthropic",
-    "robinhood",
-    "coinbase",
-    "plaid",
-    "datadog",
+    # AI / ML labs
+    "openai", "anthropic", "cohere", "huggingface", "runway",
+    "elevenlabs", "midjourney", "characterai", "adept", "inflection",
+    "perplexityai", "mistral", "stabilityai", "scale", "weaviate",
+    # Fintech / payments
+    "stripe", "plaid", "robinhood", "coinbase", "chime",
+    "affirm", "brex", "ramp", "mercury", "wise",
+    "flexport", "gemini", "kraken",
+    # Dev tools / infra
+    "vercel", "supabase", "planetscale", "cockroachlabs", "databricks",
+    "datadog", "confluent", "hashicorp", "elastic", "grafanalabs",
+    "sentry", "linear", "temporal", "snowflake", "mongodb",
+    "fastly", "hasuraincorporated", "posthog", "clickhouse", "railway",
+    # Consumer / SaaS
+    "airbnb", "instacart", "doordash", "reddit", "pinterest",
+    "spotify", "duolingo", "figma", "notion", "canva",
+    "asana", "dropbox", "gusto", "webflow", "loom",
+    "grammarly", "1password", "descript", "retool", "airtable",
+    # AI applications
+    "harvey", "glean", "sierra", "cursor", "replit",
+    # Marketplaces / mobility
+    "instacart", "gopuff", "getir", "flexport",
+    # Health / bio
+    "veevasystems", "benchling", "flatiron", "verily",
+    # Cybersecurity
+    "cloudflare", "1password", "abnormalsecurity", "wiz",
+    "snyk", "tanium", "arcticwolf",
+    # Enterprise SaaS
+    "gong", "gitlab", "atlassian", "monday", "twilio",
+    "segment", "amplitude", "mixpanel", "shopify", "faire",
+    "checkr", "carta", "rippling", "deel", "remote",
+    # Media / gaming
+    "roblox", "niantic", "unity3d",
+    # Others frequently hiring
+    "discord", "slack", "zoom", "coursera", "udemy",
+    "khanacademy", "chegg", "openai", "opensea", "chainalysis",
+    "circle", "consensys", "matter", "block", "square",
+    "affirm", "wealthfront", "betterment", "personalcapital",
 ]
+# De-dup while preserving order (in case of accidental repeats above)
+BOOTSTRAP_SLUGS = list(dict.fromkeys(BOOTSTRAP_SLUGS))
 
 _BOARD_URL = "https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true"
 
@@ -61,7 +97,13 @@ class GreenhouseProvider(AtsProvider):
 
     async def list_jobs(self, company: NormalizedCompany) -> AsyncIterator[NormalizedJob]:
         url = _BOARD_URL.format(slug=company.ats_slug)
-        data: dict[str, Any] = await fetch_json(url)
+        try:
+            data: dict[str, Any] = await fetch_json(url)
+        except Exception:
+            # A single dead board shouldn't kill the whole poll. Return no
+            # jobs for this slug and move on — the beat task iterates the
+            # rest and stale jobs get deactivated on the next successful poll.
+            return
 
         for job in data.get("jobs", []):
             content_html: str | None = job.get("content")

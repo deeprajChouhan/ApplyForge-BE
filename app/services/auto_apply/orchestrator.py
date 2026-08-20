@@ -16,7 +16,7 @@ from typing import Any, Dict, List
 
 import structlog
 from celery import shared_task
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from app.db.session import SessionLocal
 from app.models.auto_apply import AutoApplyRun, AutoApplySettings
@@ -27,7 +27,36 @@ from app.services.auto_apply.matching import score_job_for_user
 
 logger = structlog.get_logger(__name__)
 
-CANDIDATE_LIMIT = 200
+# Wider pool + newest first so we don't rescan the same cold rows every tick.
+# With no title filter this used to cap effective coverage at 200 rows and
+# starve users whose title matches lived deeper in the table.
+CANDIDATE_LIMIT = 1000
+
+
+def _title_tokens(target_titles: list[str] | None) -> list[str]:
+    """Return a de-duplicated list of individual tokens to LIKE-match on.
+
+    We split each target title on whitespace and also keep the full phrase.
+    Example: ["AI Engineer", "ML Engineer"] ->
+             ["ai engineer", "ml engineer", "ai", "engineer", "ml"]
+    Short tokens (<= 2 chars) are dropped to avoid catching everything.
+    """
+    if not target_titles:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for phrase in target_titles:
+        phrase = (phrase or "").strip().lower()
+        if not phrase:
+            continue
+        if phrase not in seen:
+            seen.add(phrase)
+            out.append(phrase)
+        for tok in phrase.split():
+            if len(tok) > 2 and tok not in seen:
+                seen.add(tok)
+                out.append(tok)
+    return out
 
 
 @shared_task(name="app.services.auto_apply.orchestrator.tick_user")
@@ -67,8 +96,6 @@ def tick_user(user_id: int) -> Dict[str, Any]:
                 .scalars()
                 .all()
             )
-            # Restrict to today where a created_at timestamp is available; if the
-            # model doesn't expose one, fall back to counting all matching rows.
             today_count = len(
                 [
                     ja
@@ -95,13 +122,23 @@ def tick_user(user_id: int) -> Dict[str, Any]:
                 select(JobApplication.job_id)
                 .where(JobApplication.user_id == user_id, JobApplication.job_id.isnot(None))
             )
-            candidates: List[Job] = (
-                db.execute(
-                    select(Job)
-                    .where(Job.is_active == True)  # noqa: E712
-                    .where(Job.id.notin_(already_applied_subq))
-                    .limit(CANDIDATE_LIMIT)
+
+            base_q = (
+                select(Job)
+                .where(Job.is_active == True)  # noqa: E712
+                .where(Job.id.notin_(already_applied_subq))
+            )
+
+            # Push the target-title filter down into SQL so we don't waste
+            # the 1000-row window on jobs that couldn't possibly match.
+            tokens = _title_tokens(getattr(settings, "target_titles_json", None) or [])
+            if tokens:
+                base_q = base_q.where(
+                    or_(*[Job.title.ilike(f"%{tok}%") for tok in tokens])
                 )
+
+            candidates: List[Job] = (
+                db.execute(base_q.order_by(Job.id.desc()).limit(CANDIDATE_LIMIT))
                 .scalars()
                 .all()
             )
@@ -159,7 +196,6 @@ def tick_user(user_id: int) -> Dict[str, Any]:
             db.add(run)
             db.commit()
 
-            # Hand off newly-queued applications to the dispatcher.
             for app_id in newly_queued_ids:
                 prepare_application_delay(app_id)
 

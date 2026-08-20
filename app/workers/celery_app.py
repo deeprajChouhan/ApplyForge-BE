@@ -35,6 +35,7 @@ celery_app.autodiscover_tasks(
 import app.services.ats.tasks  # noqa: E402,F401
 import app.services.auto_apply.orchestrator  # noqa: E402,F401
 import app.services.auto_apply.dispatcher  # noqa: E402,F401
+import app.services.discovery.live_search  # noqa: E402,F401
 import app.workers.tasks  # noqa: E402,F401
 
 celery_app.conf.update(
