@@ -404,6 +404,50 @@ def _fill_form(page, fields: list[dict[str, Any]], ctx: SubmitContext) -> tuple[
         if not value and any(r in label_lower for r in ("how did you hear", "hear about", "referral", "source")):
             value = "LinkedIn"
 
+        # Salary / Compensation expectations
+        if not value and any(s in label_lower for s in ("salary", "desired salary", "compensation", "expectation")):
+            value = ctx.extras.get("salary") or ctx.extras.get("target_salary") or "120000"
+
+        # Current Job Title / Current Title
+        if not value and any(t in label_lower for t in ("current job title", "current title", "recent job title", "current role")):
+            value = ctx.extras.get("current_title") or ctx.extras.get("current_job_title") or "Software Engineer"
+
+        # Current Employer
+        if not value and any(e in label_lower for e in ("current employer", "current company", "recent employer")):
+            value = ctx.extras.get("current_employer") or "N/A"
+
+        # Years of experience
+        if not value and any(y in label_lower for y in ("years of experience", "years of professional experience", "how many years of experience", "years of exp")):
+            value = ctx.extras.get("years_of_experience") or "5"
+
+        # Relocation
+        if not value and "relocat" in label_lower:
+            value = ctx.extras.get("relocation") or "Yes"
+
+        # Travel
+        if not value and "travel" in label_lower:
+            value = ctx.extras.get("travel") or "Yes"
+
+        # Open-ended / custom questions: invoke AI generation using applicant profile + job description
+        if not value and label and field_type in ("text", "textarea", "short_text", "long_text"):
+            try:
+                user_id = ctx.extras.get("user_id")
+                if user_id:
+                    from app.db.session import SessionLocal
+                    from app.services.answer_library.service import AnswerLibraryService
+                    with SessionLocal() as db_sess:
+                        ans_svc = AnswerLibraryService(db_sess, user_id)
+                        ai_answer = ans_svc.generate_answer_with_ai(
+                            question_text=label,
+                            field_type=field_type,
+                            context=ctx.extras,
+                            job_description=ctx.extras.get("job_description"),
+                        )
+                        if ai_answer:
+                            value = ai_answer
+            except Exception as ai_err:
+                logger.warning("playwright.ai_generation_failed", label=label, error=str(ai_err))
+
         # General fallbacks for required text / URL fields if missing from profile
         if not value and field.get("required"):
             if "linkedin" in label_lower:

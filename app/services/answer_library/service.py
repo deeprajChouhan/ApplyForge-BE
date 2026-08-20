@@ -414,3 +414,62 @@ class AnswerLibraryService:
             skipped=skipped,
             total=len(_SEED_QUESTIONS),
         )
+
+    def generate_answer_with_ai(
+        self,
+        question_text: str,
+        field_type: str = "short_text",
+        context: Optional[dict] = None,
+        job_description: Optional[str] = None,
+    ) -> Optional[str]:
+        """Generate a tailored answer to an application question using LLM / RAG,
+        save it to AnswerLibrary with source='ai_generated', and return it."""
+        try:
+            from app.services.ai.factory import get_llm_provider
+            llm = get_llm_provider()
+
+            ctx_summary = []
+            if context:
+                for k, v in context.items():
+                    if v and not str(k).startswith("ans:") and k not in ("user_id", "job_description"):
+                        ctx_summary.append(f"{k}: {v}")
+
+            ctx_str = "\n".join(ctx_summary[:15]) if ctx_summary else "No additional context provided."
+            jd_str = f"Job Description:\n{job_description[:1000]}" if job_description else ""
+
+            system_prompt = (
+                "You are an AI career assistant applying to jobs on behalf of an applicant.\n"
+                "Your task is to write a concise, compelling, accurate, and professional answer "
+                "to the job application question based ONLY on the provided applicant profile and job description.\n"
+                "Rules:\n"
+                "1. Output ONLY the raw answer text (no intro, no extra formatting, quotes, or markdown).\n"
+                "2. For short text fields, keep it under 30 words.\n"
+                "3. For long text fields (e.g. 'Tell us about yourself' / 'Why this role'), write 2-3 strong sentences.\n"
+                "4. Be confident, honest, and professional."
+            )
+
+            user_prompt = (
+                f"Applicant Profile Summary:\n{ctx_str}\n\n"
+                f"{jd_str}\n\n"
+                f"Question: {question_text}\n"
+                f"Field Type: {field_type}\n\n"
+                "Answer:"
+            )
+
+            generated_text = llm.generate(prompt=user_prompt, system_prompt=system_prompt).strip()
+            if (generated_text.startswith('"') and generated_text.endswith('"')) or (generated_text.startswith("'") and generated_text.endswith("'")):
+                generated_text = generated_text[1:-1].strip()
+
+            if generated_text:
+                self.upsert(
+                    question_text=question_text,
+                    answer_text=generated_text,
+                    field_type=field_type,
+                    tags="ai_generated",
+                    confidence=0.95,
+                    source="ai_generated",
+                )
+                return generated_text
+        except Exception as exc:
+            logger.warning("answer_library.ai_generation_failed", question=question_text, error=str(exc))
+        return None

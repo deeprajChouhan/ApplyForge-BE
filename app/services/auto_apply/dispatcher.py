@@ -307,10 +307,67 @@ def _build_submit_context(db, ja):
         or ""
     )
 
-    extras = {}
+    extras = {
+        "user_id": user.id,
+        "job_description": ja.job_description or (job.description if job else ""),
+    }
     if location_str:
         extras["location"] = location_str
         extras["city"] = location_str
+
+    # 1. Salary from AutoApplySettings or profile
+    auto_settings = db.query(AutoApplySettings).filter(AutoApplySettings.user_id == user.id).first()
+    salary_val = (
+        getattr(auto_settings, "target_salary", None)
+        or getattr(profile, "target_salary", None)
+        or "120000"
+    )
+    extras["salary"] = str(salary_val)
+    extras["target_salary"] = str(salary_val)
+    extras["desired_salary"] = str(salary_val)
+
+    # 2. Current Title & Employer from resume_info or profile
+    work_exp = resume_info.get("work_experience") or resume_info.get("experiences") or []
+    current_title = (
+        (profile.headline if profile and profile.headline else None)
+        or (getattr(profile, "current_title", None) if profile else None)
+        or (work_exp[0].get("title") if work_exp and isinstance(work_exp[0], dict) else None)
+        or "Software Engineer"
+    )
+    current_emp = (
+        (work_exp[0].get("company") if work_exp and isinstance(work_exp[0], dict) else None)
+        or (work_exp[0].get("employer") if work_exp and isinstance(work_exp[0], dict) else None)
+        or "N/A"
+    )
+    extras["current_title"] = current_title
+    extras["current_job_title"] = current_title
+    extras["current_employer"] = current_emp
+
+    # 3. Years of experience from resume_info or profile
+    years_exp = (
+        getattr(profile, "total_experience_years", None)
+        or getattr(parsed, "total_experience_years", None)
+        or "5"
+    )
+    extras["years_of_experience"] = str(years_exp)
+
+    # 4. Relocation switch from AutoApplySettings or profile
+    relocation_val = (
+        "Yes" if (
+            getattr(auto_settings, "willing_to_relocate", True)
+            or getattr(profile, "willing_to_relocate", True)
+        ) else "No"
+    )
+    extras["relocation"] = relocation_val
+
+    # 5. Travel switch from AutoApplySettings or profile
+    travel_val = (
+        "Yes" if (
+            getattr(auto_settings, "willing_to_travel", True)
+            or getattr(profile, "willing_to_travel", True)
+        ) else "No"
+    )
+    extras["travel"] = travel_val
 
     # Pre-populate user's Answer Library into extras for Playwright matching
     try:
