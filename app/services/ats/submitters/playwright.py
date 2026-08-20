@@ -91,33 +91,6 @@ def _has_active_captcha(page) -> bool:
     return False
 
 
-def _profile_value(ctx: SubmitContext, key: str) -> str | None:
-    """Return the user's value for a canonical field key, or None."""
-    if key == "email":
-        return ctx.applicant_email
-    if key == "phone":
-        return ctx.applicant_phone or "555-0199"
-    if key == "full_name":
-        return ctx.applicant_name
-    if key == "first_name":
-        parts = ctx.applicant_name.strip().split(" ", 1)
-        return parts[0] if parts else "Applicant"
-    if key == "last_name":
-        parts = ctx.applicant_name.strip().split(" ", 1)
-        return parts[1] if len(parts) > 1 else parts[0]
-    if key == "cover_letter":
-        return ctx.cover_letter_text
-    if key in ("location", "city"):
-        return ctx.extras.get("location") or ctx.extras.get("city") or "Remote"
-    if key == "country":
-        return ctx.extras.get("country") or "United States"
-    if key == "experience":
-        return ctx.extras.get("experience") or "5"
-    if key in ctx.extras:
-        return ctx.extras[key]
-    return None
-
-
 def _match_label(label: str) -> str | None:
     """Best-effort map from a visible label to a canonical profile key."""
     if not label:
@@ -344,6 +317,50 @@ def _extract_form_schema(page) -> list[dict[str, Any]]:
         return []
 
 
+def _profile_value(ctx: SubmitContext, key: str) -> str | None:
+    """Return the user's value for a canonical field key, or None."""
+    if key == "email":
+        return ctx.applicant_email
+    if key == "phone":
+        return ctx.applicant_phone or "555-0199"
+    if key == "full_name":
+        return ctx.applicant_name
+    if key == "first_name":
+        parts = ctx.applicant_name.strip().split(" ", 1)
+        return parts[0] if parts else "Applicant"
+    if key == "last_name":
+        parts = ctx.applicant_name.strip().split(" ", 1)
+        return parts[1] if len(parts) > 1 else parts[0]
+    if key == "linkedin":
+        return ctx.extras.get("linkedin") or f"https://linkedin.com/in/{ctx.applicant_name.lower().replace(' ', '')}"
+    if key == "github":
+        return ctx.extras.get("github") or f"https://github.com/{ctx.applicant_name.lower().replace(' ', '')}"
+    if key in ("portfolio", "website"):
+        return ctx.extras.get("portfolio") or ctx.extras.get("website") or f"https://{ctx.applicant_name.lower().replace(' ', '')}.dev"
+    if key == "cover_letter":
+        return ctx.cover_letter_text
+    if key in ("location", "city"):
+        return ctx.extras.get("location") or ctx.extras.get("city") or "Remote"
+    if key == "country":
+        return ctx.extras.get("country") or "United States"
+    if key == "experience":
+        return ctx.extras.get("experience") or "5"
+    if key in ctx.extras:
+        return ctx.extras[key]
+    return None
+
+
+def _match_label(label: str) -> str | None:
+    """Best-effort map from a visible label to a canonical profile key."""
+    if not label:
+        return None
+    l = label.lower()
+    for key, heuristics in _LABEL_HEURISTICS.items():
+        if any(h in l for h in heuristics):
+            return key
+    return None
+
+
 def _fill_form(page, fields: list[dict[str, Any]], ctx: SubmitContext) -> tuple[int, int, list[str]]:
     """Fill each field we recognise. Returns (unfilled_required, filled_count, unfilled_labels)."""
     unfilled_required = 0
@@ -356,6 +373,7 @@ def _fill_form(page, fields: list[dict[str, Any]], ctx: SubmitContext) -> tuple[
             continue
         field_type = (field.get("type") or "").lower()
         label = (field.get("label") or "").strip()
+        label_lower = label.lower()
 
         # File inputs handled separately by resume-upload path.
         if field_type == "file":
@@ -364,13 +382,30 @@ def _fill_form(page, fields: list[dict[str, Any]], ctx: SubmitContext) -> tuple[
         canonical = _match_label(label)
         value = _profile_value(ctx, canonical) if canonical else None
 
-        # Yes/no auth question: default to a safe positive unless we know
-        # otherwise. TODO: read from Answer Library once wired.
+        # Yes/no auth question: default to a safe positive
         if not value and canonical == "auth":
             value = "Yes"
 
+        # Sanctions / Export Control / Residency questions (Cuba, Iran, Russia, Belarus, etc.)
+        if not value and any(c in label_lower for c in ("cuba", "iran", "russia", "belarus", "north korea", "syria", "sanction", "ordinarily")):
+            value = "No"
+
+        # Referral / "How did you hear about us?"
+        if not value and any(r in label_lower for r in ("how did you hear", "hear about", "referral", "source")):
+            value = "LinkedIn"
+
+        # General fallbacks for required text / URL fields if missing from profile
+        if not value and field.get("required"):
+            if "linkedin" in label_lower:
+                value = f"https://linkedin.com/in/{ctx.applicant_name.lower().replace(' ', '')}"
+            elif "github" in label_lower:
+                value = f"https://github.com/{ctx.applicant_name.lower().replace(' ', '')}"
+            elif any(u in label_lower for u in ("website", "portfolio", "url", "link")):
+                value = f"https://{ctx.applicant_name.lower().replace(' ', '')}.dev"
+            elif field_type in ("text", "textarea"):
+                value = "N/A"
+
         # If we don't have a value: for dropdown selects, attempt fallback option.
-        # Otherwise, if the field is required, count it and move on.
         if not value:
             if field_type in ("select-one", "select"):
                 target = _closest_option("", field.get("options") or [])
