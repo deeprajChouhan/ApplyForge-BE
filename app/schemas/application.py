@@ -38,6 +38,17 @@ class ApplicationOut(BaseModel):
     priority_score: float | None = None
     # PRO: which parsed resume is selected for this application (None = use latest)
     selected_resume_id: int | None = None
+    # RCMS match_score set at queue-time by the auto-apply orchestrator.
+    # Prefer this over `fit_score` for the drawer's match badge so the
+    # queue row and drawer stay in sync.
+    match_score: int | None = None
+    # Auto-apply lifecycle stage — surfaced on ApplicationOut so the
+    # drawer's StagePill can render without a separate fetch.
+    auto_apply_stage: str | None = None
+    # Optional job metadata mirrored from the linked Job row (nullable
+    # because manually-created applications may not have them).
+    location: str | None = None
+    work_type: str | None = None
     created_at: datetime
 
     model_config = {"from_attributes": True}

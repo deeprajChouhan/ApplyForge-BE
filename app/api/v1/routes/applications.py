@@ -6,6 +6,8 @@ from app.api.deps import get_current_user, require_feature
 from app.db.session import get_db
 from app.models.enums import ApplicationStatus, FeatureFlag
 from app.models.models import User
+from pydantic import BaseModel
+
 from app.schemas.application import (
     ApplicationCreate,
     ApplicationListResponse,
@@ -20,6 +22,11 @@ from app.schemas.application import (
     SetResumeRequest,
     StatusChangeRequest,
 )
+
+
+class UpdateGeneratedDocumentRequest(BaseModel):
+    """PATCH body for editing a generated document's content in place."""
+    content: str
 from app.schemas.profile import LinkedInConnectionOut
 from app.schemas.suggestions import ApplySuggestionRequest, CustomizationOut, SuggestionsResponse
 from app.services.linkedin.service import LinkedInService
@@ -112,6 +119,86 @@ def generate(app_id: int, payload: GenerateRequest, user: User = Depends(get_cur
         status="completed",
         documents=[GeneratedDocumentOut.model_validate(doc) for doc in docs],
     )
+
+
+@router.patch(
+    "/{app_id}/documents/{doc_type}",
+    response_model=GeneratedDocumentOut,
+    dependencies=[_need_apps],
+)
+def update_document(
+    app_id: int,
+    doc_type: str,
+    payload: UpdateGeneratedDocumentRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Persist user edits to a generated document (cover letter, resume, etc.).
+
+    Updates the currently-active generated_documents row for this
+    (application, doc_type) pair in place; no new version bump so
+    subsequent renders reflect the edit immediately.
+    """
+    from app.models.enums import DocumentType
+    from app.models.models import GeneratedDocument
+    from datetime import datetime
+    from fastapi import HTTPException
+
+    # Validate doc_type against the enum instead of trusting the URL string.
+    try:
+        dt = DocumentType(doc_type)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"unknown doc_type '{doc_type}'") from exc
+
+    # Ownership check + fetch current row via ApplicationService (already
+    # scoped to user.id, so a wrong owner surfaces as 404).
+    ApplicationService(db, user.id).get(app_id)  # raises 404 if not owned
+
+    doc = (
+        db.query(GeneratedDocument)
+        .filter(
+            GeneratedDocument.application_id == app_id,
+            GeneratedDocument.doc_type == dt,
+            GeneratedDocument.is_current.is_(True),
+        )
+        .first()
+    )
+    if doc is None:
+        raise HTTPException(status_code=404, detail="no current document to update — generate one first")
+
+    doc.content = payload.content
+    doc.updated_at = datetime.utcnow()
+    db.add(doc)
+    db.commit()
+    db.refresh(doc)
+    return GeneratedDocumentOut.model_validate(doc)
+
+
+@router.post("/{app_id}/submit-now", dependencies=[_need_apps])
+def submit_now(
+    app_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Manually trigger auto-apply submission for one application.
+
+    Used before flipping `fully_automatic` on globally — lets the user
+    test the submitter end-to-end for a single row. Returns immediately
+    (Celery task runs async); poll `GET /applications/{id}` to see the
+    stage transition.
+    """
+    from fastapi import HTTPException
+    from app.services.auto_apply.dispatcher import submit_application
+
+    # Ownership check — service raises 404 if the app doesn't belong to user.
+    ja = ApplicationService(db, user.id).get(app_id)
+    if getattr(ja, "auto_apply_stage", None) not in ("awaiting_review", "queued", "failed", None):
+        raise HTTPException(
+            status_code=409,
+            detail=f"cannot submit from stage '{ja.auto_apply_stage}' — already in flight or terminal",
+        )
+    submit_application.delay(app_id)
+    return {"queued": True, "app_id": app_id}
 
 
 @router.post("/{app_id}/package", response_model=PackageResponse, dependencies=[_need_package])

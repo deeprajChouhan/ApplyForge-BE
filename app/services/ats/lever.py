@@ -2,6 +2,10 @@
 
 Public, unauthenticated API:
     https://api.lever.co/v0/postings/{slug}?mode=json
+
+Curated ~100-slug list, expanded from 7 to give the matcher a wide
+enough pool to actually find relevant roles. A dead slug just yields
+zero jobs (see fetch_json try/except below).
 """
 
 from __future__ import annotations
@@ -13,16 +17,43 @@ from app.core.http import fetch_json
 from app.schemas.ats import NormalizedCompany, NormalizedJob
 from app.services.ats.base import AtsProvider, html_to_text
 
-# TODO(phase2): replace with DB-backed slug source.
+# TODO(phase2): move to DB so it's editable without a deploy.
 BOOTSTRAP_SLUGS: list[str] = [
-    "netflix",
-    "mixpanel",
-    "pinterest",
-    "spotify",
-    "github",
-    "shopify",
-    "medium",
+    # Original seed
+    "netflix", "mixpanel", "pinterest", "spotify", "github", "shopify", "medium",
+    # AI / ML
+    "openai", "cohere", "runway", "elevenlabs", "adept", "perplexity", "inflection",
+    "characterai", "harvey", "sierra", "arcinstitute",
+    # Fintech / payments
+    "stripe", "plaid", "brex", "ramp", "mercury", "wealthfront", "affirm", "chime",
+    "gemini", "coinbase", "kraken", "opensea", "circle", "checkout", "sardine",
+    # Dev tools / infra
+    "vercel", "supabase", "planetscale", "cockroachlabs", "databricks", "hashicorp",
+    "sentry", "linear", "temporal", "railway", "grafanalabs", "confluent",
+    "clickhouse", "posthog", "chroma", "modal", "prefect", "orb",
+    # Consumer / SaaS
+    "airbnb", "instacart", "doordash", "reddit", "spotify", "duolingo", "figma",
+    "notion", "canva", "asana", "dropbox", "grammarly", "1password", "descript",
+    "retool", "airtable", "loom", "attentive",
+    # Enterprise
+    "gong", "gitlab", "atlassian", "twilio", "segment", "amplitude", "mixpanel",
+    "faire", "checkr", "carta", "rippling", "deel", "remote", "airbase",
+    "workato", "fivetran", "hex", "airbyte",
+    # Security
+    "cloudflare", "wiz", "snyk", "1password", "abnormalsecurity", "tanium",
+    "arcticwolf", "attackiq",
+    # Health / bio
+    "veevasystems", "benchling", "flatiron", "verily", "included", "sword",
+    # Marketplaces / mobility
+    "gopuff", "flexport", "faire",
+    # Media / gaming
+    "roblox", "unity3d", "niantic",
+    # Communication
+    "discord", "slack", "zoom",
+    # Education
+    "coursera", "udemy", "khanacademy",
 ]
+BOOTSTRAP_SLUGS = list(dict.fromkeys(BOOTSTRAP_SLUGS))  # de-dupe, preserve order
 
 _BOARD_URL = "https://api.lever.co/v0/postings/{slug}?mode=json"
 
@@ -45,20 +76,24 @@ def _infer_remote_mode(location: str | None) -> str:
 class LeverProvider(AtsProvider):
     name = "lever"
     base_poll_interval_seconds = 3600
-    can_submit = False  # TODO(phase2+): Lever "Postings API" supports opportunity creation on some plans.
+    can_submit = True  # HTTP submitter exists — see app.services.ats.submitters.lever
 
     async def list_companies(self) -> AsyncIterator[NormalizedCompany]:
         for slug in BOOTSTRAP_SLUGS:
             yield NormalizedCompany(
                 ats_provider=self.name,
                 ats_slug=slug,
-                name=slug,  # TODO(phase2): Lever postings API doesn't return a display company name.
+                name=slug,
                 careers_url=f"https://jobs.lever.co/{slug}",
             )
 
     async def list_jobs(self, company: NormalizedCompany) -> AsyncIterator[NormalizedJob]:
         url = _BOARD_URL.format(slug=company.ats_slug)
-        data: list[dict[str, Any]] = await fetch_json(url)
+        try:
+            data: list[dict[str, Any]] = await fetch_json(url)
+        except Exception:
+            # Dead / 404 slug — skip cleanly so the batch continues.
+            return
 
         for posting in data:
             categories: dict[str, Any] = posting.get("categories") or {}
@@ -73,8 +108,8 @@ class LeverProvider(AtsProvider):
                 location=location,
                 remote_mode=_infer_remote_mode(location),
                 employment_type=categories.get("commitment"),
-                seniority=None,  # Not directly provided; categories.team is org unit, not seniority.
-                salary_min=None,  # TODO(phase2): Lever exposes salary via `salaryRange` on some boards.
+                seniority=None,
+                salary_min=None,
                 salary_max=None,
                 salary_currency=None,
                 description=description_plain or html_to_text(description_html),

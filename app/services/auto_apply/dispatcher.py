@@ -98,11 +98,17 @@ def prepare_application(app_id: int) -> Dict[str, Any]:
 
 @shared_task(name="app.services.auto_apply.dispatcher.submit_application")
 def submit_application(app_id: int) -> Dict[str, Any]:
-    """Phase 3 stub submitter.
+    """Phase 4 real submitter.
 
-    Marks the application as submitted with submit_method="manual". The
-    real per-ATS submitter (Greenhouse/Lever/Ashby/etc. form automation
-    or API submission) is planned for Phase 4.
+    Loads the JobApplication + linked Job + user's profile/resume/cover
+    letter, builds a `SubmitContext`, and dispatches to the per-provider
+    submitter in `app.services.ats.submitters.registry`.
+
+    Outcome → stage mapping:
+      SUBMITTED       → auto_apply_stage="submitted"
+      NEEDS_MANUAL    → auto_apply_stage="awaiting_review" (user finishes it)
+      NOT_SUPPORTED   → auto_apply_stage="awaiting_review" (no submitter yet)
+      FAILED          → auto_apply_stage="failed" (transient; retry later)
     """
     try:
         with SessionLocal() as db:
@@ -110,14 +116,135 @@ def submit_application(app_id: int) -> Dict[str, Any]:
             if ja is None:
                 return {"error": "application_not_found", "app_id": app_id}
 
-            ja.auto_apply_stage = "submitted"
-            ja.submitted_at = datetime.utcnow()
-            ja.submit_method = "manual"
-            db.add(ja)
-            db.commit()
-            emit(db, ja.id, "submitted", {"submit_method": "manual"})
+            ctx = _build_submit_context(db, ja)
+            if ctx is None:
+                # Missing prerequisites (no resume, no linked Job, etc.)
+                ja.auto_apply_stage = "awaiting_review"
+                db.add(ja)
+                db.commit()
+                emit(db, ja.id, "submit_prereq_missing", {})
+                return {"app_id": app_id, "stage": ja.auto_apply_stage, "reason": "missing_prereqs"}
 
-            return {"app_id": app_id, "stage": ja.auto_apply_stage}
+            from app.services.ats.submitters import get_submitter
+            from app.services.ats.submitters.base import SubmitOutcome
+
+            submitter = get_submitter(ctx.ats_provider)
+            if submitter is None:
+                ja.auto_apply_stage = "awaiting_review"
+                db.add(ja)
+                db.commit()
+                emit(db, ja.id, "submit_not_supported", {"provider": ctx.ats_provider})
+                return {"app_id": app_id, "stage": ja.auto_apply_stage, "reason": "no_submitter"}
+
+            result = submitter.submit(ctx)
+
+            if result.outcome == SubmitOutcome.SUBMITTED:
+                ja.auto_apply_stage = "submitted"
+                ja.submitted_at = datetime.utcnow()
+                ja.submit_method = result.method
+                if result.evidence_url:
+                    ja.submission_evidence_url = result.evidence_url
+                db.add(ja)
+                db.commit()
+                emit(db, ja.id, "submitted", {
+                    "submit_method": result.method,
+                    "external_reference": result.external_reference,
+                })
+            elif result.outcome == SubmitOutcome.NEEDS_MANUAL:
+                ja.auto_apply_stage = "awaiting_review"
+                db.add(ja)
+                db.commit()
+                emit(db, ja.id, "submit_needs_manual", {
+                    "submit_method": result.method,
+                    "error": result.error,
+                })
+            elif result.outcome == SubmitOutcome.FAILED:
+                ja.auto_apply_stage = "failed"
+                db.add(ja)
+                db.commit()
+                emit(db, ja.id, "submit_failed", {
+                    "submit_method": result.method,
+                    "error": result.error,
+                })
+
+            return {"app_id": app_id, "stage": ja.auto_apply_stage, "outcome": result.outcome.value}
     except Exception as exc:
         logger.error("auto_apply.submit_application_failed", app_id=app_id, error=str(exc))
         return {"error": str(exc), "app_id": app_id}
+
+
+def _build_submit_context(db, ja):
+    """Assemble a SubmitContext from the DB. Returns None if prerequisites
+    (linked Job, applicant email, resume) are missing."""
+    from app.models.job import Job
+    from app.models.models import GeneratedDocument, ParsedResumeData, UploadedFile, User
+    from app.models.enums import DocumentType
+    from app.services.ats.submitters.base import SubmitContext
+
+    if not ja.job_id:
+        return None
+    job = db.get(Job, ja.job_id)
+    if job is None or not job.apply_url:
+        return None
+
+    user = db.get(User, ja.user_id)
+    if user is None or not getattr(user, "email", None):
+        return None
+
+    # Pick the parsed resume: application-specific selection, else the
+    # user's most recent parsed resume.
+    parsed = None
+    sel_id = getattr(ja, "selected_resume_id", None)
+    if sel_id:
+        parsed = db.get(ParsedResumeData, sel_id)
+    if parsed is None:
+        parsed = (
+            db.query(ParsedResumeData)
+            .filter(ParsedResumeData.user_id == user.id, ParsedResumeData.deleted_at.is_(None))
+            .order_by(ParsedResumeData.id.desc())
+            .first()
+        )
+    if parsed is None or not parsed.uploaded_file_id:
+        return None
+
+    upload = db.get(UploadedFile, parsed.uploaded_file_id)
+    if upload is None:
+        return None
+
+    # Resume bytes — read from storage via the existing file service so
+    # SeaweedFS / local both work. Import lazily to avoid a top-level cycle.
+    try:
+        from app.services.files.service import FileService
+        file_svc = FileService(db)
+        resume_bytes = file_svc.download(upload.id)
+    except Exception as exc:
+        logger.warning("submit.resume_download_failed", app_id=ja.id, error=str(exc))
+        return None
+
+    cover_doc = (
+        db.query(GeneratedDocument)
+        .filter(
+            GeneratedDocument.application_id == ja.id,
+            GeneratedDocument.doc_type == DocumentType.cover_letter,
+            GeneratedDocument.is_current.is_(True),
+        )
+        .first()
+    )
+
+    company = getattr(job, "company", None)
+    company_slug = getattr(company, "ats_slug", None) or ""
+
+    return SubmitContext(
+        apply_url=job.apply_url,
+        ats_provider=job.ats_provider or "",
+        ats_external_id=job.external_id or "",
+        ats_company_slug=company_slug,
+        applicant_name=(getattr(user, "full_name", None) or getattr(user, "name", None) or user.email.split("@")[0]),
+        applicant_email=user.email,
+        applicant_phone=getattr(user, "phone", None),
+        resume_bytes=resume_bytes,
+        resume_filename=upload.filename or "resume.pdf",
+        resume_mime=upload.content_type or "application/pdf",
+        cover_letter_text=cover_doc.content if cover_doc else None,
+        extras={},
+    )
