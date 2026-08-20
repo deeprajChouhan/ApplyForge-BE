@@ -51,6 +51,10 @@ FROM runtime AS worker
 
 USER root
 
+# Playwright caches browsers under PLAYWRIGHT_BROWSERS_PATH if set.
+# Set this ENV BEFORE running `playwright install` so the binaries are installed into /ms-playwright.
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
 # Playwright's own installer pulls Chromium into /ms-playwright and
 # reports the OS packages it still needs. `install-deps` is a thin
 # wrapper that apt-installs them (fonts, libnss, libatk, etc.).
@@ -62,4 +66,4 @@ RUN python -m playwright install --with-deps chromium \
 RUN chown -R appuser:appgroup /ms-playwright || true
 
 USER appuser
-ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+

@@ -1,6 +1,8 @@
 services:
   api:
-    build: .
+    build:
+      context: .
+      target: runtime
     env_file: .env
     ports:
       - "8000:8000"
@@ -53,7 +55,9 @@ services:
 
   # ── Celery worker: ATS pollers + auto-apply orchestrator ────────────────────
   worker:
-    build: .
+    build:
+      context: .
+      target: worker
     env_file: .env
     depends_on:
       redis:
@@ -69,7 +73,9 @@ services:
   # --schedule points at /tmp because the app runtime user can't write to /app
   # (which is where beat defaults its persistent dbm schedule file).
   beat:
-    build: .
+    build:
+      context: .
+      target: runtime
     env_file: .env
     depends_on:
       redis:
@@ -92,7 +98,9 @@ services:
 
   # One-shot: create the Qdrant collection (idempotent) before the API starts.
   qdrant-init:
-    build: .
+    build:
+      context: .
+      target: runtime
     env_file: .env
     depends_on:
       qdrant:

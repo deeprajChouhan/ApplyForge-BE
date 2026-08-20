@@ -59,3 +59,4 @@ pytest
 - Mock providers are now gated and only available when `AI_ALLOW_MOCK_PROVIDERS=true` (intended for tests/local development).
 - Required runtime env: `AI_API_KEY`, plus optional reliability controls: `AI_REQUEST_TIMEOUT_SECONDS`, `AI_MAX_RETRIES`, `AI_RETRY_BACKOFF_SECONDS`.
 - Misconfiguration now fails fast during provider construction instead of silently falling back to mocks.
+
