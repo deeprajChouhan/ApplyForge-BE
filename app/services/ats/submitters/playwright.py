@@ -337,9 +337,18 @@ def _fill_form(page, fields: list[dict[str, Any]], ctx: SubmitContext) -> tuple[
         if not value and canonical == "auth":
             value = "Yes"
 
-        # If we don't have a value and the field is required, count it and
-        # move on. We won't guess random text into required fields.
+        # If we don't have a value: for dropdown selects, attempt fallback option.
+        # Otherwise, if the field is required, count it and move on.
         if not value:
+            if field_type in ("select-one", "select"):
+                target = _closest_option("", field.get("options") or [])
+                if target:
+                    try:
+                        page.locator(selector).first.select_option(target, timeout=_ACTION_TIMEOUT_MS)
+                        filled += 1
+                        continue
+                    except Exception:
+                        pass
             if field.get("required"):
                 unfilled_required += 1
                 if label:
@@ -381,16 +390,22 @@ def _closest_option(value: str, options: list[str]) -> str | None:
     """Return the option whose text most nearly matches `value`."""
     if not options:
         return None
-    v = value.lower()
-    # Exact / substring first.
+    v = (value or "").lower()
+    if v:
+        # Exact / substring first.
+        for o in options:
+            if o and (o.lower() == v or v in o.lower()):
+                return o
+    # Fallback for demographic/EEOC dropdowns: prefer "Decline", "Prefer not to say", "Other"
     for o in options:
-        if o and (o.lower() == v or v in o.lower()):
+        ol = o.lower() if o else ""
+        if any(d in ol for d in ("decline", "prefer not", "don't wish", "other")):
             return o
-    # Fallback: first non-empty option.
+    # Fallback: first valid non-placeholder option
     for o in options:
-        if o:
+        if o and not any(p in o.lower() for p in ("select", "choose", "please", "--")):
             return o
-    return None
+    return options[0] if options else None
 
 
 def _try_upload_resume(page, ctx: SubmitContext) -> bool:
