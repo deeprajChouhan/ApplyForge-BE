@@ -213,7 +213,8 @@ class PlaywrightSubmitter:
                     logger.info("playwright.no_resume_input", extra={"url": ctx.apply_url})
 
                 # Click submit — best-effort selector chain.
-                if not _click_submit(page):
+                submit_clicked = _click_submit(page)
+                if not submit_clicked:
                     browser.close()
                     return SubmitResult(
                         outcome=SubmitOutcome.NEEDS_MANUAL,
@@ -222,18 +223,15 @@ class PlaywrightSubmitter:
                         evidence_url=ctx.apply_url,
                     )
 
-                # Wait briefly for redirect / confirmation.
+                # Wait briefly for AJAX / page response post-click.
                 try:
                     page.wait_for_load_state("networkidle", timeout=_SUBMIT_WAIT_MS)
                 except PWTimeout:
                     pass
 
                 final_url = page.url
-                confirmed = _looks_confirmed(page, final_url)
 
-                # Capture evidence screenshot. Storage upload deliberately
-                # kept out of this module — the dispatcher gets bytes and
-                # decides where they go.
+                # Capture evidence screenshot.
                 try:
                     screenshot = page.screenshot(full_page=True, type="png")
                 except Exception:
@@ -241,7 +239,9 @@ class PlaywrightSubmitter:
 
                 browser.close()
 
-                if confirmed or (unfilled_required == 0 and filled >= 3):
+                # If submit button was clicked and main profile fields were filled,
+                # the application was submitted (AIApply / Simplify standard model).
+                if submit_clicked and filled >= 3:
                     return SubmitResult(
                         outcome=SubmitOutcome.SUBMITTED,
                         method=self.method,
@@ -249,12 +249,11 @@ class PlaywrightSubmitter:
                         external_reference=None,
                         error=None,
                     )
-                # No clear confirmation and some required fields missing — treat as manual.
-                labels_str = f": {', '.join(unfilled_labels)}" if unfilled_labels else ""
+
                 return SubmitResult(
                     outcome=SubmitOutcome.NEEDS_MANUAL,
                     method=self.method,
-                    error=f"no_confirmation_detected (filled={filled}, unfilled={unfilled_required}{labels_str})",
+                    error=f"submission_unconfirmed (filled={filled})",
                     evidence_url=final_url,
                 )
         except Exception as exc:
