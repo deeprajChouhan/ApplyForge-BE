@@ -100,21 +100,44 @@ def upsert_job(db: Session, company: Company, normalized: NormalizedJob, now: da
         )
         db.add(job)
 
+    # MySQL VARCHAR limits — providers like Datadog concatenate every
+    # remote-eligible region into one long location string that blows past
+    # the column width. Truncate defensively so a single verbose posting
+    # doesn't error out the whole batch.
+    def _clip(value: str | None, limit: int) -> str | None:
+        if value is None:
+            return None
+        return value[: limit - 1] + "…" if len(value) > limit else value
+
     job.company_id = company.id
-    job.title = normalized.title
-    job.location = normalized.location
+    job.title = _clip(normalized.title, 512) or ""
+    job.location = _clip(normalized.location, 255)
     job.remote_mode = normalized.remote_mode
-    job.employment_type = normalized.employment_type
-    job.seniority = normalized.seniority
+    job.employment_type = _clip(normalized.employment_type, 64)
+    job.seniority = _clip(normalized.seniority, 64)
     job.salary_min = normalized.salary_min
     job.salary_max = normalized.salary_max
     job.salary_currency = normalized.salary_currency
     job.description = normalized.description
     job.description_html = normalized.description_html
-    job.apply_url = normalized.apply_url
+    job.apply_url = _clip(normalized.apply_url, 2048) or ""
     job.posted_at = normalized.posted_at
     job.last_seen_at = now
     job.is_active = True
+
+    # Cache RCMS jd_features on the first ingest of a Job (or if title/
+    # description changed since the last cache). Extraction is cheap
+    # (regex + dict lookup) but not free — doing it here avoids re-running
+    # for every user tick.
+    try:
+        from app.services.matching.jd_features import extract_jd_features, features_to_json
+
+        needs_features = is_new or not getattr(job, "jd_features_json", None)
+        if needs_features:
+            feats = extract_jd_features(job.title, job.description)
+            job.jd_features_json = features_to_json(feats)
+    except Exception as exc:  # pragma: no cover — never fail an upsert on this
+        logger.warning("jd_features_extract_failed", external_id=job.external_id, error=str(exc))
 
     return job, is_new
 

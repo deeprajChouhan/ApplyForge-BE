@@ -83,6 +83,10 @@ class Job(Base):
     )
 
     jd_analysis_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Cached output of app.services.matching.jd_features.extract_jd_features
+    # populated at ingest time — the RCMS scorer reads this per-tick instead
+    # of re-parsing the JD text.
+    jd_features_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     first_seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
