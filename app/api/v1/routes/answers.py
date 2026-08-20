@@ -21,6 +21,7 @@ from app.services.answer_library.service import AnswerLibraryService
 router = APIRouter(prefix="/answers", tags=["answers"])
 
 
+@router.get("", response_model=list[AnswerOut])
 @router.get("/", response_model=list[AnswerOut])
 def list_answers(
     field_type: Optional[str] = Query(default=None),
@@ -34,6 +35,7 @@ def list_answers(
     return service.list(field_type=field_type, tag=tag, limit=limit, offset=offset)  # type: ignore[return-value]
 
 
+@router.post("", response_model=AnswerOut)
 @router.post("/", response_model=AnswerOut)
 def create_or_update_answer(
     payload: AnswerIn,
