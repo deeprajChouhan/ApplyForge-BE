@@ -90,6 +90,18 @@ _SEED_QUESTIONS: list[tuple[str, str, str]] = [
 _EEOC_TAG = "eeoc"
 
 
+def _to_field_type(ft: Any) -> FieldType:
+    if isinstance(ft, FieldType):
+        return ft
+    if not ft:
+        return FieldType.SHORT_TEXT
+    val = str(ft).lower().strip()
+    for member in FieldType:
+        if member.value == val or member.name.lower() == val:
+            return member
+    return FieldType.SHORT_TEXT
+
+
 class AnswerLibraryService:
     """Per-user CRUD + lookup + seeding for the Answer Library."""
 
@@ -172,6 +184,7 @@ class AnswerLibraryService:
         source: str = "user",
     ) -> AnswerLibrary:
         question_key = self._question_key(question_text)
+        enum_field_type = _to_field_type(field_type)
 
         existing = self.db.execute(
             select(AnswerLibrary).where(
@@ -187,7 +200,7 @@ class AnswerLibraryService:
             answer_changed = existing.answer_text != answer_text
             existing.question_text = question_text
             existing.answer_text = answer_text
-            existing.field_type = field_type
+            existing.field_type = enum_field_type
             if tags is not None:
                 existing.tags = tags
             if confidence is not None:
@@ -208,7 +221,7 @@ class AnswerLibraryService:
             question_text=question_text,
             question_embedding_json=embedding,
             answer_text=answer_text,
-            field_type=field_type,
+            field_type=enum_field_type,
             tags=tags,
             confidence=confidence,
             source=source,
@@ -383,7 +396,7 @@ class AnswerLibraryService:
                 question_text=question_text,
                 question_embedding_json=None,
                 answer_text="Prefer not to say" if is_eeoc else "",
-                field_type=field_type,
+                field_type=_to_field_type(field_type),
                 tags=tag,
                 confidence=1.0 if is_eeoc else None,
                 source="seed",

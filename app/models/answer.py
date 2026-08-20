@@ -64,7 +64,7 @@ class AnswerLibrary(Base, TimestampMixin):
 
     answer_text: Mapped[str] = mapped_column(Text, nullable=False)
     field_type: Mapped[FieldType] = mapped_column(
-        Enum(FieldType, name="field_type_enum"),
+        Enum(FieldType, name="field_type_enum", values_callable=lambda x: [e.value for e in x]),
         default=FieldType.SHORT_TEXT,
         nullable=False,
     )
