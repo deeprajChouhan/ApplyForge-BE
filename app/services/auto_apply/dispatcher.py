@@ -183,7 +183,7 @@ def _build_submit_context(db, ja):
     """Assemble a SubmitContext from the DB. Returns None if prerequisites
     (linked Job, applicant email, resume) are missing."""
     from app.models.job import Job
-    from app.models.models import GeneratedDocument, ParsedResumeData, UploadedFile, User
+    from app.models.models import GeneratedDocument, ParsedResumeData, UploadedFile, User, UserProfile
     from app.models.enums import DocumentType
     from app.services.ats.submitters.base import SubmitContext
 
@@ -196,6 +196,8 @@ def _build_submit_context(db, ja):
     user = db.get(User, ja.user_id)
     if user is None or not getattr(user, "email", None):
         return None
+
+    profile = db.query(UserProfile).filter(UserProfile.user_id == user.id).first()
 
     # Pick the parsed resume: application-specific selection, else the
     # user's most recent parsed resume.
@@ -243,17 +245,26 @@ def _build_submit_context(db, ja):
     company = getattr(job, "company", None)
     company_slug = getattr(company, "ats_slug", None) or ""
 
+    name_str = (profile.full_name if profile and profile.full_name else None) or getattr(user, "full_name", None) or getattr(user, "name", None) or user.email.split("@")[0]
+    phone_str = (profile.phone_number if profile and profile.phone_number else None) or getattr(user, "phone", None) or getattr(user, "phone_number", None)
+    location_str = (profile.location if profile and profile.location else None) or ""
+
+    extras = {}
+    if location_str:
+        extras["location"] = location_str
+        extras["city"] = location_str
+
     return SubmitContext(
         apply_url=job.apply_url,
         ats_provider=job.ats_provider or "",
         ats_external_id=job.external_id or "",
         ats_company_slug=company_slug,
-        applicant_name=(getattr(user, "full_name", None) or getattr(user, "name", None) or user.email.split("@")[0]),
+        applicant_name=name_str,
         applicant_email=user.email,
-        applicant_phone=getattr(user, "phone", None),
+        applicant_phone=phone_str,
         resume_bytes=resume_bytes,
         resume_filename=upload.filename or "resume.pdf",
         resume_mime=upload.content_type or "application/pdf",
         cover_letter_text=cover_doc.content if cover_doc else None,
-        extras={},
+        extras=extras,
     )
