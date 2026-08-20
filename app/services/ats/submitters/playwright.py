@@ -44,18 +44,18 @@ _SUBMIT_WAIT_MS = 8_000
 
 # Labels we can fill from profile without any inference.
 _LABEL_HEURISTICS: dict[str, list[str]] = {
-    "first_name": ["first name", "given name"],
-    "last_name": ["last name", "family name", "surname"],
-    "full_name": ["full name", "your name", "name"],
-    "email": ["email"],
-    "phone": ["phone", "mobile", "telephone"],
-    "linkedin": ["linkedin"],
-    "portfolio": ["portfolio", "website", "personal site", "personal website"],
-    "github": ["github"],
-    "cover_letter": ["cover letter", "why", "why do you want"],
-    "location": ["current location", "location", "city"],
-    "salary": ["salary expectation", "expected salary", "compensation"],
-    "auth": ["authoriz", "work permit", "sponsorship"],
+    "first_name": ["first name", "given name", "first_name", "fname"],
+    "last_name": ["last name", "family name", "surname", "last_name", "lname"],
+    "full_name": ["full name", "your name", "candidate name", "name"],
+    "email": ["email", "e-mail", "email address"],
+    "phone": ["phone", "mobile", "telephone", "phone number", "contact number", "cell"],
+    "linkedin": ["linkedin", "linked in", "linkedin url", "linkedin profile"],
+    "portfolio": ["portfolio", "website", "personal site", "personal website", "url", "web site"],
+    "github": ["github", "git hub", "github url", "github profile"],
+    "cover_letter": ["cover letter", "why", "why do you want", "additional information", "comments", "note"],
+    "location": ["current location", "location", "city", "address", "state", "country", "zip"],
+    "salary": ["salary expectation", "expected salary", "compensation", "desired salary", "pay"],
+    "auth": ["authoriz", "work permit", "sponsorship", "legally authorized", "require sponsorship", "visa", "eligible to work"],
 }
 
 def _has_active_captcha(page) -> bool:
@@ -187,15 +187,16 @@ class PlaywrightSubmitter:
                         evidence_url=ctx.apply_url,
                     )
 
-                unfilled_required, filled = _fill_form(page, fields, ctx)
+                unfilled_required, filled, unfilled_labels = _fill_form(page, fields, ctx)
 
                 # If too many required fields are unanswered, bail out cleanly.
                 if unfilled_required > 3:
                     browser.close()
+                    label_summary = ", ".join(unfilled_labels[:4])
                     return SubmitResult(
                         outcome=SubmitOutcome.NEEDS_MANUAL,
                         method=self.method,
-                        error=f"unanswered_required_fields={unfilled_required}",
+                        error=f"unanswered_required_fields={unfilled_required} ({label_summary})",
                         evidence_url=ctx.apply_url,
                     )
 
@@ -307,10 +308,11 @@ def _extract_form_schema(page) -> list[dict[str, Any]]:
         return []
 
 
-def _fill_form(page, fields: list[dict[str, Any]], ctx: SubmitContext) -> tuple[int, int]:
-    """Fill each field we recognise. Returns (unfilled_required, filled_count)."""
+def _fill_form(page, fields: list[dict[str, Any]], ctx: SubmitContext) -> tuple[int, int, list[str]]:
+    """Fill each field we recognise. Returns (unfilled_required, filled_count, unfilled_labels)."""
     unfilled_required = 0
     filled = 0
+    unfilled_labels: list[str] = []
 
     for field in fields:
         selector = field.get("selector") or ""
@@ -336,6 +338,8 @@ def _fill_form(page, fields: list[dict[str, Any]], ctx: SubmitContext) -> tuple[
         if not value:
             if field.get("required"):
                 unfilled_required += 1
+                if label:
+                    unfilled_labels.append(label[:40])
             continue
 
         try:
@@ -345,6 +349,8 @@ def _fill_form(page, fields: list[dict[str, Any]], ctx: SubmitContext) -> tuple[
                 if target is None:
                     if field.get("required"):
                         unfilled_required += 1
+                        if label:
+                            unfilled_labels.append(label[:40])
                     continue
                 page.locator(selector).first.select_option(target, timeout=_ACTION_TIMEOUT_MS)
             elif field_type == "checkbox":
@@ -361,8 +367,10 @@ def _fill_form(page, fields: list[dict[str, Any]], ctx: SubmitContext) -> tuple[
             logger.debug("playwright.fill_field_failed", extra={"selector": selector, "err": str(exc)})
             if field.get("required"):
                 unfilled_required += 1
+                if label:
+                    unfilled_labels.append(label[:40])
 
-    return unfilled_required, filled
+    return unfilled_required, filled, unfilled_labels
 
 
 def _closest_option(value: str, options: list[str]) -> str | None:
