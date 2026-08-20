@@ -446,13 +446,34 @@ def _click_submit(page) -> bool:
 
 def _looks_confirmed(page, url: str) -> bool:
     """Heuristics for 'the site accepted the application.'"""
-    if any(k in (url or "").lower() for k in ("thank", "confirm", "submitted", "success")):
+    u = (url or "").lower()
+    if any(k in u for k in ("thank", "confirm", "submitted", "success", "done", "applied")):
         return True
     try:
         body = (page.inner_text("body") or "").lower()
     except Exception:
         body = ""
-    return bool(re.search(r"(thank you|application (received|submitted)|we[’']ve received)", body))
+    success_phrases = [
+        "thank you",
+        "thanks for applying",
+        "application submitted",
+        "application received",
+        "successfully submitted",
+        "we've received",
+        "we have received",
+        "application has been submitted",
+        "your application was sent",
+        "congratulations",
+    ]
+    if any(p in body for p in success_phrases):
+        return True
+    # If the submit button was removed/replaced after submission
+    try:
+        if page.locator('button[type="submit"], input[type="submit"]').count() == 0:
+            return True
+    except Exception:
+        pass
+    return bool(re.search(r"(thank you|application (received|submitted)|we[’']ve received|thanks)", body))
 
 
 submitter: AtsSubmitter = PlaywrightSubmitter()
