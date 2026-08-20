@@ -46,6 +46,7 @@ class SubmitResult:
     evidence_url: Optional[str] = None   # URL to confirmation page / stored screenshot
     external_reference: Optional[str] = None  # ATS-side application id, if returned
     error: Optional[str] = None          # populated when outcome != SUBMITTED
+    unfilled_questions: Optional[list[str]] = None  # list of question labels that were left unanswered
 
 
 class AtsSubmitter(Protocol):

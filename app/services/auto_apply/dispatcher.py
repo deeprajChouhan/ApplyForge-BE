@@ -157,12 +157,33 @@ def submit_application(app_id: int) -> Dict[str, Any]:
                     "external_reference": result.external_reference,
                 })
             elif result.outcome == SubmitOutcome.NEEDS_MANUAL:
-                ja.auto_apply_stage = "awaiting_review"
+                unfilled_q = getattr(result, "unfilled_questions", None)
+                if unfilled_q and len(unfilled_q) > 0:
+                    try:
+                        from app.services.answer_library.service import AnswerLibraryService
+                        ans_svc = AnswerLibraryService(db, ja.user_id)
+                        for q_text in unfilled_q:
+                            if q_text and len(str(q_text).strip()) > 1:
+                                ans_svc.upsert(
+                                    question_text=str(q_text).strip(),
+                                    answer_text="",
+                                    field_type="short_text",
+                                    source="unanswered_auto_apply",
+                                    tags="unanswered",
+                                )
+                    except Exception as err:
+                        logger.warning("dispatcher.add_unanswered_questions_failed", app_id=ja.id, error=str(err))
+
+                    ja.auto_apply_stage = "needs_answer"
+                else:
+                    ja.auto_apply_stage = "awaiting_review"
+
                 db.add(ja)
                 db.commit()
                 emit(db, ja.id, "submit_needs_manual", {
                     "submit_method": result.method,
                     "error": result.error,
+                    "unfilled_questions": unfilled_q or [],
                 })
             elif result.outcome == SubmitOutcome.FAILED:
                 ja.auto_apply_stage = "failed"
@@ -290,6 +311,18 @@ def _build_submit_context(db, ja):
     if location_str:
         extras["location"] = location_str
         extras["city"] = location_str
+
+    # Pre-populate user's Answer Library into extras for Playwright matching
+    try:
+        from app.services.answer_library.service import AnswerLibraryService
+        ans_svc = AnswerLibraryService(db, user.id)
+        saved_answers = ans_svc.list(limit=500)
+        for sa in saved_answers:
+            if sa.question_text and sa.answer_text and sa.answer_text.strip():
+                norm_key = AnswerLibraryService._normalize(sa.question_text)
+                extras[f"ans:{norm_key}"] = sa.answer_text.strip()
+    except Exception as err:
+        logger.debug("submit_context.load_answers_failed", error=str(err))
 
     return SubmitContext(
         apply_url=job.apply_url,

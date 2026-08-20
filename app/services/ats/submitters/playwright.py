@@ -366,6 +366,7 @@ def _fill_form(page, fields: list[dict[str, Any]], ctx: SubmitContext) -> tuple[
     unfilled_required = 0
     filled = 0
     unfilled_labels: list[str] = []
+    seen_radio_names: set[str] = set()
 
     for field in fields:
         selector = field.get("selector") or ""
@@ -374,10 +375,18 @@ def _fill_form(page, fields: list[dict[str, Any]], ctx: SubmitContext) -> tuple[
         field_type = (field.get("type") or "").lower()
         label = (field.get("label") or "").strip()
         label_lower = label.lower()
+        field_name = field.get("name") or ""
 
         # File inputs handled separately by resume-upload path.
         if field_type == "file":
             continue
+
+        # Radio button groups: group by name attribute to process the group once.
+        if field_type == "radio":
+            if field_name and field_name in seen_radio_names:
+                continue
+            if field_name:
+                seen_radio_names.add(field_name)
 
         canonical = _match_label(label)
         value = _profile_value(ctx, canonical) if canonical else None
@@ -405,7 +414,7 @@ def _fill_form(page, fields: list[dict[str, Any]], ctx: SubmitContext) -> tuple[
             elif field_type in ("text", "textarea"):
                 value = "N/A"
 
-        # If we don't have a value: for dropdown selects, attempt fallback option.
+        # If we don't have a value: for dropdown selects & radio groups, attempt fallback option.
         if not value:
             if field_type in ("select-one", "select"):
                 target = _closest_option("", field.get("options") or [])
@@ -416,6 +425,17 @@ def _fill_form(page, fields: list[dict[str, Any]], ctx: SubmitContext) -> tuple[
                         continue
                     except Exception:
                         pass
+            elif field_type == "radio" and field_name:
+                try:
+                    # Select last or first radio in the group for required radio question fallback
+                    radios = page.locator(f'input[type="radio"][name="{field_name}"]')
+                    if radios.count() > 0:
+                        radios.last.check(timeout=_ACTION_TIMEOUT_MS)
+                        filled += 1
+                        continue
+                except Exception:
+                    pass
+
             if field.get("required"):
                 unfilled_required += 1
                 if label:
@@ -438,8 +458,12 @@ def _fill_form(page, fields: list[dict[str, Any]], ctx: SubmitContext) -> tuple[
                 if str(value).strip().lower() in ("yes", "true", "1"):
                     page.locator(selector).first.check(timeout=_ACTION_TIMEOUT_MS)
             elif field_type == "radio":
-                # Radios come as a group — target the label with `value`.
-                page.locator(f'{selector}[value="{value}"]').first.check(timeout=_ACTION_TIMEOUT_MS)
+                # Try clicking radio by name group or selector
+                r_group = page.locator(f'input[type="radio"][name="{field_name}"]') if field_name else page.locator(selector)
+                if r_group.count() > 0:
+                    r_group.first.check(timeout=_ACTION_TIMEOUT_MS)
+                else:
+                    page.locator(selector).first.check(timeout=_ACTION_TIMEOUT_MS)
             else:
                 page.locator(selector).first.fill(str(value), timeout=_ACTION_TIMEOUT_MS)
             filled += 1
