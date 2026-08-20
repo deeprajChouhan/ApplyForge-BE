@@ -50,13 +50,15 @@ _LABEL_HEURISTICS: dict[str, list[str]] = {
     "email": ["email", "e-mail", "email address"],
     "phone": ["phone", "mobile", "telephone", "phone number", "contact number", "cell"],
     "linkedin": ["linkedin", "linked in", "linkedin url", "linkedin profile"],
-    "portfolio": ["portfolio", "website", "personal site", "personal website", "url", "web site"],
+    "portfolio": ["portfolio", "website", "personal site", "personal website", "url", "web site", "link"],
     "github": ["github", "git hub", "github url", "github profile"],
     "cover_letter": ["cover letter", "why", "why do you want", "additional information", "comments", "note"],
     "location": ["current location", "location", "city", "address", "state", "country", "zip"],
     "salary": ["salary expectation", "expected salary", "compensation", "desired salary", "pay"],
     "auth": ["authoriz", "work permit", "sponsorship", "legally authorized", "require sponsorship", "visa", "eligible to work"],
+    "experience": ["years of experience", "years experience", "experience"],
 }
+
 
 def _has_active_captcha(page) -> bool:
     """Check if an active, visible CAPTCHA widget or challenge frame is present.
@@ -109,6 +111,8 @@ def _profile_value(ctx: SubmitContext, key: str) -> str | None:
         return ctx.extras.get("location") or ctx.extras.get("city") or "Remote"
     if key == "country":
         return ctx.extras.get("country") or "United States"
+    if key == "experience":
+        return ctx.extras.get("experience") or "5"
     if key in ctx.extras:
         return ctx.extras[key]
     return None
@@ -246,10 +250,11 @@ class PlaywrightSubmitter:
                         error=None,
                     )
                 # No clear confirmation and some required fields missing — treat as manual.
+                labels_str = f": {', '.join(unfilled_labels)}" if unfilled_labels else ""
                 return SubmitResult(
                     outcome=SubmitOutcome.NEEDS_MANUAL,
                     method=self.method,
-                    error=f"no_confirmation_detected (filled={filled})",
+                    error=f"no_confirmation_detected (filled={filled}, unfilled={unfilled_required}{labels_str})",
                     evidence_url=final_url,
                 )
         except Exception as exc:
