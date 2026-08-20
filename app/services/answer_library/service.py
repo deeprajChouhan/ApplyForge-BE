@@ -17,7 +17,7 @@ from typing import Any, Optional
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models.answer import AnswerLibrary
+from app.models.answer import AnswerLibrary, FieldType
 from app.schemas.answer import AnswerLookupOut, AnswerSeedResult
 
 # TODO: RAGService (app.services.rag.service.RAGService) may already provide a
