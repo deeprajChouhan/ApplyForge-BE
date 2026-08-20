@@ -185,7 +185,21 @@ class PlaywrightSubmitter:
                         evidence_url=ctx.apply_url,
                     )
 
+                target_frame = page
                 fields = _extract_form_schema(page)
+                if not fields:
+                    for frame in page.frames:
+                        if frame == page:
+                            continue
+                        try:
+                            f_fields = _extract_form_schema(frame)
+                            if f_fields:
+                                fields = f_fields
+                                target_frame = frame
+                                break
+                        except Exception:
+                            continue
+
                 if not fields:
                     browser.close()
                     return SubmitResult(
@@ -195,7 +209,7 @@ class PlaywrightSubmitter:
                         evidence_url=ctx.apply_url,
                     )
 
-                unfilled_required, filled, unfilled_labels = _fill_form(page, fields, ctx)
+                unfilled_required, filled, unfilled_labels = _fill_form(target_frame, fields, ctx)
 
                 # If too many required fields are unanswered, bail out cleanly.
                 if unfilled_required > 3:
@@ -209,11 +223,11 @@ class PlaywrightSubmitter:
                     )
 
                 # Upload resume into a file input if one exists.
-                if not _try_upload_resume(page, ctx):
+                if not _try_upload_resume(target_frame, ctx):
                     logger.info("playwright.no_resume_input", extra={"url": ctx.apply_url})
 
                 # Click submit — best-effort selector chain.
-                submit_clicked = _click_submit(page)
+                submit_clicked = _click_submit(target_frame)
                 if not submit_clicked:
                     browser.close()
                     return SubmitResult(
