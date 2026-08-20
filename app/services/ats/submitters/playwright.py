@@ -201,6 +201,20 @@ class PlaywrightSubmitter:
                             continue
 
                 if not fields:
+                    import re
+                    match = re.search(r"gh_jid=(\d+)", ctx.apply_url)
+                    if match:
+                        gh_id = match.group(1)
+                        embed_url = f"https://boards.greenhouse.io/embed/job_app?token={gh_id}"
+                        logger.info("playwright.fallback_to_direct_greenhouse", extra={"url": embed_url})
+                        try:
+                            page.goto(embed_url, wait_until="networkidle", timeout=_NAV_TIMEOUT_MS)
+                            fields = _extract_form_schema(page)
+                            target_frame = page
+                        except Exception:
+                            pass
+
+                if not fields:
                     browser.close()
                     return SubmitResult(
                         outcome=SubmitOutcome.NEEDS_MANUAL,
