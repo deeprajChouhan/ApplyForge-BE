@@ -237,7 +237,7 @@ class PlaywrightSubmitter:
 
                 browser.close()
 
-                if confirmed:
+                if confirmed or (unfilled_required == 0 and filled >= 3):
                     return SubmitResult(
                         outcome=SubmitOutcome.SUBMITTED,
                         method=self.method,
@@ -245,7 +245,7 @@ class PlaywrightSubmitter:
                         external_reference=None,
                         error=None,
                     )
-                # No clear confirmation — treat as manual so the user reviews.
+                # No clear confirmation and some required fields missing — treat as manual.
                 return SubmitResult(
                     outcome=SubmitOutcome.NEEDS_MANUAL,
                     method=self.method,
