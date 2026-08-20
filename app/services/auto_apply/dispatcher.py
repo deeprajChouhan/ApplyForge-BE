@@ -42,18 +42,23 @@ def prepare_application(app_id: int) -> Dict[str, Any]:
             db.commit()
             emit(db, ja.id, "preparing")
 
+            # Analysis + document generation. Split into two try/except
+            # blocks so a failure in doc generation doesn't wipe out a
+            # successful JD analysis (or vice versa).
             try:
-                # Safe import — ApplicationsService lives in a module owned by
-                # another part of the codebase; signatures unverified here.
-                from app.services.applications.service import ApplicationsService
+                from app.services.applications.service import ApplicationService
 
-                svc = ApplicationsService(db, ja.user_id)
-                svc.analyze_jd(ja.id, ja.job_description)  # TODO: verify signature
-                svc.generate(ja.id, ["resume", "cover_letter"])  # TODO: verify signature
+                svc = ApplicationService(db, ja.user_id)
+                svc.analyze_jd(ja.id, ja.job_description)
             except Exception as exc:
-                # Non-fatal — mark generated_error but still move to awaiting_review
-                # so the user can intervene manually rather than the pipeline
-                # silently stalling.
+                emit(db, ja.id, "analysis_error", {"error": str(exc)})
+
+            try:
+                from app.services.applications.service import ApplicationService
+
+                svc = ApplicationService(db, ja.user_id)
+                svc.generate_docs(ja.id, ["resume", "cover_letter"])
+            except Exception as exc:
                 emit(db, ja.id, "generation_error", {"error": str(exc)})
 
             settings = (
