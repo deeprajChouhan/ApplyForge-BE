@@ -154,13 +154,17 @@ def update_document(
     # scoped to user.id, so a wrong owner surfaces as 404).
     ApplicationService(db, user.id).get(app_id)  # raises 404 if not owned
 
+    # No `is_current` flag on GeneratedDocument — the highest non-deleted
+    # version is the active one. Editing that row in place keeps the
+    # current-documents endpoint's answer consistent without a version bump.
     doc = (
         db.query(GeneratedDocument)
         .filter(
             GeneratedDocument.application_id == app_id,
             GeneratedDocument.doc_type == dt,
-            GeneratedDocument.is_current.is_(True),
+            GeneratedDocument.deleted_at.is_(None),
         )
+        .order_by(GeneratedDocument.version.desc())
         .first()
     )
     if doc is None:

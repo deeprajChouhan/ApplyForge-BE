@@ -227,13 +227,16 @@ def _build_submit_context(db, ja):
         logger.warning("submit.resume_download_failed", app_id=ja.id, error=str(exc))
         return None
 
+    # GeneratedDocument uses `version` (no is_current flag) — highest
+    # version that hasn't been soft-deleted is the active one.
     cover_doc = (
         db.query(GeneratedDocument)
         .filter(
             GeneratedDocument.application_id == ja.id,
             GeneratedDocument.doc_type == DocumentType.cover_letter,
-            GeneratedDocument.is_current.is_(True),
+            GeneratedDocument.deleted_at.is_(None),
         )
+        .order_by(GeneratedDocument.version.desc())
         .first()
     )
 
