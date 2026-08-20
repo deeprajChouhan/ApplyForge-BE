@@ -207,6 +207,7 @@ class PlaywrightSubmitter:
                         method=self.method,
                         error=f"unanswered_required_fields={unfilled_required} ({label_summary})",
                         evidence_url=ctx.apply_url,
+                        unfilled_questions=unfilled_labels,
                     )
 
                 # Upload resume into a file input if one exists.
@@ -425,16 +426,17 @@ def _fill_form(page, fields: list[dict[str, Any]], ctx: SubmitContext) -> tuple[
                         continue
                     except Exception:
                         pass
-            elif field_type == "radio" and field_name:
+            elif field_type == "radio":
                 try:
-                    # Select last or first radio in the group for required radio question fallback
-                    radios = page.locator(f'input[type="radio"][name="{field_name}"]')
+                    import json
+                    r_sel = f'input[type="radio"][name={json.dumps(field_name)}]' if field_name else selector
+                    radios = page.locator(r_sel)
                     if radios.count() > 0:
-                        radios.last.check(timeout=_ACTION_TIMEOUT_MS)
+                        radios.first.check(timeout=_ACTION_TIMEOUT_MS)
                         filled += 1
                         continue
-                except Exception:
-                    pass
+                except Exception as r_err:
+                    logger.debug("playwright.radio_fallback_failed", extra={"err": str(r_err)})
 
             if field.get("required"):
                 unfilled_required += 1
