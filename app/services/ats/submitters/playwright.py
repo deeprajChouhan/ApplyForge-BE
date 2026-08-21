@@ -429,7 +429,8 @@ def _fill_form(page, fields: list[dict[str, Any]], ctx: SubmitContext) -> tuple[
             value = ctx.extras.get("travel") or "Yes"
 
         # Open-ended / custom questions: invoke AI generation using applicant profile + job description
-        if not value and label and field_type in ("text", "textarea", "short_text", "long_text"):
+        is_security_field = any(s in label_lower for s in ("recaptcha", "captcha", "csrf", "turnstile", "hcaptcha", "token", "hidden"))
+        if not value and label and not is_security_field and field_type in ("text", "textarea", "short_text", "long_text"):
             try:
                 user_id = ctx.extras.get("user_id")
                 if user_id:
