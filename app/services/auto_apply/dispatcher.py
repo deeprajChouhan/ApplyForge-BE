@@ -157,6 +157,38 @@ def submit_application(app_id: int) -> Dict[str, Any]:
                     "external_reference": result.external_reference,
                 })
             elif result.outcome == SubmitOutcome.NEEDS_MANUAL:
+                if result.error in ("no_submit_button", "no_form_detected"):
+                    from app.models.enums import ApplicationStatus
+                    from app.models.models import ApplicationStatusHistory
+
+                    old_status = ja.status
+                    ja.auto_apply_stage = "failed"
+                    ja.status = ApplicationStatus.archived
+
+                    try:
+                        from app.models.job import Job
+                        job = db.get(Job, ja.job_id)
+                        if job:
+                            job.is_active = False
+                            db.add(job)
+                            logger.info("dispatcher.deactivate_closed_job", job_id=ja.job_id, app_id=ja.id, reason=result.error)
+                    except Exception as err:
+                        logger.warning("dispatcher.deactivate_closed_job_failed", job_id=ja.job_id, error=str(err))
+
+                    db.add(ApplicationStatusHistory(
+                        application_id=ja.id,
+                        old_status=old_status,
+                        new_status=ApplicationStatus.archived,
+                        note=f"Auto-apply failed: Job closed ({result.error})",
+                    ))
+                    db.add(ja)
+                    db.commit()
+                    emit(db, ja.id, "submit_failed", {
+                        "submit_method": result.method,
+                        "error": result.error,
+                    })
+                    return {"app_id": app_id, "stage": ja.auto_apply_stage, "outcome": "failed"}
+
                 unfilled_q = getattr(result, "unfilled_questions", None)
                 if unfilled_q and len(unfilled_q) > 0:
                     try:
@@ -177,16 +209,6 @@ def submit_application(app_id: int) -> Dict[str, Any]:
                     ja.auto_apply_stage = "needs_answer"
                 else:
                     ja.auto_apply_stage = "awaiting_review"
-                    if result.error in ("no_submit_button", "no_form_detected"):
-                        try:
-                            from app.models.job import Job
-                            job = db.get(Job, ja.job_id)
-                            if job:
-                                job.is_active = False
-                                db.add(job)
-                                logger.info("dispatcher.deactivate_closed_job", job_id=ja.job_id, app_id=ja.id, reason=result.error)
-                        except Exception as err:
-                            logger.warning("dispatcher.deactivate_closed_job_failed", job_id=ja.job_id, error=str(err))
 
                 db.add(ja)
                 db.commit()
