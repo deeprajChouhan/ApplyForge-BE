@@ -17,8 +17,12 @@ from typing import Any, Optional
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+import structlog
+
 from app.models.answer import AnswerLibrary, FieldType
 from app.schemas.answer import AnswerLookupOut, AnswerSeedResult
+
+logger = structlog.get_logger(__name__)
 
 # TODO: RAGService (app.services.rag.service.RAGService) may already provide a
 # reusable embedding helper -- if so, prefer wiring this service to that
@@ -456,7 +460,7 @@ class AnswerLibraryService:
                 "Answer:"
             )
 
-            generated_text = llm.generate(prompt=user_prompt, system_prompt=system_prompt).strip()
+            generated_text = llm.generate(system_prompt=system_prompt, user_prompt=user_prompt).strip()
             if (generated_text.startswith('"') and generated_text.endswith('"')) or (generated_text.startswith("'") and generated_text.endswith("'")):
                 generated_text = generated_text[1:-1].strip()
 

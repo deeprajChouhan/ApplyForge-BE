@@ -446,7 +446,7 @@ def _fill_form(page, fields: list[dict[str, Any]], ctx: SubmitContext) -> tuple[
                         if ai_answer:
                             value = ai_answer
             except Exception as ai_err:
-                logger.warning("playwright.ai_generation_failed", label=label, error=str(ai_err))
+                logger.warning(f"playwright.ai_generation_failed for label {label}: {ai_err}")
 
         # General fallbacks for required text / URL fields if missing from profile
         if not value and field.get("required"):
