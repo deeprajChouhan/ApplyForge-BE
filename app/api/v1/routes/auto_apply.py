@@ -155,7 +155,10 @@ def get_queue(
     )
 
     if stage:
-        query = query.filter(JobApplication.auto_apply_stage == stage)
+        if stage == "declined":
+            query = query.filter(JobApplication.auto_apply_stage == "failed")
+        else:
+            query = query.filter(JobApplication.auto_apply_stage == stage)
 
     if cursor:
         cur_updated_at, cur_id = _decode_cursor(cursor)
@@ -193,6 +196,8 @@ def get_queue(
         .all()
     )
     counts: Dict[str, int] = {stage_name: count for stage_name, count in counts_rows}
+    if "failed" in counts:
+        counts["declined"] = counts.get("declined", 0) + counts["failed"]
 
     # Build items explicitly — the ORM field is `id` but the API contract
     # exposes it as `application_id`, so a bare model_validate would fail.
@@ -207,7 +212,9 @@ def get_queue(
                 if isinstance(row.match_reasons_json, list)
                 else None
             ),
-            auto_apply_stage=row.auto_apply_stage,
+            auto_apply_stage=(
+                "declined" if row.auto_apply_stage == "failed" else row.auto_apply_stage
+            ),
             updated_at=row.updated_at,
             apply_url=None,  # TODO: join to jobs table to surface job.apply_url
             job_id=row.job_id,
