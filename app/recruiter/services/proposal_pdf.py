@@ -161,6 +161,64 @@ def _market_table(role: Role, styles: dict[str, ParagraphStyle]) -> Table | None
     return tbl
 
 
+def _key_facts(role: Role, client: Client | None) -> list[tuple[str, str]]:
+    """Two-column (label, value) rows to render as a compact facts table."""
+    facts: list[tuple[str, str]] = []
+    if client is not None and getattr(client, "name", None):
+        facts.append(("Client", client.name))
+    if role.seniority:
+        facts.append(("Seniority", role.seniority))
+    if role.employment_type is not None:
+        et = (
+            role.employment_type.value
+            if hasattr(role.employment_type, "value")
+            else str(role.employment_type)
+        )
+        facts.append(("Employment type", et.replace("_", " ")))
+    if role.location:
+        facts.append(("Location", role.location))
+    if role.min_years_experience is not None:
+        facts.append(("Minimum experience", f"{role.min_years_experience:g}+ yrs"))
+    if role.salary_min or role.salary_max:
+        cur = role.budget_currency or "USD"
+        facts.append(
+            (
+                "Salary band",
+                f"{cur} {(role.salary_min or 0):,} – {(role.salary_max or 0):,}",
+            )
+        )
+    return facts
+
+
+def _facts_table(facts: list[tuple[str, str]], styles: dict[str, ParagraphStyle]) -> Table:
+    # Two facts per row so the section stays compact.
+    rows: list[list[Paragraph]] = []
+    for i in range(0, len(facts), 2):
+        left = facts[i]
+        right = facts[i + 1] if i + 1 < len(facts) else ("", "")
+        rows.append(
+            [
+                Paragraph(f"<b>{left[0]}</b>", styles["label"]),
+                Paragraph(left[1], styles["body"]),
+                Paragraph(f"<b>{right[0]}</b>" if right[0] else "", styles["label"]),
+                Paragraph(right[1], styles["body"]),
+            ]
+        )
+    tbl = Table(rows, colWidths=[3.5 * cm, 4.5 * cm, 3.5 * cm, 4.5 * cm])
+    tbl.setStyle(
+        TableStyle(
+            [
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+                ("TOPPADDING", (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ]
+        )
+    )
+    return tbl
+
+
 def render_role_proposal_pdf(
     role: Role, agency: Agency, client: Client | None = None
 ) -> bytes:
