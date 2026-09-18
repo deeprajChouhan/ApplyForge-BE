@@ -126,17 +126,35 @@ class S3StorageService:
     # ── Bucket bootstrap ─────────────────────────────────────────────────────
 
     def _ensure_bucket(self) -> None:
-        """Verify the bucket is reachable; warn loudly if not (SeaweedFS
-        requires buckets to be created via the filer, not the S3 API)."""
+        """Verify the bucket is reachable; auto-create it on backends that
+        support the S3 CreateBucket API (MinIO, AWS S3). SeaweedFS rejects
+        S3-side create — we log a hint in that case and keep going so the
+        service still boots.
+        """
         try:
             self.client.head_bucket(Bucket=self.bucket)
             logger.debug("s3_bucket_exists bucket=%s", self.bucket)
-        except Exception as exc:
+            return
+        except Exception as head_exc:
+            logger.info(
+                "s3_bucket_missing bucket=%s error=%s — attempting create",
+                self.bucket, head_exc,
+            )
+        try:
+            self.client.create_bucket(Bucket=self.bucket)
+            logger.info("s3_bucket_created bucket=%s", self.bucket)
+        except Exception as create_exc:
+            # Already-exists races are fine; a real failure is logged and
+            # the app continues to boot so uploads can surface the reason.
+            msg = str(create_exc)
+            if "BucketAlreadyOwnedByYou" in msg or "BucketAlreadyExists" in msg:
+                logger.info("s3_bucket_already_present bucket=%s", self.bucket)
+                return
             logger.error(
-                "s3_bucket_missing bucket=%s error=%s — "
-                "Create it via the SeaweedFS filer: "
+                "s3_bucket_create_failed bucket=%s error=%s — "
+                "on SeaweedFS, create it via the filer: "
                 "curl -X POST http://<filer-host>:8888/buckets/%s/",
-                self.bucket, exc, self.bucket,
+                self.bucket, create_exc, self.bucket,
             )
 
     # ── Core ────────────────────────────────────────────────────────────────
