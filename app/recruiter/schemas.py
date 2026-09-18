@@ -770,6 +770,32 @@ class PublicShortlistCandidate(BaseModel):
     top_skills: list[str]
 
 
+class PublicCandidateExperience(BaseModel):
+    """Client-safe experience row — no ids or internal metadata."""
+    title: str | None = None
+    company: str | None = None
+    start_date: date | None = None
+    end_date: date | None = None
+    description: str | None = None
+
+
+class PublicCandidateDetail(BaseModel):
+    """Full client-facing candidate profile served through the share link.
+
+    Deliberately excludes email, phone, expected budget, source file, and any
+    provisioning ids — the public page is boardroom-safe and free of PII.
+    """
+    candidate_id: int
+    display_name: str
+    headline: str | None = None
+    location: str | None = None
+    years_experience: float | None = None
+    fit_score: float
+    summary: str | None = None
+    skills: list[str] = Field(default_factory=list)
+    experiences: list[PublicCandidateExperience] = Field(default_factory=list)
+
+
 class PublicRoleView(BaseModel):
     """Client-safe payload — no candidate PII, no client budget internals."""
     role_id: int

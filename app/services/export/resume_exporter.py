@@ -270,459 +270,451 @@ class _ResumeData:
         self.certifications = certifications
 
 
-# ── PDF export ─────────────────────────────────────────────────────────────
+# ── Template-driven renderers ──────────────────────────────────────────────
+#
+# Both the PDF and DOCX renderers consume the SAME ResolvedTemplate
+# (from ResumeTemplateResolver). The template's config_json decides:
+#   - which sections appear and in what order (config.sections)
+#   - typography (config.styles.font_family, body/heading sizes, line_height)
+#   - margins (config.styles.margin_*)
+#   - accent color and header alignment
+#   - layout family (single_column | two_column | centered)
+#
+# The old hardcoded "Classic ATS" defaults are gone — the classic look is
+# just the config a ResumeTemplate seeded with base_template='classic' carries.
 
-def _build_pdf(data: _ResumeData) -> bytes:
-    """
-    ATS-optimised single-column PDF resume.
+from app.services.templates.resolver import ResolvedTemplate
 
-    Design principles:
-    - Single column only — multi-column trips up most ATS parsers
-    - Standard section names (Professional Summary, Skills, Work Experience…)
-    - Plain text bullets — no Unicode trickery
-    - Dates right-aligned via a two-cell table (safest cross-renderer approach)
-    - Skills rendered as comma-separated text (ATS reads prose, not grids)
-    - No images, no text boxes, no headers/footers
-    - Helvetica throughout (universal, renders identically on all platforms)
-    """
+
+# Section-key → renderer callable
+def _section_renderer_map_pdf(data, styles, template, story_add, S):
+    return {
+        "header":         lambda: _pdf_header(data, styles, template, story_add, S),
+        "summary":        lambda: _pdf_summary(data, styles, template, story_add, S),
+        "skills":         lambda: _pdf_skills(data, styles, template, story_add, S),
+        "experience":     lambda: _pdf_experience(data, styles, template, story_add, S),
+        "projects":       lambda: _pdf_projects(data, styles, template, story_add, S),
+        "education":      lambda: _pdf_education(data, styles, template, story_add, S),
+        "certifications": lambda: _pdf_certifications(data, styles, template, story_add, S),
+    }
+
+
+def _pdf_font_family(styles: dict) -> tuple[str, str, str]:
+    """Return (regular, bold, italic) reportlab font names for a config family."""
+    fam = (styles.get("font_family") or "").strip().lower()
+    if fam in ("times", "times new roman", "georgia", "serif"):
+        return "Times-Roman", "Times-Bold", "Times-Italic"
+    if fam in ("courier", "mono", "monospace"):
+        return "Courier", "Courier-Bold", "Courier-Oblique"
+    # Inter and any other sans → Helvetica (ReportLab core font)
+    return "Helvetica", "Helvetica-Bold", "Helvetica-Oblique"
+
+
+def _section_label(template: ResolvedTemplate, key: str, fallback: str) -> str:
+    for s in template.config.get("sections", []):
+        if s.get("key") == key:
+            lbl = s.get("label")
+            if isinstance(lbl, str) and lbl.strip():
+                return lbl
+    return fallback
+
+
+def _enabled_sections_in_order(template: ResolvedTemplate) -> list[str]:
+    secs = [s for s in template.config.get("sections", []) if s.get("enabled")]
+    secs.sort(key=lambda s: s.get("order", 999))
+    return [s["key"] for s in secs]
+
+
+# ── PDF ────────────────────────────────────────────────────────────────────
+
+def _build_pdf(data: "_ResumeData", template: ResolvedTemplate) -> bytes:
     from reportlab.lib import colors
-    from reportlab.lib.enums import TA_LEFT, TA_RIGHT, TA_JUSTIFY
+    from reportlab.lib.enums import TA_LEFT, TA_RIGHT, TA_JUSTIFY, TA_CENTER
     from reportlab.lib.pagesizes import letter
     from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-    from reportlab.lib.units import inch, mm
     from reportlab.platypus import (
-        HRFlowable,
-        Paragraph,
-        SimpleDocTemplate,
-        Spacer,
-        Table,
-        TableStyle,
-        KeepTogether,
+        HRFlowable, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle,
     )
 
-    # ── Dimensions ──────────────────────────────────────────────────────
-    PAGE_W, PAGE_H = letter           # 8.5 × 11 in
-    L_MAR = R_MAR = 0.65 * inch
-    T_MAR = B_MAR = 0.55 * inch
-    CONTENT_W = PAGE_W - L_MAR - R_MAR   # ≈ 7.2 in
+    styles = template.config.get("styles", {})
+    regular, bold, italic = _pdf_font_family(styles)
+    accent = colors.HexColor(styles.get("accent_color") or "#1D4ED8")
+    dark   = colors.HexColor("#0F172A")
+    body_c = colors.HexColor("#1E293B")
+    mid    = colors.HexColor("#475569")
+    light  = colors.HexColor("#64748B")
 
+    body_size    = float(styles.get("body_font_size", 10))
+    head_size    = float(styles.get("heading_font_size", 12))
+    lh_ratio     = float(styles.get("line_height", 1.35))
+    sec_spacing  = float(styles.get("section_spacing", 8))
+    m_t          = float(styles.get("margin_top", 40))
+    m_b          = float(styles.get("margin_bottom", 40))
+    m_l          = float(styles.get("margin_left", 46))
+    m_r          = float(styles.get("margin_right", 46))
+    header_align = styles.get("header_style", "left")
+
+    PAGE_W, PAGE_H = letter
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
         buf, pagesize=letter,
-        leftMargin=L_MAR, rightMargin=R_MAR,
-        topMargin=T_MAR, bottomMargin=B_MAR,
+        leftMargin=m_l, rightMargin=m_r,
+        topMargin=m_t, bottomMargin=m_b,
     )
 
-    # ── Colour palette ───────────────────────────────────────────────────
-    C_ACCENT  = colors.HexColor("#1D4ED8")   # strong blue  — section headers / company
-    C_DARK    = colors.HexColor("#0F172A")   # near-black   — name, job titles
-    C_BODY    = colors.HexColor("#1E293B")   # slate-900    — body text
-    C_MID     = colors.HexColor("#475569")   # slate-600    — bullets, dates
-    C_LIGHT   = colors.HexColor("#64748B")   # slate-500    — secondary labels
-    C_RULE    = colors.HexColor("#CBD5E1")   # slate-300    — dividers
-    C_ACCENT_RULE = colors.HexColor("#1D4ED8")
-
-    # ── Style factory ────────────────────────────────────────────────────
     _base = getSampleStyleSheet()["Normal"]
+
     def S(name, **kw):
         return ParagraphStyle(name, parent=_base, **kw)
 
-    # Header block
-    sty_name = S("RName",
-        fontName="Helvetica-Bold", fontSize=24, leading=29,
-        textColor=C_DARK, spaceAfter=1)
-    sty_headline = S("RHead",
-        fontName="Helvetica", fontSize=11, leading=15,
-        textColor=C_ACCENT, spaceAfter=3)
-    sty_contact = S("RContact",
-        fontName="Helvetica", fontSize=9, leading=13,
-        textColor=C_LIGHT, spaceAfter=0)
+    style_pack = {
+        "name":     S("N", fontName=bold, fontSize=head_size * 1.8, leading=head_size * 2.2,
+                       textColor=dark, alignment=TA_CENTER if header_align == "centered" else TA_LEFT),
+        "headline": S("H", fontName=regular, fontSize=body_size + 1, leading=(body_size + 1) * lh_ratio,
+                       textColor=accent, alignment=TA_CENTER if header_align == "centered" else TA_LEFT),
+        "contact":  S("C", fontName=regular, fontSize=body_size - 1, leading=(body_size - 1) * lh_ratio,
+                       textColor=light, alignment=TA_CENTER if header_align == "centered" else TA_LEFT),
+        "sec":      S("Sec", fontName=bold, fontSize=head_size, leading=head_size * 1.2,
+                       textColor=accent, spaceBefore=sec_spacing, spaceAfter=2),
+        "body":     S("B", fontName=regular, fontSize=body_size, leading=body_size * lh_ratio,
+                       textColor=body_c, alignment=TA_JUSTIFY),
+        "bullet":   S("Bul", fontName=regular, fontSize=body_size, leading=body_size * lh_ratio,
+                       textColor=body_c, leftIndent=14, spaceAfter=1.5),
+        "role":     S("R", fontName=bold, fontSize=body_size + 0.5, leading=(body_size + 0.5) * lh_ratio,
+                       textColor=dark),
+        "company":  S("Co", fontName=italic, fontSize=body_size, leading=body_size * lh_ratio,
+                       textColor=accent),
+        "date":     S("D", fontName=regular, fontSize=body_size - 1, leading=(body_size - 1) * lh_ratio,
+                       textColor=mid, alignment=TA_RIGHT),
+        "sub":      S("Sub", fontName=italic, fontSize=body_size, leading=body_size * lh_ratio,
+                       textColor=mid),
+        "accent":   accent,
+        "rule":     colors.HexColor("#CBD5E1"),
+    }
 
-    # Section headings — bold caps with a rule drawn below via HRFlowable
-    sty_sec = S("RSec",
-        fontName="Helvetica-Bold", fontSize=8.5, leading=11,
-        textColor=C_ACCENT_RULE, spaceBefore=10, spaceAfter=2,
-        letterSpacing=1.2)
+    story: list = []
+    add = story.append
 
-    # Summary
-    sty_summary = S("RSum",
-        fontName="Helvetica", fontSize=9.5, leading=14.5,
-        textColor=C_BODY, alignment=TA_JUSTIFY, spaceAfter=2)
+    def rule(color=None, thickness=1.0):
+        add(HRFlowable(width="100%", thickness=thickness,
+                       color=color or style_pack["accent"], spaceAfter=4))
 
-    # Skills — plain paragraph, ATS-friendly
-    sty_skills = S("RSkills",
-        fontName="Helvetica", fontSize=9.5, leading=14.5,
-        textColor=C_BODY, spaceAfter=2)
+    def section_head(label: str):
+        add(Paragraph(label.upper(), style_pack["sec"]))
+        rule()
 
-    # Experience
-    sty_role = S("RRole",
-        fontName="Helvetica-Bold", fontSize=10.5, leading=14,
-        textColor=C_DARK, spaceAfter=0)
-    sty_company = S("RCo",
-        fontName="Helvetica-Oblique", fontSize=9.5, leading=13,
-        textColor=C_ACCENT, spaceAfter=1)
-    sty_date = S("RDate",
-        fontName="Helvetica", fontSize=9, leading=12,
-        textColor=C_MID, alignment=TA_RIGHT)
-    sty_bullet = S("RBullet",
-        fontName="Helvetica", fontSize=9.5, leading=14,
-        textColor=C_BODY,
-        leftIndent=14, firstLineIndent=0,
-        spaceAfter=1.5, spaceBefore=0)
+    renderers = {
+        "header":         lambda: _pdf_header(data, style_pack, template, add, rule),
+        "summary":        lambda: _pdf_simple(data.summary, "summary", template, style_pack, add, section_head),
+        "skills":         lambda: _pdf_skills(data, style_pack, template, add, section_head),
+        "experience":     lambda: _pdf_experience(data, style_pack, template, add, section_head),
+        "projects":       lambda: _pdf_projects(data, style_pack, template, add, section_head),
+        "education":      lambda: _pdf_education(data, style_pack, template, add, section_head),
+        "certifications": lambda: _pdf_certifications(data, style_pack, template, add, section_head),
+    }
 
-    # Projects
-    sty_proj_name = S("RProjName",
-        fontName="Helvetica-Bold", fontSize=10, leading=13,
-        textColor=C_DARK, spaceAfter=1, spaceBefore=4)
-    sty_proj_desc = S("RProjDesc",
-        fontName="Helvetica", fontSize=9.5, leading=14,
-        textColor=C_MID, spaceAfter=2, alignment=TA_JUSTIFY)
-
-    # Education / Certs
-    sty_inst = S("RInst",
-        fontName="Helvetica-Bold", fontSize=10.5, leading=14,
-        textColor=C_DARK, spaceAfter=0)
-    sty_degree = S("RDeg",
-        fontName="Helvetica-Oblique", fontSize=9.5, leading=13,
-        textColor=C_MID, spaceAfter=4)
-    sty_cert = S("RCert",
-        fontName="Helvetica", fontSize=9.5, leading=14,
-        textColor=C_BODY, spaceAfter=2)
-
-    # ── Helpers ──────────────────────────────────────────────────────────
-    def accent_rule():
-        """Thin blue rule under section headings."""
-        return HRFlowable(
-            width="100%", thickness=1.2,
-            color=C_ACCENT_RULE, spaceAfter=5, spaceBefore=0,
-        )
-
-    def light_rule():
-        """Very faint separator between experience entries."""
-        return HRFlowable(
-            width="100%", thickness=0.4,
-            color=C_RULE, spaceAfter=5, spaceBefore=4,
-        )
-
-    def section(title: str):
-        return [Paragraph(title.upper(), sty_sec), accent_rule()]
-
-    def exp_header(role: str, company: str, period: str) -> Table:
-        """Role + company on left, date on right — kept in one line."""
-        role_para    = Paragraph(role, sty_role)
-        company_para = Paragraph(company, sty_company)
-        date_para    = Paragraph(period, sty_date)
-        tbl = Table(
-            [[role_para, date_para],
-             [company_para, ""]],
-            colWidths=[CONTENT_W * 0.72, CONTENT_W * 0.28],
-        )
-        tbl.setStyle(TableStyle([
-            ("VALIGN",        (0, 0), (-1, -1), "TOP"),
-            ("LEFTPADDING",   (0, 0), (-1, -1), 0),
-            ("RIGHTPADDING",  (0, 0), (-1, -1), 0),
-            ("TOPPADDING",    (0, 0), (-1, -1), 0),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
-        ]))
-        return tbl
-
-    def edu_header(institution: str, period: str) -> Table:
-        tbl = Table(
-            [[Paragraph(institution, sty_inst), Paragraph(period, sty_date)]],
-            colWidths=[CONTENT_W * 0.72, CONTENT_W * 0.28],
-        )
-        tbl.setStyle(TableStyle([
-            ("VALIGN",        (0, 0), (-1, -1), "TOP"),
-            ("LEFTPADDING",   (0, 0), (-1, -1), 0),
-            ("RIGHTPADDING",  (0, 0), (-1, -1), 0),
-            ("TOPPADDING",    (0, 0), (-1, -1), 0),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
-        ]))
-        return tbl
-
-    def bullet_para(text: str) -> Paragraph:
-        """Bullet with a real en-dash leader — ATS reads the plain text fine."""
-        return Paragraph(f"&#x2022;&#160;&#160;{text}", sty_bullet)
-
-    # ── Build story ──────────────────────────────────────────────────────
-    story = []
-
-    # ── NAME ────────────────────────────────────────────────────────────
-    story.append(Paragraph(data.full_name or "Resume", sty_name))
-    if data.headline:
-        story.append(Paragraph(data.headline, sty_headline))
-
-    # Contact line — email · location (pipe-separated for ATS)
-    contact_parts = []
-    if data.email:
-        contact_parts.append(data.email)
-    if data.location:
-        contact_parts.append(data.location)
-    if contact_parts:
-        story.append(Paragraph("  |  ".join(contact_parts), sty_contact))
-
-    # Thick accent rule under the header block
-    story.append(Spacer(1, 4))
-    story.append(HRFlowable(
-        width="100%", thickness=2, color=C_ACCENT,
-        spaceAfter=8, spaceBefore=0,
-    ))
-
-    # ── PROFESSIONAL SUMMARY ─────────────────────────────────────────────
-    if data.summary:
-        story += section("Professional Summary")
-        story.append(Paragraph(data.summary, sty_summary))
-        story.append(Spacer(1, 4))
-
-    # ── SKILLS ──────────────────────────────────────────────────────────
-    if data.skills:
-        story += section("Skills")
-        # Comma-separated — every ATS parser can read this perfectly
-        skill_names = [s["name"] for s in data.skills if s.get("name")]
-        story.append(Paragraph(", ".join(skill_names), sty_skills))
-        story.append(Spacer(1, 4))
-
-    # ── WORK EXPERIENCE ──────────────────────────────────────────────────
-    if data.experiences:
-        story += section("Work Experience")
-        for i, exp in enumerate(data.experiences):
-            role    = exp.get("role") or ""
-            company = exp.get("company") or ""
-            start   = _fmt_date(exp.get("start_date"))
-            end     = _fmt_date(exp.get("end_date"))
-            period  = f"{start} \u2013 {end}"
-            bullets = _bullets(exp.get("description"), 6)
-
-            block = [exp_header(role, company, period)]
-            for b in bullets:
-                block.append(bullet_para(b))
-            if i < len(data.experiences) - 1:
-                block.append(light_rule())
-            else:
-                block.append(Spacer(1, 6))
-            story.append(KeepTogether(block))
-
-    # ── PROJECTS ────────────────────────────────────────────────────────
-    if data.projects:
-        story += section("Projects & Others")
-        for proj in data.projects:
-            name = proj.get("name") or ""
-            tech = proj.get("technologies") or ""
-            desc = proj.get("description") or ""
-            tech_str = f" <font color='#1D4ED8'><i>| {tech}</i></font>" if tech else ""
-            block = [Paragraph(f"{name}{tech_str}", sty_proj_name)]
-            if desc:
-                block.append(Paragraph(desc, sty_proj_desc))
-            story.append(KeepTogether(block))
-        story.append(Spacer(1, 4))
-
-    # ── EDUCATION ────────────────────────────────────────────────────────
-    if data.educations:
-        story += section("Education")
-        for edu in data.educations:
-            institution = edu.get("institution") or ""
-            degree      = edu.get("degree") or ""
-            field       = edu.get("field_of_study") or ""
-            start       = _fmt_date(edu.get("start_date"))
-            end         = _fmt_date(edu.get("end_date"))
-            degree_line = ", ".join(filter(None, [degree, field]))
-            period      = f"{start} \u2013 {end}"
-            block = [edu_header(institution, period)]
-            if degree_line:
-                block.append(Paragraph(degree_line, sty_degree))
-            story.append(KeepTogether(block))
-        story.append(Spacer(1, 4))
-
-    # ── CERTIFICATIONS ───────────────────────────────────────────────────
-    if data.certifications:
-        story += section("Certifications")
-        for cert in data.certifications:
-            name   = cert.get("name") or ""
-            issuer = cert.get("issuer") or ""
-            issued = _fmt_date(cert.get("issue_date"))
-            line_parts = [f"<b>{name}</b>"]
-            if issuer:
-                line_parts.append(issuer)
-            if cert.get("issue_date"):
-                line_parts.append(issued)
-            story.append(Paragraph(" — ".join(line_parts), sty_cert))
+    for key in _enabled_sections_in_order(template):
+        fn = renderers.get(key)
+        if fn:
+            fn()
 
     doc.build(story)
     return buf.getvalue()
 
 
-# ── DOCX export ────────────────────────────────────────────────────────────
+def _pdf_header(data, sp, template, add, rule):
+    from reportlab.platypus import Paragraph, Spacer
+    add(Paragraph(data.full_name or "Resume", sp["name"]))
+    if data.headline:
+        add(Paragraph(data.headline, sp["headline"]))
+    contact = "  ·  ".join([p for p in [data.email, data.location] if p])
+    if contact:
+        add(Paragraph(contact, sp["contact"]))
+    add(Spacer(1, 4))
 
-def _build_docx(data: _ResumeData) -> bytes:
+
+def _pdf_simple(text, key, template, sp, add, section_head):
+    from reportlab.platypus import Paragraph
+    if not text:
+        return
+    section_head(_section_label(template, key, "Professional Summary"))
+    add(Paragraph(text, sp["body"]))
+
+
+def _pdf_skills(data, sp, template, add, section_head):
+    from reportlab.platypus import Paragraph
+    if not data.skills:
+        return
+    section_head(_section_label(template, "skills", "Skills"))
+    names = [f"{s['name']} ({s['level']})" if s.get("level") else s["name"] for s in data.skills]
+    add(Paragraph("  ·  ".join(names), sp["body"]))
+
+
+def _pdf_experience(data, sp, template, add, section_head):
+    from reportlab.platypus import Paragraph, Spacer, Table, TableStyle
+    if not data.experiences:
+        return
+    section_head(_section_label(template, "experience", "Work Experience"))
+    for e in data.experiences:
+        role = e.get("role", "")
+        company = e.get("company", "")
+        start = _fmt_date(e.get("start_date"))
+        end = _fmt_date(e.get("end_date"))
+        left = Paragraph(f"<b>{role}</b>  —  <i>{company}</i>", sp["role"])
+        right = Paragraph(f"{start} – {end}", sp["date"])
+        t = Table([[left, right]], colWidths=["70%", "30%"])
+        t.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"),
+                                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                                ("RIGHTPADDING", (0, 0), (-1, -1), 0)]))
+        add(t)
+        for b in _bullets(e.get("description"), 6):
+            add(Paragraph(f"• {b}", sp["bullet"]))
+        add(Spacer(1, 3))
+
+
+def _pdf_projects(data, sp, template, add, section_head):
+    from reportlab.platypus import Paragraph, Spacer
+    if not data.projects:
+        return
+    section_head(_section_label(template, "projects", "Projects"))
+    for p in data.projects:
+        name = p.get("name", "")
+        tech = p.get("technologies", "")
+        desc = p.get("description", "")
+        line = f"<b>{name}</b>"
+        if tech:
+            line += f"  |  <font color='{sp['accent'].hexval()}'>{tech}</font>"
+        add(Paragraph(line, sp["role"]))
+        if desc:
+            add(Paragraph(desc[:400], sp["sub"]))
+        add(Spacer(1, 2))
+
+
+def _pdf_education(data, sp, template, add, section_head):
+    from reportlab.platypus import Paragraph, Table, TableStyle
+    if not data.educations:
+        return
+    section_head(_section_label(template, "education", "Education"))
+    for edu in data.educations:
+        inst = edu.get("institution", "")
+        degree = edu.get("degree", "")
+        field = edu.get("field_of_study", "")
+        start = _fmt_date(edu.get("start_date"))
+        end = _fmt_date(edu.get("end_date"))
+        line = ", ".join(filter(None, [degree, field]))
+        left = Paragraph(f"<b>{inst}</b>", sp["role"])
+        right = Paragraph(f"{start} – {end}", sp["date"])
+        t = Table([[left, right]], colWidths=["70%", "30%"])
+        t.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"),
+                                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                                ("RIGHTPADDING", (0, 0), (-1, -1), 0)]))
+        add(t)
+        if line:
+            add(Paragraph(line, sp["sub"]))
+
+
+def _pdf_certifications(data, sp, template, add, section_head):
+    from reportlab.platypus import Paragraph
+    if not data.certifications:
+        return
+    section_head(_section_label(template, "certifications", "Certifications"))
+    for c in data.certifications:
+        name = c.get("name", "")
+        issuer = c.get("issuer", "")
+        issued = _fmt_date(c.get("issue_date"))
+        parts = [f"<b>{name}</b>"]
+        if issuer:
+            parts.append(f"— {issuer}")
+        if c.get("issue_date"):
+            parts.append(f"({issued})")
+        add(Paragraph(" ".join(parts), sp["body"]))
+
+
+# ── DOCX ───────────────────────────────────────────────────────────────────
+
+def _build_docx(data: "_ResumeData", template: ResolvedTemplate) -> bytes:
     from docx import Document
+    from docx.shared import Pt, RGBColor, Inches
     from docx.enum.text import WD_ALIGN_PARAGRAPH
     from docx.oxml.ns import qn
-    from docx.shared import Inches, Pt, RGBColor
     from docx.oxml import OxmlElement
 
-    ACCENT_RGB = RGBColor(0x1e, 0x40, 0xAF)   # blue-800
-    DARK_RGB   = RGBColor(0x11, 0x18, 0x27)    # gray-900
-    MID_RGB    = RGBColor(0x37, 0x41, 0x51)    # gray-700
-    LIGHT_RGB  = RGBColor(0x6b, 0x72, 0x80)    # gray-500
+    styles = template.config.get("styles", {})
+    body_size = float(styles.get("body_font_size", 10))
+    head_size = float(styles.get("heading_font_size", 12))
+    accent_hex = (styles.get("accent_color") or "#1D4ED8").lstrip("#")
+    header_align = styles.get("header_style", "left")
+    font_name = styles.get("font_family") or "Helvetica"
+    # python-docx is fine with any font string; Word will fall back locally.
+
+    ACCENT = RGBColor.from_string(accent_hex)
+    DARK   = RGBColor(0x0F, 0x17, 0x2A)
+    MID    = RGBColor(0x47, 0x55, 0x69)
+    LIGHT  = RGBColor(0x64, 0x74, 0x8B)
 
     doc = Document()
+    section = doc.sections[0]
+    section.top_margin    = Inches(float(styles.get("margin_top",    40)) / 72)
+    section.bottom_margin = Inches(float(styles.get("margin_bottom", 40)) / 72)
+    section.left_margin   = Inches(float(styles.get("margin_left",   46)) / 72)
+    section.right_margin  = Inches(float(styles.get("margin_right",  46)) / 72)
 
-    # ── page margins ────────────────────────────────────────────────────
-    for section in doc.sections:
-        section.top_margin    = Inches(0.65)
-        section.bottom_margin = Inches(0.65)
-        section.left_margin   = Inches(0.75)
-        section.right_margin  = Inches(0.75)
+    def add_run(p, text, *, bold=False, italic=False, color=None, size_pt=None):
+        r = p.add_run(text)
+        r.font.name = font_name
+        r.bold = bold
+        r.italic = italic
+        if color is not None:
+            r.font.color.rgb = color
+        if size_pt is not None:
+            r.font.size = Pt(size_pt)
+        return r
 
-    def add_run(para, text: str, bold=False, italic=False,
-                color: RGBColor | None = None, size_pt: float = 10):
-        run = para.add_run(text)
-        run.bold   = bold
-        run.italic = italic
-        if color:
-            run.font.color.rgb = color
-        run.font.size = Pt(size_pt)
-        return run
-
-    def section_heading(title: str):
+    def section_heading(label):
         p = doc.add_paragraph()
-        p.paragraph_format.space_before = Pt(10)
-        p.paragraph_format.space_after  = Pt(2)
-        run = p.add_run(title.upper())
-        run.bold = True
-        run.font.size = Pt(9)
-        run.font.color.rgb = ACCENT_RGB
-        # bottom border
+        p.paragraph_format.space_before = Pt(6)
+        p.paragraph_format.space_after = Pt(2)
+        add_run(p, label.upper(), bold=True, color=ACCENT, size_pt=head_size)
+        # thin bottom border
         pPr = p._p.get_or_add_pPr()
         pBdr = OxmlElement("w:pBdr")
         bottom = OxmlElement("w:bottom")
         bottom.set(qn("w:val"), "single")
         bottom.set(qn("w:sz"), "4")
         bottom.set(qn("w:space"), "1")
-        bottom.set(qn("w:color"), "1e40af")
+        bottom.set(qn("w:color"), accent_hex)
         pBdr.append(bottom)
         pPr.append(pBdr)
         return p
 
-    # ── name + headline ─────────────────────────────────────────────────
-    name_p = doc.add_paragraph()
-    name_p.paragraph_format.space_after = Pt(1)
-    add_run(name_p, data.full_name or "Resume", bold=True, color=DARK_RGB, size_pt=22)
+    def render_header():
+        p = doc.add_paragraph()
+        if header_align == "centered":
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        add_run(p, data.full_name or "Resume", bold=True, color=DARK, size_pt=head_size * 1.8)
+        if data.headline:
+            hp = doc.add_paragraph()
+            if header_align == "centered":
+                hp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            add_run(hp, data.headline, color=ACCENT, size_pt=body_size + 1)
+        contact_parts = [p for p in [data.email, data.location] if p]
+        if contact_parts:
+            cp = doc.add_paragraph()
+            if header_align == "centered":
+                cp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            add_run(cp, "  ·  ".join(contact_parts), color=LIGHT, size_pt=body_size - 1)
 
-    if data.headline:
-        h_p = doc.add_paragraph()
-        h_p.paragraph_format.space_after = Pt(2)
-        add_run(h_p, data.headline, color=ACCENT_RGB, size_pt=11)
-
-    contact_parts = [p for p in [data.email, data.location] if p]
-    if contact_parts:
-        c_p = doc.add_paragraph()
-        c_p.paragraph_format.space_after = Pt(6)
-        add_run(c_p, "  ·  ".join(contact_parts), color=LIGHT_RGB, size_pt=9)
-
-    # ── summary ─────────────────────────────────────────────────────────
-    if data.summary:
-        section_heading("Professional Summary")
+    def render_summary():
+        if not data.summary:
+            return
+        section_heading(_section_label(template, "summary", "Professional Summary"))
         p = doc.add_paragraph(data.summary)
-        p.paragraph_format.space_after = Pt(2)
-        for run in p.runs:
-            run.font.size = Pt(9.5)
-            run.font.color.rgb = MID_RGB
+        for r in p.runs:
+            r.font.size = Pt(body_size)
+            r.font.color.rgb = MID
+            r.font.name = font_name
 
-    # ── skills ──────────────────────────────────────────────────────────
-    if data.skills:
-        section_heading("Skills")
-        skill_names = [
-            f"{s['name']} ({s['level']})" if s.get("level") else s["name"]
-            for s in data.skills
-        ]
-        p = doc.add_paragraph("  ·  ".join(skill_names))
-        p.paragraph_format.space_after = Pt(2)
-        for run in p.runs:
-            run.font.size = Pt(9.5)
-            run.font.color.rgb = MID_RGB
+    def render_skills():
+        if not data.skills:
+            return
+        section_heading(_section_label(template, "skills", "Skills"))
+        names = [f"{s['name']} ({s['level']})" if s.get("level") else s["name"] for s in data.skills]
+        p = doc.add_paragraph("  ·  ".join(names))
+        for r in p.runs:
+            r.font.size = Pt(body_size)
+            r.font.color.rgb = MID
+            r.font.name = font_name
 
-    # ── experience ──────────────────────────────────────────────────────
-    if data.experiences:
-        section_heading("Work Experience")
-        for exp in data.experiences:
-            role    = exp.get("role", "")
-            company = exp.get("company", "")
-            start   = _fmt_date(exp.get("start_date"))
-            end     = _fmt_date(exp.get("end_date"))
-
-            row_p = doc.add_paragraph()
-            row_p.paragraph_format.space_after = Pt(0)
-            add_run(row_p, role, bold=True, color=DARK_RGB, size_pt=10.5)
-            add_run(row_p, "  —  ", color=MID_RGB, size_pt=10)
-            add_run(row_p, company, italic=True, color=ACCENT_RGB, size_pt=10)
-            add_run(row_p, f"   {start} – {end}", color=LIGHT_RGB, size_pt=9)
-
-            for b in _bullets(exp.get("description"), 6):
+    def render_experience():
+        if not data.experiences:
+            return
+        section_heading(_section_label(template, "experience", "Work Experience"))
+        for e in data.experiences:
+            role = e.get("role", "")
+            company = e.get("company", "")
+            start = _fmt_date(e.get("start_date"))
+            end = _fmt_date(e.get("end_date"))
+            row = doc.add_paragraph()
+            add_run(row, role, bold=True, color=DARK, size_pt=body_size + 0.5)
+            add_run(row, "  —  ", color=MID, size_pt=body_size)
+            add_run(row, company, italic=True, color=ACCENT, size_pt=body_size)
+            add_run(row, f"   {start} – {end}", color=LIGHT, size_pt=body_size - 1)
+            for b in _bullets(e.get("description"), 6):
                 bp = doc.add_paragraph(style="List Bullet")
-                bp.paragraph_format.left_indent  = Inches(0.2)
-                bp.paragraph_format.space_after  = Pt(1)
-                run = bp.add_run(b)
-                run.font.size = Pt(9.5)
-                run.font.color.rgb = MID_RGB
+                bp.paragraph_format.left_indent = Inches(0.2)
+                r = bp.add_run(b)
+                r.font.size = Pt(body_size)
+                r.font.color.rgb = MID
+                r.font.name = font_name
 
-            doc.add_paragraph().paragraph_format.space_after = Pt(3)
-
-    # ── projects ────────────────────────────────────────────────────────
-    if data.projects:
-        section_heading("Projects")
+    def render_projects():
+        if not data.projects:
+            return
+        section_heading(_section_label(template, "projects", "Projects"))
         for proj in data.projects:
             name = proj.get("name", "")
             tech = proj.get("technologies", "")
             desc = proj.get("description", "")
             p = doc.add_paragraph()
-            p.paragraph_format.space_after = Pt(1)
-            add_run(p, name, bold=True, color=DARK_RGB, size_pt=10)
+            add_run(p, name, bold=True, color=DARK, size_pt=body_size)
             if tech:
-                add_run(p, f"  |  {tech}", color=ACCENT_RGB, size_pt=9)
+                add_run(p, f"  |  {tech}", color=ACCENT, size_pt=body_size - 1)
             if desc:
-                dp = doc.add_paragraph(desc[:300])
-                dp.paragraph_format.space_after = Pt(2)
-                for run in dp.runs:
-                    run.font.size = Pt(9.5)
-                    run.font.color.rgb = MID_RGB
+                dp = doc.add_paragraph(desc[:400])
+                for r in dp.runs:
+                    r.font.size = Pt(body_size)
+                    r.font.color.rgb = MID
+                    r.font.name = font_name
 
-    # ── education ───────────────────────────────────────────────────────
-    if data.educations:
-        section_heading("Education")
+    def render_education():
+        if not data.educations:
+            return
+        section_heading(_section_label(template, "education", "Education"))
         for edu in data.educations:
-            institution = edu.get("institution", "")
-            degree      = edu.get("degree", "")
-            field       = edu.get("field_of_study", "")
-            start       = _fmt_date(edu.get("start_date"))
-            end         = _fmt_date(edu.get("end_date"))
-            degree_line = ", ".join(filter(None, [degree, field]))
-
+            inst = edu.get("institution", "")
+            degree = edu.get("degree", "")
+            field = edu.get("field_of_study", "")
+            start = _fmt_date(edu.get("start_date"))
+            end = _fmt_date(edu.get("end_date"))
+            line = ", ".join(filter(None, [degree, field]))
             p = doc.add_paragraph()
-            p.paragraph_format.space_after = Pt(1)
-            add_run(p, institution, bold=True, color=DARK_RGB, size_pt=10.5)
-            add_run(p, f"   {start} – {end}", color=LIGHT_RGB, size_pt=9)
-            if degree_line:
-                dp = doc.add_paragraph(degree_line)
-                dp.paragraph_format.space_after = Pt(3)
-                for run in dp.runs:
-                    run.font.size = Pt(9.5)
-                    run.font.color.rgb = MID_RGB
+            add_run(p, inst, bold=True, color=DARK, size_pt=body_size + 0.5)
+            add_run(p, f"   {start} – {end}", color=LIGHT, size_pt=body_size - 1)
+            if line:
+                dp = doc.add_paragraph(line)
+                for r in dp.runs:
+                    r.font.size = Pt(body_size)
+                    r.font.color.rgb = MID
+                    r.font.name = font_name
 
-    # ── certifications ───────────────────────────────────────────────────
-    if data.certifications:
-        section_heading("Certifications")
-        for cert in data.certifications:
-            name   = cert.get("name", "")
-            issuer = cert.get("issuer", "")
-            issued = _fmt_date(cert.get("issue_date"))
+    def render_certifications():
+        if not data.certifications:
+            return
+        section_heading(_section_label(template, "certifications", "Certifications"))
+        for c in data.certifications:
+            name = c.get("name", "")
+            issuer = c.get("issuer", "")
+            issued = _fmt_date(c.get("issue_date"))
             p = doc.add_paragraph()
-            p.paragraph_format.space_after = Pt(2)
-            add_run(p, name, bold=True, color=DARK_RGB, size_pt=10)
+            add_run(p, name, bold=True, color=DARK, size_pt=body_size)
             if issuer:
-                add_run(p, f"  —  {issuer}", color=MID_RGB, size_pt=9.5)
-            if cert.get("issue_date"):
-                add_run(p, f"  ({issued})", color=LIGHT_RGB, size_pt=9)
+                add_run(p, f"  —  {issuer}", color=MID, size_pt=body_size - 0.5)
+            if c.get("issue_date"):
+                add_run(p, f"  ({issued})", color=LIGHT, size_pt=body_size - 1)
+
+    renderers = {
+        "header":         render_header,
+        "summary":        render_summary,
+        "skills":         render_skills,
+        "experience":     render_experience,
+        "projects":       render_projects,
+        "education":      render_education,
+        "certifications": render_certifications,
+    }
+    for key in _enabled_sections_in_order(template):
+        fn = renderers.get(key)
+        if fn:
+            fn()
 
     buf = io.BytesIO()
     doc.save(buf)
@@ -732,24 +724,34 @@ def _build_docx(data: _ResumeData) -> bytes:
 # ── Public API ─────────────────────────────────────────────────────────────
 
 class ResumeExporter:
-    def __init__(self, db: Session, user: User, app_id: int | None = None):
-        self.db     = db
-        self.user   = user
-        self.app_id = app_id
+    """
+    Export the user's resume as PDF or DOCX using a resolved template.
 
-    def _load(self) -> _ResumeData:
+    Callers MUST pass a ResolvedTemplate (from ResumeTemplateResolver).
+    The exporter no longer picks a default template internally — that was
+    the exact source of the bug where switching templates in the UI still
+    exported the classic layout.
+    """
+    def __init__(self, db: Session, user: User, template: ResolvedTemplate,
+                 app_id: int | None = None):
+        self.db       = db
+        self.user     = user
+        self.template = template
+        self.app_id   = app_id
+
+    def _load(self) -> "_ResumeData":
         return _ResumeData(self.db, self.user.id, self.user.email, app_id=self.app_id)
 
     def as_pdf(self) -> bytes:
         try:
-            return _build_pdf(self._load())
+            return _build_pdf(self._load(), self.template)
         except Exception as exc:
             logger.error("resume_pdf_error", error=str(exc))
             raise HTTPException(status_code=500, detail=f"PDF generation failed: {exc}")
 
     def as_docx(self) -> bytes:
         try:
-            return _build_docx(self._load())
+            return _build_docx(self._load(), self.template)
         except Exception as exc:
             logger.error("resume_docx_error", error=str(exc))
             raise HTTPException(status_code=500, detail=f"DOCX generation failed: {exc}")

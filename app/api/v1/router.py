@@ -14,6 +14,7 @@ from app.api.v1.routes import answers
 from app.api.v1.routes import kits
 from app.api.v1.routes import auto_apply
 from app.api.v1.routes import application_actions
+from app.api.v1.routes import resume_templates
 from app.recruiter.api.router import recruiter_router
 
 api_router = APIRouter()
@@ -40,4 +41,5 @@ api_router.include_router(answers.router)
 api_router.include_router(kits.router)
 api_router.include_router(auto_apply.router)
 api_router.include_router(application_actions.router)
+api_router.include_router(resume_templates.router)
 api_router.include_router(recruiter_router)

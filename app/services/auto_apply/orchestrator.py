@@ -16,7 +16,7 @@ from typing import Any, Dict, List
 
 import structlog
 from celery import shared_task
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from app.db.session import SessionLocal
 from app.models.auto_apply import AutoApplyRun, AutoApplySettings
@@ -27,7 +27,32 @@ from app.services.auto_apply.matching import score_job_for_user
 
 logger = structlog.get_logger(__name__)
 
-CANDIDATE_LIMIT = 200
+CANDIDATE_LIMIT = 1000
+
+
+def _title_tokens(target_titles) -> list[str]:
+    """Break each target title into tokens for the SQL prefilter.
+
+    Example: ["AI Engineer", "Machine Learning Engineer"] ->
+             ["ai engineer","machine learning engineer","ai","engineer","machine","learning"]
+    Short tokens (≤2 chars) dropped so we don't accept everything containing "AI".
+    """
+    if not target_titles:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for phrase in target_titles:
+        phrase = (phrase or "").strip().lower()
+        if not phrase:
+            continue
+        if phrase not in seen:
+            seen.add(phrase)
+            out.append(phrase)
+        for tok in phrase.split():
+            if len(tok) > 2 and tok not in seen:
+                seen.add(tok)
+                out.append(tok)
+    return out
 
 
 @shared_task(name="app.services.auto_apply.orchestrator.tick_user")
@@ -95,13 +120,25 @@ def tick_user(user_id: int) -> Dict[str, Any]:
                 select(JobApplication.job_id)
                 .where(JobApplication.user_id == user_id, JobApplication.job_id.isnot(None))
             )
-            candidates: List[Job] = (
-                db.execute(
-                    select(Job)
-                    .where(Job.is_active == True)  # noqa: E712
-                    .where(Job.id.notin_(already_applied_subq))
-                    .limit(CANDIDATE_LIMIT)
+
+            base_q = (
+                select(Job)
+                .where(Job.is_active == True)  # noqa: E712
+                .where(Job.id.notin_(already_applied_subq))
+            )
+
+            # Hard title-token SQL prefilter: reject anything whose title
+            # doesn't contain a token from the user's target titles. Prevents
+            # "Commercial Account Executive" from ever reaching the matcher
+            # for a user whose targets are "AI Engineer" / "ML Engineer".
+            tokens = _title_tokens(getattr(settings, "target_titles_json", None) or [])
+            if tokens:
+                base_q = base_q.where(
+                    or_(*[Job.title.ilike(f"%{tok}%") for tok in tokens])
                 )
+
+            candidates: List[Job] = (
+                db.execute(base_q.order_by(Job.id.desc()).limit(CANDIDATE_LIMIT))
                 .scalars()
                 .all()
             )

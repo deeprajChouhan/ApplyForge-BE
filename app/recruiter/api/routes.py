@@ -3,7 +3,7 @@ isolation through the get_agency dependency."""
 from __future__ import annotations
 
 from dataclasses import asdict
-from datetime import datetime
+from datetime import date, datetime
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile
 from sqlalchemy.orm import Session
@@ -67,6 +67,8 @@ from app.recruiter.schemas import (
     ParseJDRequest,
     ParseJDResult,
     PublicFeedbackCreate,
+    PublicCandidateDetail,
+    PublicCandidateExperience,
     PublicRoleView,
     PublicShortlistCandidate,
     RoleFeedbackOut,
@@ -449,6 +451,23 @@ def refresh_market_snapshot(
         raise HTTPException(status_code=404, detail="Role not found")
     snap = crawl_role_market(db, agency.id, role=role)
     return snap
+
+
+@roles_router.delete("/{role_id}/market", status_code=204)
+def clear_market_snapshot(
+    role_id: int,
+    agency: Agency = Depends(require_unlocked_agency),
+    db: Session = Depends(get_db),
+):
+    """Remove the cached market snapshot for this role. Idempotent —
+    returns 204 whether or not a snapshot was set."""
+    role = db.get(Role, role_id)
+    if role is None or role.agency_id != agency.id:
+        raise HTTPException(status_code=404, detail="Role not found")
+    if role.market_snapshot is not None:
+        role.market_snapshot = None
+        db.commit()
+    return None
 
 
 @roles_router.get("", response_model=list[RoleOut])
@@ -1208,6 +1227,74 @@ def public_role_view(token: str, db: Session = Depends(get_db)):
         is_draft=role.is_draft,
         agency_name=agency.name if agency else "",
         shortlist=_public_shortlist(db, role),
+    )
+
+
+@public_router.get(
+    "/roles/{token}/candidates/{candidate_id}",
+    response_model=PublicCandidateDetail,
+)
+def public_role_candidate(
+    token: str,
+    candidate_id: int,
+    db: Session = Depends(get_db),
+):
+    """Client-safe full profile for a candidate on the shared shortlist.
+
+    Guards: the token must be active and the candidate must appear on the
+    most recent shortlist for the role. Deliberately excludes email, phone,
+    expected budget, source file, and provisioning ids — the public share is
+    boardroom-safe.
+    """
+    tok = (
+        db.query(RoleShareToken)
+        .filter(RoleShareToken.token == token, RoleShareToken.is_active.is_(True))
+        .first()
+    )
+    if tok is None:
+        raise HTTPException(status_code=404, detail="Share link is not active")
+
+    sl = (
+        db.query(Shortlist)
+        .filter(Shortlist.role_id == tok.role_id, Shortlist.agency_id == tok.agency_id)
+        .order_by(Shortlist.id.desc())
+        .first()
+    )
+    if sl is None:
+        raise HTTPException(status_code=404, detail="Candidate is not on the shortlist")
+    entry = next((e for e in sl.entries if e.candidate_id == candidate_id), None)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="Candidate is not on the shortlist")
+
+    cand = db.get(CandidateProfile, candidate_id)
+    if cand is None or cand.agency_id != tok.agency_id:
+        raise HTTPException(status_code=404, detail="Candidate no longer exists")
+
+    skills = sorted({(s.name or "").strip() for s in cand.skills if s.name})
+    experiences = sorted(
+        cand.experiences,
+        key=lambda e: (e.start_date or date.min),
+        reverse=True,
+    )
+    return PublicCandidateDetail(
+        candidate_id=cand.id,
+        display_name=_client_display_name(cand.full_name, cand.id),
+        headline=cand.headline,
+        location=cand.location,
+        years_experience=cand.years_experience,
+        fit_score=entry.fit_score,
+        summary=cand.summary,
+        skills=skills,
+        experiences=[
+            PublicCandidateExperience(
+                title=e.title,
+                company=e.company,
+                start_date=e.start_date,
+                end_date=e.end_date,
+                description=e.description,
+            )
+            for e in experiences
+        ],
     )
 
 

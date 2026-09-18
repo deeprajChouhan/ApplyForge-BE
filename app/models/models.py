@@ -70,6 +70,10 @@ class UserProfile(Base, TimestampMixin):
     preferred_locations: Mapped[str | None] = mapped_column(Text)  # JSON list[str]
     salary_expectation: Mapped[str | None] = mapped_column(String(100))
     deal_breakers: Mapped[str | None] = mapped_column(Text)  # JSON list[str]
+    # Resume presentation preferences (Phase: resume templates)
+    default_resume_template_id: Mapped[int | None] = mapped_column(
+        ForeignKey("resume_templates.id", ondelete="SET NULL"), nullable=True, index=True
+    )
 
 
 class WorkExperience(Base, TimestampMixin):
@@ -207,6 +211,10 @@ class JobApplication(Base, TimestampMixin):
     submission_evidence_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     submitted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     job_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    # Resume template chosen for this application (nullable = fall back to user default)
+    resume_template_id: Mapped[int | None] = mapped_column(
+        ForeignKey("resume_templates.id", ondelete="SET NULL"), nullable=True, index=True
+    )
 
 
 class GeneratedDocument(Base, TimestampMixin):
@@ -218,6 +226,10 @@ class GeneratedDocument(Base, TimestampMixin):
     version: Mapped[int] = mapped_column(Integer, default=1)
     content: Mapped[str] = mapped_column(Text)
     format: Mapped[str] = mapped_column(String(20), default="txt")
+    # Snapshot of which template was active when this version was generated.
+    resume_template_id: Mapped[int | None] = mapped_column(
+        ForeignKey("resume_templates.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
 
 
@@ -534,3 +546,36 @@ class InterviewAnswer(Base, TimestampMixin):
     answer: Mapped[str | None] = mapped_column(Text, nullable=True)
     feedback: Mapped[str | None] = mapped_column(Text, nullable=True)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+# ── Resume Templates ────────────────────────────────────────────────────────
+
+class ResumeTemplate(Base, TimestampMixin):
+    """
+    A resume template = structured (data) + presentation (config).
+
+    System templates have user_id = NULL and is_system = True. They are shared,
+    immutable, and act as the starting point for user duplicates. User-owned
+    templates have user_id set to the owning user; every read/write must filter
+    by user_id (or user_id IS NULL for is_system rows).
+
+    config_json is a versioned document describing section ordering,
+    enabled/disabled state, per-section labels, and shared style tokens.
+    See app.services.templates.defaults for the schema.
+    """
+    __tablename__ = "resume_templates"
+    __table_args__ = (
+        Index("ix_resume_templates_user_system", "user_id", "is_system"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    # Stable key of the rendering family: classic | modern | sidebar | executive.
+    # Renderers dispatch off this — user overrides always name a base_template.
+    base_template: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
+    is_system: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    config_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)

@@ -462,6 +462,141 @@ Returns `text/plain` with header:
 
 ---
 
+
+## RESUME TEMPLATES
+
+Resume templates are first-class persisted objects. Every user gets access to
+a fixed set of read-only **system templates** (Classic ATS, Modern,
+Two-Column Sidebar, Executive) plus any **user-owned templates** they create
+by duplicating or building from scratch. All queries are scoped by `user_id`
+(system templates are the only shared rows and are never mutated by users).
+
+Template config schema (`config`):
+
+```json
+{
+  "version": 1,
+  "layout": "single_column | two_column | centered",
+  "sections": [
+    { "key": "header",     "label": "Header",               "enabled": true, "order": 0 },
+    { "key": "summary",    "label": "Professional Summary", "enabled": true, "order": 1 },
+    { "key": "skills",     "label": "Skills",               "enabled": true, "order": 2 },
+    { "key": "experience", "label": "Work Experience",      "enabled": true, "order": 3 },
+    { "key": "projects",   "label": "Projects",             "enabled": true, "order": 4 },
+    { "key": "education",  "label": "Education",            "enabled": true, "order": 5 },
+    { "key": "certifications", "label": "Certifications",   "enabled": true, "order": 6 }
+  ],
+  "styles": {
+    "font_family": "Helvetica",
+    "body_font_size": 10,
+    "heading_font_size": 12,
+    "line_height": 1.35,
+    "section_spacing": 8,
+    "margin_top": 40, "margin_bottom": 40, "margin_left": 46, "margin_right": 46,
+    "accent_color": "#1D4ED8",
+    "header_style": "left"
+  }
+}
+```
+
+Section `key` values are a closed set — unknown keys are dropped on write.
+Missing sections are appended, disabled, at the end so every renderer
+receives a fully-populated list.
+
+### `GET /resume-templates`
+List every template visible to the current user (system + user-owned).
+
+Response 200:
+```json
+{
+  "templates": [
+    { "id": 1, "user_id": null, "name": "Classic ATS", "base_template": "classic",
+      "is_system": true,  "is_default": true,  "config": { ... },
+      "created_at": "...", "updated_at": "..." },
+    { "id": 12, "user_id": 4, "name": "My Modern", "base_template": "modern",
+      "is_system": false, "is_default": false, "config": { ... }, ... }
+  ],
+  "default_template_id": 1
+}
+```
+
+### `GET /resume-templates/{id}`
+Fetch one template. Returns `404` if it is neither a system template nor
+owned by the current user.
+
+### `POST /resume-templates`
+Create a user-owned template.
+
+Request:
+```json
+{ "name": "My Custom", "base_template": "modern", "config": { ... } }
+```
+Response `201`: single `ResumeTemplateOut` (as above).
+
+Errors:
+- `422` unknown `base_template` (must be one of `classic|modern|sidebar|executive`).
+
+### `PATCH /resume-templates/{id}`
+Update an existing user-owned template. Body may include `name`, `config`,
+or both. System templates return `403` — duplicate first.
+
+### `POST /resume-templates/{id}/duplicate`
+Duplicate any accessible template (including a system template) into a new
+user-owned template. Response `201`: the new template.
+
+Request:
+```json
+{ "name": "Optional new name" }
+```
+
+### `DELETE /resume-templates/{id}`
+Soft-delete a user-owned template. Any application/user default currently
+pointing at it is cleared to `null`, so subsequent renders fall back to
+Classic ATS. System templates return `403`.
+
+### `POST /resume-templates/default`
+Set the current user's account-level default template.
+
+Request:
+```json
+{ "template_id": 12 }
+```
+Response `200`: the newly-defaulted `ResumeTemplateOut` (with
+`is_default: true`).
+
+### `PATCH /applications/{app_id}/template`
+Set (or clear) which template this specific application uses. Does NOT
+change the account-level default.
+
+Request:
+```json
+{ "template_id": 12 }
+```
+`template_id: null` detaches — subsequent renders resolve back to the
+user's default and then Classic ATS.
+
+Response 200:
+```json
+{
+  "application_id": 5,
+  "template_id": 12,
+  "resolved": {
+    "id": 12, "name": "My Modern", "base_template": "modern",
+    "is_system": false, "source": "application"
+  }
+}
+```
+
+### `GET /applications/{app_id}/template`
+Return the template currently resolved for this application, including the
+full normalized `config` so the frontend can render a live preview without
+a second call.
+
+`source` in the response is one of: `application`, `generated_document`,
+`user_default`, `classic_fallback`.
+
+---
+
 ## Common Error Responses
 
 - `400` Bad Request (validation/business rule)

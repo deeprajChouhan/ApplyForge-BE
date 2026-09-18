@@ -33,6 +33,8 @@ from app.services.linkedin.service import LinkedInService
 from app.services.applications.service import ApplicationService
 from app.services.suggestions.service import SuggestionService
 from app.services.export.resume_exporter import ResumeExporter
+from app.services.templates import ResumeTemplateResolver, ResumeTemplateService
+from app.schemas.resume_templates import SetApplicationTemplateRequest
 
 router = APIRouter(prefix="/applications", tags=["applications"])
 
@@ -260,7 +262,8 @@ def export_resume_pdf(app_id: int, user: User = Depends(get_current_user), db: S
     """Download the user's resume as an ATS-optimised PDF."""
     # Verify the application belongs to this user (raises 404 otherwise)
     ApplicationService(db, user.id).get(app_id)
-    pdf_bytes = ResumeExporter(db, user, app_id=app_id).as_pdf()
+    template = ResumeTemplateResolver(db, user.id).resolve_for_application(app_id)
+    pdf_bytes = ResumeExporter(db, user, template=template, app_id=app_id).as_pdf()
     safe_name = (user.email or "resume").split("@")[0].replace(" ", "_")
     filename = f"{safe_name}_resume.pdf"
     return Response(
@@ -274,7 +277,8 @@ def export_resume_pdf(app_id: int, user: User = Depends(get_current_user), db: S
 def export_resume_docx(app_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Download the user's resume as a DOCX file."""
     ApplicationService(db, user.id).get(app_id)
-    docx_bytes = ResumeExporter(db, user, app_id=app_id).as_docx()
+    template = ResumeTemplateResolver(db, user.id).resolve_for_application(app_id)
+    docx_bytes = ResumeExporter(db, user, template=template, app_id=app_id).as_docx()
     safe_name = (user.email or "resume").split("@")[0].replace(" ", "_")
     filename = f"{safe_name}_resume.docx"
     return Response(
@@ -282,3 +286,55 @@ def export_resume_docx(app_id: int, user: User = Depends(get_current_user), db: 
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+@router.patch("/{app_id}/template", dependencies=[_need_apps])
+def set_application_template(
+    app_id: int,
+    payload: SetApplicationTemplateRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Persist which template this application uses.
+
+    template_id: null detaches — subsequent renders resolve back to the
+    user's account default (and, failing that, Classic ATS).
+    """
+    ApplicationService(db, user.id).get(app_id)  # ownership 404
+    svc = ResumeTemplateService(db, user.id)
+    app = svc.set_application_template(app_id, payload.template_id)
+    resolved = ResumeTemplateResolver(db, user.id).resolve_for_application(app_id)
+    return {
+        "application_id": app.id,
+        "template_id": app.resume_template_id,
+        "resolved": {
+            "id": resolved.id,
+            "name": resolved.name,
+            "base_template": resolved.base_template,
+            "is_system": resolved.is_system,
+            "source": resolved.source,
+        },
+    }
+
+
+@router.get("/{app_id}/template", dependencies=[_need_apps])
+def get_application_template(
+    app_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Return the template currently resolved for this application."""
+    ApplicationService(db, user.id).get(app_id)  # ownership 404
+    resolved = ResumeTemplateResolver(db, user.id).resolve_for_application(app_id)
+    return {
+        "application_id": app_id,
+        "template_id": resolved.id,
+        "resolved": {
+            "id": resolved.id,
+            "name": resolved.name,
+            "base_template": resolved.base_template,
+            "is_system": resolved.is_system,
+            "source": resolved.source,
+            "config": resolved.config,
+        },
+    }

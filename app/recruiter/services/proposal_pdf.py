@@ -99,9 +99,25 @@ def _skills_line(skills: list[str], style: ParagraphStyle) -> Paragraph:
     return Paragraph(" · ".join(skills), style)
 
 
+def _has_market_data(m: dict | None) -> bool:
+    """A snapshot is worth rendering only when it carries at least one
+    salary percentile or aggregate skill/title signal."""
+    if not isinstance(m, dict):
+        return False
+    if any(m.get(k) is not None for k in ("salary_p25", "salary_p50", "salary_p75")):
+        return True
+    if (m.get("top_skills") or []) or (m.get("competing_roles") or []):
+        return True
+    return False
+
+
 def _market_table(role: Role, styles: dict[str, ParagraphStyle]) -> Table | None:
     m = role.market_snapshot or None
     if not isinstance(m, dict):
+        return None
+    # Skip the table entirely when no salary percentiles are known — an
+    # all-"—" table just makes the proposal look thin.
+    if all(m.get(k) is None for k in ("salary_p25", "salary_p50", "salary_p75")):
         return None
     cur = m.get("currency") or role.budget_currency or "USD"
 
@@ -210,6 +226,13 @@ def render_role_proposal_pdf(
         story.append(Paragraph(client.name, styles["body"]))
         story.append(Spacer(1, 4))
 
+    # Key facts — a small two-column table so the proposal carries the same
+    # structured facts the recruiter sees on the internal role page.
+    facts = _key_facts(role, client)
+    if facts:
+        story.append(Paragraph("Key facts", styles["h2"]))
+        story.append(_facts_table(facts, styles))
+
     if role.description:
         story.append(Paragraph("About the role", styles["h2"]))
         story.append(Paragraph(role.description.replace("\n", "<br/>"), styles["body"]))
@@ -219,14 +242,32 @@ def render_role_proposal_pdf(
     story.append(Paragraph("Nice to have", styles["h2"]))
     story.append(_skills_line(role.preferred_skills or [], styles["body"]))
 
+    snap = role.market_snapshot if isinstance(role.market_snapshot, dict) else None
     tbl = _market_table(role, styles)
-    if tbl is not None:
+    top_skills = (snap or {}).get("top_skills") or []
+    competing = (snap or {}).get("competing_roles") or []
+    if tbl is not None or top_skills or competing:
         story.append(Paragraph("Market benchmark", styles["h2"]))
-        story.append(tbl)
-        srcs = (role.market_snapshot or {}).get("sources") or []
+        if tbl is not None:
+            story.append(tbl)
+        if top_skills:
+            story.append(Spacer(1, 6))
+            story.append(Paragraph("In-demand skills", styles["label"]))
+            story.append(Paragraph(" · ".join(top_skills[:12]), styles["body"]))
+        if competing:
+            story.append(Spacer(1, 6))
+            story.append(Paragraph("Competing titles", styles["label"]))
+            story.append(Paragraph(" · ".join(competing[:8]), styles["body"]))
+        srcs = (snap or {}).get("sources") or []
+        sample_n = (snap or {}).get("sample_size") if snap else None
+        footer_bits: list[str] = []
         if srcs:
+            footer_bits.append(f"Sourced from {', '.join(srcs)}")
+        if sample_n:
+            footer_bits.append(f"{sample_n} sample{'s' if sample_n != 1 else ''}")
+        if footer_bits:
             story.append(Spacer(1, 4))
-            story.append(Paragraph(f"Sourced from {', '.join(srcs)}", styles["small"]))
+            story.append(Paragraph(" · ".join(footer_bits), styles["small"]))
 
     story.append(Spacer(1, 20))
     story.append(HRFlowable(width="100%", thickness=0.7, color=colors.HexColor("#e5e7eb")))

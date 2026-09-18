@@ -214,7 +214,19 @@ class PlaywrightSubmitter:
                 if not _try_upload_resume(target_frame, ctx):
                     logger.info("playwright.no_resume_input", extra={"url": ctx.apply_url})
 
-                # Click submit — best-effort selector chain.
+                # Capture URL + submit-button count BEFORE clicking so we can
+                # honestly compare after. A real submission almost always
+                # either changes the URL or removes the submit button; if
+                # neither happens, the click didn't actually go through
+                # (bot detection, missing field, silent error).
+                pre_submit_url = page.url
+                try:
+                    pre_submit_button_count = target_frame.locator(
+                        'button[type="submit"], input[type="submit"]'
+                    ).count()
+                except Exception:
+                    pre_submit_button_count = -1
+
                 submit_clicked = _click_submit(target_frame)
                 if not submit_clicked:
                     browser.close()
@@ -239,23 +251,29 @@ class PlaywrightSubmitter:
                 except Exception:
                     screenshot = None
 
+                confirmed, confirmation_signal = _confirm_submission(
+                    page,
+                    target_frame,
+                    pre_url=pre_submit_url,
+                    post_url=final_url,
+                    pre_submit_button_count=pre_submit_button_count,
+                )
+
                 browser.close()
 
-                # If submit button was clicked and main profile fields were filled,
-                # the application was submitted (AIApply / Simplify standard model).
-                if submit_clicked and filled >= 3:
+                if confirmed:
                     return SubmitResult(
                         outcome=SubmitOutcome.SUBMITTED,
                         method=self.method,
                         evidence_url=final_url,
                         external_reference=None,
-                        error=None,
+                        error=f"confirmed_via={confirmation_signal}",
                     )
 
                 return SubmitResult(
                     outcome=SubmitOutcome.NEEDS_MANUAL,
                     method=self.method,
-                    error=f"submission_unconfirmed (filled={filled})",
+                    error=f"submission_unconfirmed (filled={filled}, url_changed={final_url != pre_submit_url})",
                     evidence_url=final_url,
                 )
         except Exception as exc:
@@ -595,6 +613,65 @@ def _click_submit(page) -> bool:
         except Exception:
             continue
     return False
+
+
+def _confirm_submission(
+    page,
+    target_frame,
+    pre_url: str,
+    post_url: str,
+    pre_submit_button_count: int,
+) -> tuple[bool, str]:
+    """Honest confirmation check.
+
+    Real submissions almost always leave AT LEAST ONE of these fingerprints:
+      * URL changes to include a confirmation slug (thanks/confirm/…)
+      * The submit button disappears (form removed / replaced by receipt)
+      * The page gains a very specific confirmation string that would NEVER
+        appear inside a raw job description ("your application has been
+        submitted", "we've received your application").
+    We deliberately DO NOT accept "thank you" or "thanks" — those appear in
+    thousands of JD bodies and produced silent false positives before.
+
+    Returns (confirmed, signal_used).
+    """
+    # 1) URL fingerprint — strong, unambiguous.
+    post_url_l = (post_url or "").lower()
+    if post_url != pre_url and any(
+        k in post_url_l for k in ("thank", "confirm", "submitted", "success", "applied", "receipt")
+    ):
+        return True, f"url_slug:{post_url_l[:80]}"
+
+    # 2) Submit button removed — form was replaced by a receipt block.
+    try:
+        post_count = target_frame.locator('button[type="submit"], input[type="submit"]').count()
+    except Exception:
+        post_count = -1
+    if pre_submit_button_count > 0 and post_count == 0:
+        return True, "submit_button_removed"
+
+    # 3) Specific confirmation string — hand-picked to NOT match raw JD text.
+    strict_phrases = [
+        "application has been submitted",
+        "application was submitted",
+        "application submitted successfully",
+        "successfully submitted your application",
+        "we've received your application",
+        "we have received your application",
+        "your application is on its way",
+        "thanks for applying to",
+        "thank you for applying to",
+        "your submission has been received",
+    ]
+    try:
+        body = (page.inner_text("body") or "").lower()
+    except Exception:
+        body = ""
+    for phrase in strict_phrases:
+        if phrase in body:
+            return True, f"body_phrase:{phrase}"
+
+    return False, "no_signal"
 
 
 def _looks_confirmed(page, url: str) -> bool:
