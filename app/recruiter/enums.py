@@ -121,3 +121,200 @@ ACTIVE_STAGES = {
     ApplicationStage.interview,
     ApplicationStage.offer,
 }
+
+
+# ── Recruiter OS: role-specific screening (Phase 1) ──────────────────────
+
+class ScreeningOutcome(str, enum.Enum):
+    """Recruiter's suitability verdict for a candidate on a specific role."""
+    suitable = "suitable"
+    maybe = "maybe"
+    not_suitable = "not_suitable"
+
+
+class WorkModel(str, enum.Enum):
+    remote = "remote"
+    hybrid = "hybrid"
+    onsite = "onsite"
+    flexible = "flexible"
+
+
+class RelocationPreference(str, enum.Enum):
+    yes = "yes"
+    no = "no"
+    conditional = "conditional"
+
+
+class NoticeUnit(str, enum.Enum):
+    day = "DAY"
+    week = "WEEK"
+    month = "MONTH"
+
+
+class CompensationPeriod(str, enum.Enum):
+    hour = "HOUR"
+    day = "DAY"
+    week = "WEEK"
+    month = "MONTH"
+    year = "YEAR"
+
+
+class MotivationCategory(str, enum.Enum):
+    career_progression = "career_progression"
+    compensation = "compensation"
+    technology = "technology"
+    leadership = "leadership"
+    relocation = "relocation"
+    remote_flexibility = "remote_flexibility"
+    company_stability = "company_stability"
+    industry_interest = "industry_interest"
+    product_ownership = "product_ownership"
+    team_environment = "team_environment"
+    other = "other"
+
+
+# Client-visibility default map. Any key missing from Application.client_visibility
+# resolves to the value here. `internal_notes` and `screening_outcome` are NEVER
+# client-visible — the visibility serializer ignores the map for those two.
+CLIENT_VISIBLE_FIELDS = (
+    "recruiter_summary",
+    "candidate_motivation",
+    "expected_compensation",
+    "notice_period",
+    "availability",
+    "preferred_work_model",
+    "preferred_location",
+    "relocation",
+)
+
+# Fields that must NEVER leave the recruiter tenant regardless of visibility map.
+NEVER_CLIENT_VISIBLE = (
+    "internal_notes",
+    "screening_outcome",
+    "current_compensation",
+    "assigned_recruiter_id",
+    "screening_completed_by",
+    "motivation_categories",  # detail; the recruiter_summary carries the client-safe narrative
+)
+
+DEFAULT_CLIENT_VISIBILITY = {f: True for f in CLIENT_VISIBLE_FIELDS}
+
+
+# ── Recruiter OS: Phase 2-7 enums ──────────────────────────────────────
+
+class ConsentStatus(str, enum.Enum):
+    pending = "pending"
+    confirmed = "confirmed"
+    declined = "declined"
+    expired = "expired"
+
+
+class ConsentMethod(str, enum.Enum):
+    email = "email"
+    phone = "phone"
+    portal = "portal"
+    manual = "manual"
+
+
+class SubmissionStatus(str, enum.Enum):
+    draft = "draft"
+    submitted = "submitted"
+    client_reviewing = "client_reviewing"
+    progressed = "progressed"
+    on_hold = "on_hold"
+    rejected = "rejected"
+    withdrawn = "withdrawn"
+
+
+class ClientDecision(str, enum.Enum):
+    progress = "progress"
+    hold = "hold"
+    reject = "reject"
+
+
+class FeedbackReason(str, enum.Enum):
+    technical_experience = "technical_experience"
+    industry_experience = "industry_experience"
+    seniority = "seniority"
+    salary = "salary"
+    location = "location"
+    availability = "availability"
+    notice_period = "notice_period"
+    communication = "communication"
+    role_changed = "role_changed"
+    other = "other"
+
+
+class InterviewStage(str, enum.Enum):
+    screen = "screen"
+    first = "first"
+    second = "second"
+    final = "final"
+    other = "other"
+
+
+class InterviewType(str, enum.Enum):
+    phone = "phone"
+    video = "video"
+    onsite = "onsite"
+    technical = "technical"
+    panel = "panel"
+
+
+class InterviewStatus(str, enum.Enum):
+    scheduled = "scheduled"
+    completed = "completed"
+    cancelled = "cancelled"
+    rescheduled = "rescheduled"
+    no_show = "no_show"
+
+
+class OfferStatus(str, enum.Enum):
+    draft = "draft"
+    sent = "sent"
+    negotiating = "negotiating"
+    accepted = "accepted"
+    declined = "declined"
+    withdrawn = "withdrawn"
+
+
+class PlacementStatus(str, enum.Enum):
+    upcoming = "upcoming"
+    started = "started"
+    completed = "completed"
+    cancelled = "cancelled"
+    refunded = "refunded"
+    replaced = "replaced"
+
+
+class TaskStatus(str, enum.Enum):
+    open = "open"
+    in_progress = "in_progress"
+    done = "done"
+    dismissed = "dismissed"
+
+
+class TaskPriority(str, enum.Enum):
+    low = "low"
+    medium = "medium"
+    high = "high"
+    urgent = "urgent"
+
+
+class NotificationKind(str, enum.Enum):
+    candidate_screening_due = "candidate_screening_due"
+    consent_missing = "consent_missing"
+    submission_viewed = "submission_viewed"
+    client_feedback_received = "client_feedback_received"
+    feedback_overdue = "feedback_overdue"
+    interview_requested = "interview_requested"
+    interview_upcoming = "interview_upcoming"
+    interview_feedback_missing = "interview_feedback_missing"
+    offer_updated = "offer_updated"
+    offer_expiring = "offer_expiring"
+    candidate_accepted = "candidate_accepted"
+    candidate_declined = "candidate_declined"
+    start_date_upcoming = "start_date_upcoming"
+    guarantee_ending = "guarantee_ending"
+    stale_pipeline = "stale_pipeline"
+    other = "other"

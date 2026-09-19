@@ -695,6 +695,128 @@ class ApplicationOut(ORMModel):
     added_from_shortlist_id: int | None = None
     swot: dict | None = None
     last_activity_at: datetime | None = None
+    # Recruiter OS Phase 1: role-specific screening block.
+    screening_outcome: str | None = None
+    screening_completed_at: datetime | None = None
+    screening_completed_by: int | None = None
+    assigned_recruiter_id: int | None = None
+    recruiter_summary: str | None = None
+    candidate_motivation: str | None = None
+    internal_notes: str | None = None
+    motivation_categories: list[str] | None = None
+    expected_compensation: dict | None = None
+    current_compensation: dict | None = None
+    notice_period: dict | None = None
+    availability_date: date | None = None
+    availability_immediate: bool = False
+    preferred_work_model: str | None = None
+    preferred_location: str | None = None
+    relocation: str | None = None
+    relocation_notes: str | None = None
+    client_visibility: dict = Field(default_factory=dict)
+
+
+# ── Recruiter OS Phase 1: screening payloads ───────────────────────────
+class CompensationBlock(BaseModel):
+    amount: int | None = None
+    currency: str | None = None
+    period: str | None = None  # YEAR | MONTH | WEEK | DAY | HOUR
+    minimum: int | None = None
+    maximum: int | None = None
+    target: int | None = None
+    fixed: int | None = None
+    variable: int | None = None
+    bonus: int | None = None
+    allowances: dict | None = None
+    rate: int | None = None
+    rate_period: str | None = None
+    contract_classification: str | None = None
+
+
+class NoticePeriodBlock(BaseModel):
+    value: int
+    unit: str  # DAY | WEEK | MONTH
+    negotiable: bool = False
+    available_from: date | None = None
+
+
+class ApplicationScreeningUpdate(BaseModel):
+    screening_outcome: str | None = None
+    recruiter_summary: str | None = None
+    candidate_motivation: str | None = None
+    internal_notes: str | None = None
+    motivation_categories: list[str] | None = None
+    expected_compensation: CompensationBlock | None = None
+    current_compensation: CompensationBlock | None = None
+    notice_period: NoticePeriodBlock | None = None
+    availability_date: date | None = None
+    availability_immediate: bool | None = None
+    preferred_work_model: str | None = None
+    preferred_location: str | None = None
+    relocation: str | None = None
+    relocation_notes: str | None = None
+    assigned_recruiter_id: int | None = None
+    client_visibility: dict | None = None
+    mark_completed: bool = False
+
+
+class ScreeningImproveRequest(BaseModel):
+    rough_notes: str
+
+
+class ScreeningImproveResult(BaseModel):
+    summary: str
+    unsupported_gaps: list[str] = Field(default_factory=list)
+    used_llm: bool
+    generated_at: datetime
+
+
+class ScreeningExtractRequest(BaseModel):
+    rough_notes: str
+
+
+class ScreeningExtractResult(BaseModel):
+    expected_compensation: dict | None = None
+    current_compensation: dict | None = None
+    notice_period: dict | None = None
+    availability_immediate: bool | None = None
+    preferred_work_model: str | None = None
+    preferred_location: str | None = None
+    candidate_motivation: str | None = None
+    motivation_categories: list[str] | None = None
+    used_llm: bool
+    generated_at: datetime
+
+
+class ClientVisibleApplicationOut(BaseModel):
+    application_id: int
+    role_id: int | None
+    candidate_id: int
+    stage: str | None = None
+    recruiter_summary: str | None = None
+    candidate_motivation: str | None = None
+    expected_compensation: dict | None = None
+    notice_period: dict | None = None
+    availability_date: str | None = None
+    availability_immediate: bool | None = None
+    preferred_work_model: str | None = None
+    preferred_location: str | None = None
+    relocation: str | None = None
+
+
+class MarketConfigOut(BaseModel):
+    country_code: str
+    country_name: str
+    default_currency: str
+    default_salary_period: str
+    salary_display_format: str
+    notice_period_presets: list[dict]
+    employment_types: list[str]
+    compensation_schema: list[str]
+    contract_schema: list[str]
+    date_format: str
+    phone_format: str
+    terminology: dict
 
 
 class SwotOut(BaseModel):
@@ -846,3 +968,532 @@ class MarketSnapshotOut(ORMModel):
     competing_roles: list[str] | None
     sources: list[str] | None
     created_at: datetime | None = None
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Recruiter OS — Phase 2-7 payloads
+# ═══════════════════════════════════════════════════════════════════════
+
+# ── Phase 2: Consent ──────────────────────────────────────────────────
+class ConsentCreate(BaseModel):
+    candidate_id: int
+    role_id: int
+    method: str | None = None
+    status: str = "confirmed"
+    evidence: str | None = None
+    expires_at: datetime | None = None
+
+
+class ConsentUpdate(BaseModel):
+    status: str | None = None
+    method: str | None = None
+    evidence: str | None = None
+    expires_at: datetime | None = None
+
+
+class ConsentOut(ORMModel):
+    id: int
+    agency_id: int
+    candidate_id: int
+    role_id: int
+    status: str
+    method: str | None = None
+    captured_at: datetime | None = None
+    captured_by: int | None = None
+    evidence: str | None = None
+    expires_at: datetime | None = None
+    created_at: datetime | None = None
+
+
+# ── Phase 2: Submission readiness + ClientSubmission ─────────────────
+class SubmissionReadinessItem(BaseModel):
+    key: str
+    label: str
+    ok: bool
+    hint: str | None = None
+
+
+class SubmissionReadinessOut(BaseModel):
+    application_id: int
+    ready: bool
+    items: list[SubmissionReadinessItem]
+    missing_count: int
+
+
+class ClientSubmissionCreate(BaseModel):
+    application_id: int
+    client_summary: str | None = None
+    key_strengths: list[str] | None = None
+    potential_gaps: list[str] | None = None
+    cv_version_id: str | None = None
+    mark_submitted: bool = False
+
+
+class ClientSubmissionUpdate(BaseModel):
+    client_summary: str | None = None
+    key_strengths: list[str] | None = None
+    potential_gaps: list[str] | None = None
+    cv_version_id: str | None = None
+    status: str | None = None
+    client_decision: str | None = None
+    client_feedback: str | None = None
+    client_viewed_at: datetime | None = None
+    client_responded_at: datetime | None = None
+
+
+class ClientSubmissionOut(ORMModel):
+    id: int
+    agency_id: int
+    client_id: int | None
+    role_id: int
+    candidate_id: int
+    application_id: int
+    submitted_by: int | None = None
+    submitted_at: datetime | None = None
+    status: str
+    client_summary: str | None = None
+    key_strengths: list[str] | None = None
+    potential_gaps: list[str] | None = None
+    compensation_snapshot: dict | None = None
+    notice_period_snapshot: dict | None = None
+    availability_snapshot: dict | None = None
+    motivation_snapshot: str | None = None
+    cv_version_id: str | None = None
+    client_decision: str | None = None
+    client_feedback: str | None = None
+    client_viewed_at: datetime | None = None
+    client_responded_at: datetime | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class AiSubmissionDraftRequest(BaseModel):
+    application_id: int
+
+
+class AiSubmissionDraftResult(BaseModel):
+    client_summary: str
+    key_strengths: list[str]
+    potential_gaps: list[str]
+    unsupported_claims: list[str] = Field(default_factory=list)
+    used_llm: bool
+    generated_at: datetime
+
+
+# ── Phase 3: Structured feedback + comparison + SLA ──────────────────
+class SubmissionFeedbackCreate(BaseModel):
+    decision: str
+    reasons: list[str] | None = None
+    comment: str | None = None
+    client_contact_name: str | None = None
+    client_contact_email: str | None = None
+    submitted_via: str | None = None
+
+
+class SubmissionFeedbackOut(ORMModel):
+    id: int
+    submission_id: int
+    decision: str
+    reasons: list[str] | None
+    comment: str | None
+    client_contact_name: str | None
+    client_contact_email: str | None
+    submitted_via: str | None
+    created_at: datetime | None = None
+
+
+class ClientSlaConfigUpdate(BaseModel):
+    expected_feedback_hours: int
+    notify_recruiter: bool = True
+
+
+class ClientSlaConfigOut(ORMModel):
+    id: int
+    client_id: int
+    expected_feedback_hours: int
+    notify_recruiter: bool
+
+
+class CandidateComparisonRequest(BaseModel):
+    role_id: int
+    candidate_ids: list[int]
+
+
+class CandidateComparisonRow(BaseModel):
+    candidate_id: int
+    display_name: str | None = None
+    fit_score: float | None = None
+    expected_compensation: dict | None = None
+    notice_period: dict | None = None
+    availability_immediate: bool | None = None
+    top_skills: list[str] = Field(default_factory=list)
+
+
+class CandidateComparisonOut(BaseModel):
+    role_id: int
+    rows: list[CandidateComparisonRow]
+    ai_key_differences: list[str] = Field(default_factory=list)
+    used_llm: bool = False
+
+
+class FeedbackSlaSummaryOut(BaseModel):
+    client_id: int
+    expected_feedback_hours: int
+    average_feedback_hours: float | None = None
+    awaiting_feedback: int
+    overdue: int
+
+
+# ── Phase 4: Interviews ───────────────────────────────────────────────
+class InterviewCreate(BaseModel):
+    application_id: int
+    stage: str = "first"
+    interview_type: str | None = None
+    interviewers: list[dict] | None = None
+    proposed_times: list[datetime] | None = None
+    confirmed_time: datetime | None = None
+    duration_minutes: int | None = None
+    location: str | None = None
+    meeting_url: str | None = None
+    notes: str | None = None
+
+
+class InterviewUpdate(BaseModel):
+    stage: str | None = None
+    interview_type: str | None = None
+    interviewers: list[dict] | None = None
+    proposed_times: list[datetime] | None = None
+    confirmed_time: datetime | None = None
+    duration_minutes: int | None = None
+    location: str | None = None
+    meeting_url: str | None = None
+    status: str | None = None
+    notes: str | None = None
+
+
+class InterviewOut(ORMModel):
+    id: int
+    application_id: int
+    submission_id: int | None
+    role_id: int
+    candidate_id: int
+    client_id: int | None
+    stage: str
+    interview_type: str | None = None
+    interviewers: list[dict] | None = None
+    proposed_times: list[str] | None = None
+    confirmed_time: datetime | None = None
+    duration_minutes: int | None = None
+    location: str | None = None
+    meeting_url: str | None = None
+    status: str
+    notes: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class InterviewFeedbackCreate(BaseModel):
+    interviewer_name: str | None = None
+    technical: int | None = None
+    communication: int | None = None
+    role_understanding: int | None = None
+    domain_knowledge: int | None = None
+    leadership: int | None = None
+    culture_alignment: int | None = None
+    decision: str | None = None
+    comment: str | None = None
+
+
+class InterviewFeedbackOut(ORMModel):
+    id: int
+    interview_id: int
+    interviewer_name: str | None
+    technical: int | None
+    communication: int | None
+    role_understanding: int | None
+    domain_knowledge: int | None
+    leadership: int | None
+    culture_alignment: int | None
+    decision: str | None
+    comment: str | None
+    created_at: datetime | None = None
+
+
+class InterviewBriefOut(BaseModel):
+    interview_id: int
+    likely_topics: list[str]
+    candidate_strengths: list[str]
+    potential_gaps: list[str]
+    suggested_questions: list[dict]
+    used_llm: bool
+    generated_at: datetime
+
+
+# ── Phase 5: Offers + Placements ──────────────────────────────────────
+class OfferCreate(BaseModel):
+    application_id: int
+    base_compensation: dict | None = None
+    bonus: dict | None = None
+    equity: dict | None = None
+    allowances: dict | None = None
+    benefits: str | None = None
+    start_date: date | None = None
+    offer_date: date | None = None
+    expiry_date: date | None = None
+    notes: str | None = None
+
+
+class OfferUpdate(BaseModel):
+    base_compensation: dict | None = None
+    bonus: dict | None = None
+    equity: dict | None = None
+    allowances: dict | None = None
+    benefits: str | None = None
+    start_date: date | None = None
+    offer_date: date | None = None
+    expiry_date: date | None = None
+    status: str | None = None
+    notes: str | None = None
+
+
+class OfferOut(ORMModel):
+    id: int
+    application_id: int
+    submission_id: int | None
+    role_id: int
+    candidate_id: int
+    client_id: int | None
+    base_compensation: dict | None = None
+    bonus: dict | None = None
+    equity: dict | None = None
+    allowances: dict | None = None
+    benefits: str | None = None
+    start_date: date | None = None
+    offer_date: date | None = None
+    expiry_date: date | None = None
+    status: str
+    assigned_recruiter_id: int | None = None
+    notes: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class OfferNegotiationCreate(BaseModel):
+    round_label: str = "counter"
+    from_party: str | None = None
+    compensation: dict | None = None
+    comment: str | None = None
+
+
+class OfferNegotiationOut(ORMModel):
+    id: int
+    offer_id: int
+    round_label: str
+    from_party: str | None = None
+    compensation: dict | None = None
+    comment: str | None = None
+    author_recruiter_id: int | None = None
+    created_at: datetime | None = None
+
+
+class PlacementCreate(BaseModel):
+    offer_id: int | None = None
+    application_id: int | None = None
+    role_id: int
+    candidate_id: int
+    client_id: int | None = None
+    start_date: date | None = None
+    final_compensation: dict | None = None
+    fee_percent: float | None = None
+    fee_amount: int | None = None
+    guarantee_weeks: int | None = None
+    notes: str | None = None
+
+
+class PlacementUpdate(BaseModel):
+    start_date: date | None = None
+    final_compensation: dict | None = None
+    fee_percent: float | None = None
+    fee_amount: int | None = None
+    guarantee_weeks: int | None = None
+    guarantee_ends_at: date | None = None
+    status: str | None = None
+    notes: str | None = None
+
+
+class PlacementOut(ORMModel):
+    id: int
+    offer_id: int | None
+    role_id: int
+    candidate_id: int
+    client_id: int | None
+    recruiter_id: int | None
+    start_date: date | None
+    final_compensation: dict | None
+    fee_percent: float | None
+    fee_amount: int | None
+    guarantee_weeks: int | None
+    guarantee_ends_at: date | None
+    status: str
+    notes: str | None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class PostPlacementCheckinCreate(BaseModel):
+    day_offset: int
+    due_date: date | None = None
+
+
+class PostPlacementCheckinUpdate(BaseModel):
+    completed_at: datetime | None = None
+    outcome: str | None = None
+    notes: str | None = None
+
+
+class PostPlacementCheckinOut(ORMModel):
+    id: int
+    placement_id: int
+    day_offset: int
+    due_date: date | None = None
+    completed_at: datetime | None = None
+    completed_by: int | None = None
+    outcome: str | None = None
+    notes: str | None = None
+
+
+# ── Phase 6: Tasks + Notifications + Daily Brief ─────────────────────
+class RecruiterTaskCreate(BaseModel):
+    title: str
+    detail: str | None = None
+    owner_recruiter_id: int | None = None
+    priority: str = "medium"
+    due_at: datetime | None = None
+    parent_kind: str | None = None
+    parent_id: int | None = None
+    ai_generated: bool = False
+
+
+class RecruiterTaskUpdate(BaseModel):
+    title: str | None = None
+    detail: str | None = None
+    owner_recruiter_id: int | None = None
+    status: str | None = None
+    priority: str | None = None
+    due_at: datetime | None = None
+
+
+class RecruiterTaskOut(ORMModel):
+    id: int
+    owner_recruiter_id: int | None = None
+    title: str
+    detail: str | None = None
+    status: str
+    priority: str
+    due_at: datetime | None = None
+    completed_at: datetime | None = None
+    parent_kind: str | None = None
+    parent_id: int | None = None
+    ai_generated: bool
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class NotificationOut(ORMModel):
+    id: int
+    recruiter_id: int | None = None
+    kind: str
+    title: str
+    body: str | None = None
+    parent_kind: str | None = None
+    parent_id: int | None = None
+    priority: str
+    is_read: bool
+    created_at: datetime | None = None
+
+
+class NotificationBulkUpdate(BaseModel):
+    ids: list[int]
+    is_read: bool = True
+
+
+class DailyBriefItem(BaseModel):
+    priority: str
+    title: str
+    detail: str | None = None
+    action_kind: str | None = None
+    parent_kind: str | None = None
+    parent_id: int | None = None
+
+
+class DailyBriefOut(BaseModel):
+    recruiter_id: int | None = None
+    generated_at: datetime
+    urgent: list[DailyBriefItem] = Field(default_factory=list)
+    high: list[DailyBriefItem] = Field(default_factory=list)
+    medium: list[DailyBriefItem] = Field(default_factory=list)
+    opportunities: list[DailyBriefItem] = Field(default_factory=list)
+    used_llm: bool = False
+
+
+# ── Phase 7: AI intelligence ─────────────────────────────────────────
+class AskPoolRequest(BaseModel):
+    query: str
+    limit: int = 10
+
+
+class AskPoolMatch(BaseModel):
+    candidate_id: int
+    display_name: str | None
+    fit_reason: str
+    top_skills: list[str] = Field(default_factory=list)
+    expected_compensation: dict | None = None
+    notice_period: dict | None = None
+
+
+class AskPoolResult(BaseModel):
+    query: str
+    matches: list[AskPoolMatch]
+    filters_applied: dict = Field(default_factory=dict)
+    used_llm: bool
+    generated_at: datetime
+
+
+class RoleQualityCheckOut(BaseModel):
+    role_id: int
+    observations: list[str]
+    candidate_pool_risk: str  # "low" | "medium" | "high"
+    used_llm: bool
+    generated_at: datetime
+
+
+class RoleHealthOut(BaseModel):
+    role_id: int
+    sourced: int
+    screened: int
+    submitted: int
+    interviewed: int
+    offered: int
+    placed: int
+    rejected: int
+    pipeline_risk: str
+    common_rejection_reasons: list[str]
+    suggestion: str | None
+    used_llm: bool
+    generated_at: datetime
+
+
+class ClientIntelligenceOut(BaseModel):
+    client_id: int
+    open_roles: int
+    submissions: int
+    interviews: int
+    offers: int
+    placements: int
+    interview_rate: float | None
+    offer_rate: float | None
+    average_feedback_hours: float | None
+    common_rejection_reasons: list[str]
+    summary: str | None
+    used_llm: bool
+    generated_at: datetime

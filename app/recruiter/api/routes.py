@@ -21,18 +21,31 @@ from app.recruiter.api.deps import (
 from app.recruiter.enums import ApplicationStage
 from app.recruiter.models import (
     Agency,
+    AiInsightCache,
     Application,
     ApplicationNote,
+    CandidateConsent,
     CandidateProfile,
     Client,
+    ClientSlaConfig,
+    ClientSubmission,
+    Interview,
+    InterviewFeedback,
     MarketSnapshot,
+    Notification,
+    Offer,
+    OfferNegotiation,
+    Placement,
+    PostPlacementCheckin,
     Recruiter,
+    RecruiterTask,
     Role,
     RoleFeedback,
     RoleShareToken,
     Shortlist,
     ShortlistEntry,
     SpecSheetTemplate,
+    SubmissionFeedback,
 )
 from app.recruiter.schemas import (
     ApplicationCreate,
@@ -83,10 +96,64 @@ from app.recruiter.schemas import (
     RoleUpdate,
     ShortlistOut,
     SwotOut,
+    ApplicationScreeningUpdate,
+    ClientVisibleApplicationOut,
+    MarketConfigOut,
+    ScreeningExtractRequest,
+    ScreeningExtractResult,
+    ScreeningImproveRequest,
+    ScreeningImproveResult,
+    ConsentCreate,
+    ConsentUpdate,
+    ConsentOut,
+    SubmissionReadinessOut,
+    ClientSubmissionCreate,
+    ClientSubmissionUpdate,
+    ClientSubmissionOut,
+    AiSubmissionDraftRequest,
+    AiSubmissionDraftResult,
+    SubmissionFeedbackCreate,
+    SubmissionFeedbackOut,
+    ClientSlaConfigUpdate,
+    ClientSlaConfigOut,
+    CandidateComparisonRequest,
+    CandidateComparisonOut,
+    FeedbackSlaSummaryOut,
+    InterviewCreate,
+    InterviewUpdate,
+    InterviewOut,
+    InterviewFeedbackCreate,
+    InterviewFeedbackOut,
+    InterviewBriefOut,
+    OfferCreate,
+    OfferUpdate,
+    OfferOut,
+    OfferNegotiationCreate,
+    OfferNegotiationOut,
+    PlacementCreate,
+    PlacementUpdate,
+    PlacementOut,
+    PostPlacementCheckinCreate,
+    PostPlacementCheckinUpdate,
+    PostPlacementCheckinOut,
+    RecruiterTaskCreate,
+    RecruiterTaskUpdate,
+    RecruiterTaskOut,
+    NotificationOut,
+    NotificationBulkUpdate,
+    DailyBriefOut,
+    AskPoolRequest,
+    AskPoolResult,
+    RoleQualityCheckOut,
+    RoleHealthOut,
+    ClientIntelligenceOut,
 )
 from app.recruiter.bridge import provision_candidate
 from app.recruiter.enums import UsageKind
 from app.recruiter.services import usage as usage_service
+from app.recruiter.services import market_config as market_config_service
+from app.recruiter.services import visibility as visibility_service
+from app.recruiter.services.screening import improve_summary, extract_structured_notes
 from app.recruiter.services.advisory import next_hire_advisory
 from app.recruiter.services.client_analytics import compute_client_analytics
 from app.recruiter.services.ingestion import ingest_batch
@@ -1404,3 +1471,1116 @@ def crawl_agency_market_endpoint(
         snapshots=[MarketSnapshotOut.model_validate(s) for s in snaps],
         total=len(snaps),
     )
+
+
+
+# ── Recruiter OS Phase 1: role-specific screening ───────────────────────
+
+def _load_application_or_404(db, agency, application_id: int) -> Application:
+    app_row = db.get(Application, application_id)
+    if app_row is None or app_row.agency_id != agency.id:
+        raise HTTPException(status_code=404, detail="Application not found")
+    return app_row
+
+
+@applications_router.get("/{application_id}/screening", response_model=ApplicationOut)
+def get_application_screening(
+    application_id: int,
+    agency: Agency = Depends(get_agency),
+    db: Session = Depends(get_db),
+):
+    app_row = _load_application_or_404(db, agency, application_id)
+    return app_row
+
+
+@applications_router.patch("/{application_id}/screening", response_model=ApplicationOut)
+def update_application_screening(
+    application_id: int,
+    payload: ApplicationScreeningUpdate,
+    agency: Agency = Depends(require_unlocked_agency),
+    recruiter: Recruiter | None = Depends(_soft_recruiter),
+    db: Session = Depends(get_db),
+):
+    """
+    Partial update for the role-specific screening block. Fields omitted from
+    the payload are left unchanged. Screening only makes sense when the
+    application is linked to a role — otherwise 400.
+    """
+    app_row = _load_application_or_404(db, agency, application_id)
+    if app_row.role_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Screening requires the application to be linked to a role.",
+        )
+
+    data = payload.model_dump(exclude_unset=True)
+    prev_outcome = app_row.screening_outcome
+
+    if payload.expected_compensation is not None:
+        app_row.expected_compensation = payload.expected_compensation.model_dump(exclude_none=True)
+        data.pop("expected_compensation", None)
+    if payload.current_compensation is not None:
+        app_row.current_compensation = payload.current_compensation.model_dump(exclude_none=True)
+        data.pop("current_compensation", None)
+    if payload.notice_period is not None:
+        np = payload.notice_period.model_dump(exclude_none=True)
+        if np.get("available_from") and hasattr(np["available_from"], "isoformat"):
+            np["available_from"] = np["available_from"].isoformat()
+        app_row.notice_period = np
+        data.pop("notice_period", None)
+
+    if "screening_outcome" in data and data["screening_outcome"] is not None:
+        from app.recruiter.enums import ScreeningOutcome
+        try:
+            app_row.screening_outcome = ScreeningOutcome(data["screening_outcome"])
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid screening_outcome")
+        data.pop("screening_outcome")
+    if "preferred_work_model" in data and data["preferred_work_model"] is not None:
+        from app.recruiter.enums import WorkModel
+        try:
+            app_row.preferred_work_model = WorkModel(data["preferred_work_model"])
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid preferred_work_model")
+        data.pop("preferred_work_model")
+    if "relocation" in data and data["relocation"] is not None:
+        from app.recruiter.enums import RelocationPreference
+        try:
+            app_row.relocation = RelocationPreference(data["relocation"])
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid relocation preference")
+        data.pop("relocation")
+
+    for field in (
+        "recruiter_summary", "candidate_motivation", "internal_notes",
+        "motivation_categories", "availability_date", "availability_immediate",
+        "preferred_location", "relocation_notes", "assigned_recruiter_id",
+        "client_visibility",
+    ):
+        if field in data:
+            setattr(app_row, field, data[field])
+
+    if payload.mark_completed:
+        app_row.screening_completed_at = datetime.utcnow()
+        app_row.screening_completed_by = recruiter.id if recruiter else None
+
+    app_row.last_activity_at = datetime.utcnow()
+
+    if app_row.screening_outcome != prev_outcome and app_row.screening_outcome is not None:
+        db.add(
+            ApplicationNote(
+                agency_id=agency.id,
+                application_id=app_row.id,
+                author_recruiter_id=recruiter.id if recruiter else None,
+                author_name=(recruiter.full_name or recruiter.email) if recruiter else None,
+                kind="system",
+                body=f"Screening outcome set to {app_row.screening_outcome.value}",
+            )
+        )
+
+    db.commit()
+    db.refresh(app_row)
+    return app_row
+
+
+@applications_router.get(
+    "/{application_id}/client-view",
+    response_model=ClientVisibleApplicationOut,
+)
+def application_client_view(
+    application_id: int,
+    agency: Agency = Depends(get_agency),
+    db: Session = Depends(get_db),
+):
+    """
+    Server-side client-visible serialisation. Recruiter-facing (used to
+    preview what the client will see); Phase 2 client portal endpoints will
+    also route through visibility_service.to_client_view.
+    """
+    app_row = _load_application_or_404(db, agency, application_id)
+    return visibility_service.to_client_view(app_row)
+
+
+@applications_router.post(
+    "/{application_id}/screening/ai-improve-summary",
+    response_model=ScreeningImproveResult,
+)
+def ai_improve_summary(
+    application_id: int,
+    payload: ScreeningImproveRequest,
+    agency: Agency = Depends(require_unlocked_agency),
+    db: Session = Depends(get_db),
+):
+    app_row = _load_application_or_404(db, agency, application_id)
+    cand = db.get(CandidateProfile, app_row.candidate_id)
+    role = db.get(Role, app_row.role_id) if app_row.role_id else None
+    return improve_summary(
+        payload.rough_notes,
+        cand_name=(cand.full_name if cand else None),
+        role_title=(role.title if role else None),
+    )
+
+
+@applications_router.post(
+    "/{application_id}/screening/ai-extract-notes",
+    response_model=ScreeningExtractResult,
+)
+def ai_extract_notes(
+    application_id: int,
+    payload: ScreeningExtractRequest,
+    agency: Agency = Depends(require_unlocked_agency),
+    db: Session = Depends(get_db),
+):
+    app_row = _load_application_or_404(db, agency, application_id)
+    role = db.get(Role, app_row.role_id) if app_row.role_id else None
+    return extract_structured_notes(
+        payload.rough_notes,
+        country_code=(role.country_code if role else None),
+    )
+
+
+# ── Market configuration (static reference data) ────────────────────────
+market_config_router = APIRouter(prefix="/market-configs", tags=["recruiter: market-config"])
+
+
+@market_config_router.get("", response_model=list[MarketConfigOut])
+def list_market_configs():
+    return [MarketConfigOut(**c.to_dict()) for c in market_config_service.all_configs()]
+
+
+@market_config_router.get("/{country_code}", response_model=MarketConfigOut)
+def get_market_config(country_code: str):
+    if not market_config_service.is_supported(country_code):
+        raise HTTPException(status_code=404, detail="Unsupported country")
+    return MarketConfigOut(**market_config_service.get_config(country_code).to_dict())
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Recruiter OS — Phase 2 routes: Consent + Submission workflow
+# ═══════════════════════════════════════════════════════════════════════
+from app.recruiter.services import submissions as submissions_service
+from app.recruiter.services import collaboration as collaboration_service
+from app.recruiter.services import interviews as interviews_service
+from app.recruiter.services import offers as offers_service
+from app.recruiter.services import productivity as productivity_service
+from app.recruiter.services import intelligence as intelligence_service
+
+
+consent_router = APIRouter(
+    prefix="/agencies/{agency_id}/consents", tags=["recruiter: consent"]
+)
+
+
+@consent_router.post("", response_model=ConsentOut, status_code=201)
+def create_consent(
+    payload: ConsentCreate,
+    agency: Agency = Depends(require_unlocked_agency),
+    recruiter: Recruiter | None = Depends(_soft_recruiter),
+    db: Session = Depends(get_db),
+):
+    cand = db.get(CandidateProfile, payload.candidate_id)
+    if cand is None or cand.agency_id != agency.id:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+    role = db.get(Role, payload.role_id)
+    if role is None or role.agency_id != agency.id:
+        raise HTTPException(status_code=404, detail="Role not found")
+    from app.recruiter.enums import ConsentStatus, ConsentMethod
+    try:
+        status = ConsentStatus(payload.status)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid consent status")
+    method = None
+    if payload.method:
+        try:
+            method = ConsentMethod(payload.method)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid consent method")
+    consent = CandidateConsent(
+        agency_id=agency.id, candidate_id=payload.candidate_id,
+        role_id=payload.role_id, status=status, method=method,
+        captured_at=datetime.utcnow() if status == ConsentStatus.confirmed else None,
+        captured_by=recruiter.id if recruiter else None,
+        evidence=payload.evidence, expires_at=payload.expires_at,
+    )
+    db.add(consent); db.commit(); db.refresh(consent)
+    return consent
+
+
+@consent_router.get("", response_model=list[ConsentOut])
+def list_consents(
+    agency: Agency = Depends(get_agency),
+    candidate_id: int | None = Query(default=None),
+    role_id: int | None = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    q = db.query(CandidateConsent).filter(CandidateConsent.agency_id == agency.id)
+    if candidate_id is not None:
+        q = q.filter(CandidateConsent.candidate_id == candidate_id)
+    if role_id is not None:
+        q = q.filter(CandidateConsent.role_id == role_id)
+    return q.order_by(CandidateConsent.id.desc()).all()
+
+
+@consent_router.patch("/{consent_id}", response_model=ConsentOut)
+def update_consent(
+    consent_id: int,
+    payload: ConsentUpdate,
+    agency: Agency = Depends(require_unlocked_agency),
+    recruiter: Recruiter | None = Depends(_soft_recruiter),
+    db: Session = Depends(get_db),
+):
+    consent = db.get(CandidateConsent, consent_id)
+    if consent is None or consent.agency_id != agency.id:
+        raise HTTPException(status_code=404, detail="Consent not found")
+    from app.recruiter.enums import ConsentStatus, ConsentMethod
+    if payload.status:
+        try:
+            consent.status = ConsentStatus(payload.status)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid consent status")
+        if consent.status == ConsentStatus.confirmed and consent.captured_at is None:
+            consent.captured_at = datetime.utcnow()
+            consent.captured_by = recruiter.id if recruiter else None
+    if payload.method:
+        try:
+            consent.method = ConsentMethod(payload.method)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid consent method")
+    if payload.evidence is not None:
+        consent.evidence = payload.evidence
+    if payload.expires_at is not None:
+        consent.expires_at = payload.expires_at
+    db.commit(); db.refresh(consent)
+    return consent
+
+
+# ── Submission readiness + ClientSubmission CRUD ────────────────────
+submissions_router = APIRouter(
+    prefix="/agencies/{agency_id}/submissions", tags=["recruiter: submissions"]
+)
+
+
+@applications_router.get(
+    "/{application_id}/readiness", response_model=SubmissionReadinessOut,
+)
+def application_readiness(
+    application_id: int,
+    agency: Agency = Depends(get_agency),
+    db: Session = Depends(get_db),
+):
+    app_row = _load_application_or_404(db, agency, application_id)
+    return submissions_service.readiness(db, agency.id, app_row)
+
+
+@submissions_router.post("", response_model=ClientSubmissionOut, status_code=201)
+def create_submission(
+    payload: ClientSubmissionCreate,
+    agency: Agency = Depends(require_unlocked_agency),
+    recruiter: Recruiter | None = Depends(_soft_recruiter),
+    db: Session = Depends(get_db),
+):
+    app_row = _load_application_or_404(db, agency, payload.application_id)
+    if app_row.role_id is None:
+        raise HTTPException(status_code=400, detail="Application must be linked to a role")
+    role = db.get(Role, app_row.role_id)
+    sub = ClientSubmission(
+        agency_id=agency.id,
+        client_id=role.client_id if role else None,
+        role_id=app_row.role_id,
+        candidate_id=app_row.candidate_id,
+        application_id=app_row.id,
+        client_summary=payload.client_summary,
+        key_strengths=payload.key_strengths,
+        potential_gaps=payload.potential_gaps,
+        cv_version_id=payload.cv_version_id,
+    )
+    submissions_service.snapshot_screening_into(sub, app_row)
+    if payload.mark_submitted:
+        from app.recruiter.enums import SubmissionStatus
+        sub.status = SubmissionStatus.submitted
+        sub.submitted_at = datetime.utcnow()
+        sub.submitted_by = recruiter.id if recruiter else None
+    db.add(sub); db.commit(); db.refresh(sub)
+    return sub
+
+
+@submissions_router.get("", response_model=list[ClientSubmissionOut])
+def list_submissions(
+    agency: Agency = Depends(get_agency),
+    role_id: int | None = Query(default=None),
+    candidate_id: int | None = Query(default=None),
+    client_id: int | None = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    q = db.query(ClientSubmission).filter(ClientSubmission.agency_id == agency.id)
+    if role_id is not None: q = q.filter(ClientSubmission.role_id == role_id)
+    if candidate_id is not None: q = q.filter(ClientSubmission.candidate_id == candidate_id)
+    if client_id is not None: q = q.filter(ClientSubmission.client_id == client_id)
+    return q.order_by(ClientSubmission.id.desc()).all()
+
+
+@submissions_router.get("/{submission_id}", response_model=ClientSubmissionOut)
+def get_submission(
+    submission_id: int,
+    agency: Agency = Depends(get_agency),
+    db: Session = Depends(get_db),
+):
+    sub = db.get(ClientSubmission, submission_id)
+    if sub is None or sub.agency_id != agency.id:
+        raise HTTPException(status_code=404, detail="Submission not found")
+    return sub
+
+
+@submissions_router.patch("/{submission_id}", response_model=ClientSubmissionOut)
+def update_submission(
+    submission_id: int,
+    payload: ClientSubmissionUpdate,
+    agency: Agency = Depends(require_unlocked_agency),
+    recruiter: Recruiter | None = Depends(_soft_recruiter),
+    db: Session = Depends(get_db),
+):
+    sub = db.get(ClientSubmission, submission_id)
+    if sub is None or sub.agency_id != agency.id:
+        raise HTTPException(status_code=404, detail="Submission not found")
+    from app.recruiter.enums import SubmissionStatus, ClientDecision
+    if payload.client_summary is not None: sub.client_summary = payload.client_summary
+    if payload.key_strengths is not None: sub.key_strengths = payload.key_strengths
+    if payload.potential_gaps is not None: sub.potential_gaps = payload.potential_gaps
+    if payload.cv_version_id is not None: sub.cv_version_id = payload.cv_version_id
+    if payload.status is not None:
+        try:
+            new_status = SubmissionStatus(payload.status)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid submission status")
+        if new_status == SubmissionStatus.submitted and sub.status != SubmissionStatus.submitted:
+            sub.submitted_at = datetime.utcnow()
+            sub.submitted_by = recruiter.id if recruiter else None
+        sub.status = new_status
+    if payload.client_decision:
+        try:
+            sub.client_decision = ClientDecision(payload.client_decision)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid client decision")
+    if payload.client_feedback is not None: sub.client_feedback = payload.client_feedback
+    if payload.client_viewed_at is not None: sub.client_viewed_at = payload.client_viewed_at
+    if payload.client_responded_at is not None: sub.client_responded_at = payload.client_responded_at
+    db.commit(); db.refresh(sub)
+    return sub
+
+
+@submissions_router.post(
+    "/{submission_id}/ai-draft", response_model=AiSubmissionDraftResult,
+)
+def ai_draft_submission(
+    submission_id: int,
+    agency: Agency = Depends(require_unlocked_agency),
+    db: Session = Depends(get_db),
+):
+    sub = db.get(ClientSubmission, submission_id)
+    if sub is None or sub.agency_id != agency.id:
+        raise HTTPException(status_code=404, detail="Submission not found")
+    app_row = db.get(Application, sub.application_id)
+    cand = db.get(CandidateProfile, sub.candidate_id)
+    role = db.get(Role, sub.role_id)
+    return submissions_service.ai_draft_submission(app_row, cand, role)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Recruiter OS — Phase 3 routes: feedback, comparison, SLA
+# ═══════════════════════════════════════════════════════════════════════
+
+@submissions_router.post(
+    "/{submission_id}/feedback", response_model=SubmissionFeedbackOut, status_code=201,
+)
+def create_submission_feedback(
+    submission_id: int,
+    payload: SubmissionFeedbackCreate,
+    agency: Agency = Depends(require_unlocked_agency),
+    db: Session = Depends(get_db),
+):
+    sub = db.get(ClientSubmission, submission_id)
+    if sub is None or sub.agency_id != agency.id:
+        raise HTTPException(status_code=404, detail="Submission not found")
+    from app.recruiter.enums import ClientDecision
+    try:
+        decision = ClientDecision(payload.decision)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid decision")
+    fb = SubmissionFeedback(
+        agency_id=agency.id, submission_id=submission_id, decision=decision,
+        reasons=payload.reasons, comment=payload.comment,
+        client_contact_name=payload.client_contact_name,
+        client_contact_email=payload.client_contact_email,
+        submitted_via=payload.submitted_via,
+    )
+    db.add(fb)
+    # Mirror decision + first responded timestamp onto the submission
+    sub.client_decision = decision
+    if sub.client_responded_at is None:
+        sub.client_responded_at = datetime.utcnow()
+    db.commit(); db.refresh(fb)
+    return fb
+
+
+@submissions_router.get(
+    "/{submission_id}/feedback", response_model=list[SubmissionFeedbackOut],
+)
+def list_submission_feedback(
+    submission_id: int,
+    agency: Agency = Depends(get_agency),
+    db: Session = Depends(get_db),
+):
+    sub = db.get(ClientSubmission, submission_id)
+    if sub is None or sub.agency_id != agency.id:
+        raise HTTPException(status_code=404, detail="Submission not found")
+    return (
+        db.query(SubmissionFeedback)
+        .filter(SubmissionFeedback.submission_id == submission_id)
+        .order_by(SubmissionFeedback.id.desc()).all()
+    )
+
+
+sla_router = APIRouter(
+    prefix="/agencies/{agency_id}/clients/{client_id}", tags=["recruiter: sla"]
+)
+
+
+@sla_router.get("/sla", response_model=ClientSlaConfigOut | None)
+def get_client_sla(
+    client_id: int,
+    agency: Agency = Depends(get_agency),
+    db: Session = Depends(get_db),
+):
+    cfg = db.query(ClientSlaConfig).filter(
+        ClientSlaConfig.agency_id == agency.id, ClientSlaConfig.client_id == client_id,
+    ).first()
+    return cfg
+
+
+@sla_router.put("/sla", response_model=ClientSlaConfigOut)
+def upsert_client_sla(
+    client_id: int,
+    payload: ClientSlaConfigUpdate,
+    agency: Agency = Depends(require_unlocked_agency),
+    db: Session = Depends(get_db),
+):
+    client = db.get(Client, client_id)
+    if client is None or client.agency_id != agency.id:
+        raise HTTPException(status_code=404, detail="Client not found")
+    cfg = db.query(ClientSlaConfig).filter(
+        ClientSlaConfig.agency_id == agency.id, ClientSlaConfig.client_id == client_id,
+    ).first()
+    if cfg is None:
+        cfg = ClientSlaConfig(agency_id=agency.id, client_id=client_id)
+        db.add(cfg)
+    cfg.expected_feedback_hours = payload.expected_feedback_hours
+    cfg.notify_recruiter = payload.notify_recruiter
+    db.commit(); db.refresh(cfg)
+    return cfg
+
+
+@sla_router.get("/sla-summary", response_model=FeedbackSlaSummaryOut)
+def client_sla_summary(
+    client_id: int,
+    agency: Agency = Depends(get_agency),
+    db: Session = Depends(get_db),
+):
+    client = db.get(Client, client_id)
+    if client is None or client.agency_id != agency.id:
+        raise HTTPException(status_code=404, detail="Client not found")
+    return collaboration_service.sla_summary(db, agency.id, client_id)
+
+
+comparison_router = APIRouter(
+    prefix="/agencies/{agency_id}/candidate-comparison",
+    tags=["recruiter: comparison"],
+)
+
+
+@comparison_router.post("", response_model=CandidateComparisonOut)
+def compare_candidates(
+    payload: CandidateComparisonRequest,
+    agency: Agency = Depends(get_agency),
+    db: Session = Depends(get_db),
+):
+    role = db.get(Role, payload.role_id)
+    if role is None or role.agency_id != agency.id:
+        raise HTTPException(status_code=404, detail="Role not found")
+    return collaboration_service.candidate_comparison(
+        db, agency.id, payload.role_id, payload.candidate_ids,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Recruiter OS — Phase 4 routes: Interviews
+# ═══════════════════════════════════════════════════════════════════════
+interviews_router = APIRouter(
+    prefix="/agencies/{agency_id}/interviews", tags=["recruiter: interviews"]
+)
+
+
+def _load_interview_or_404(db, agency, iid: int) -> Interview:
+    iv = db.get(Interview, iid)
+    if iv is None or iv.agency_id != agency.id:
+        raise HTTPException(status_code=404, detail="Interview not found")
+    return iv
+
+
+@interviews_router.post("", response_model=InterviewOut, status_code=201)
+def create_interview(
+    payload: InterviewCreate,
+    agency: Agency = Depends(require_unlocked_agency),
+    db: Session = Depends(get_db),
+):
+    app_row = _load_application_or_404(db, agency, payload.application_id)
+    from app.recruiter.enums import InterviewStage, InterviewType
+    try:
+        stage = InterviewStage(payload.stage)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid interview stage")
+    itype = None
+    if payload.interview_type:
+        try: itype = InterviewType(payload.interview_type)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid interview_type")
+    role = db.get(Role, app_row.role_id) if app_row.role_id else None
+    iv = Interview(
+        agency_id=agency.id, application_id=app_row.id, role_id=app_row.role_id,
+        candidate_id=app_row.candidate_id,
+        client_id=role.client_id if role else None,
+        stage=stage, interview_type=itype,
+        interviewers=payload.interviewers,
+        proposed_times=[t.isoformat() for t in (payload.proposed_times or [])],
+        confirmed_time=payload.confirmed_time,
+        duration_minutes=payload.duration_minutes,
+        location=payload.location, meeting_url=payload.meeting_url,
+        notes=payload.notes,
+    )
+    db.add(iv); db.commit(); db.refresh(iv)
+    return iv
+
+
+@interviews_router.get("", response_model=list[InterviewOut])
+def list_interviews(
+    agency: Agency = Depends(get_agency),
+    application_id: int | None = Query(default=None),
+    role_id: int | None = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    q = db.query(Interview).filter(Interview.agency_id == agency.id)
+    if application_id is not None: q = q.filter(Interview.application_id == application_id)
+    if role_id is not None: q = q.filter(Interview.role_id == role_id)
+    return q.order_by(Interview.id.desc()).all()
+
+
+@interviews_router.get("/{interview_id}", response_model=InterviewOut)
+def get_interview(
+    interview_id: int,
+    agency: Agency = Depends(get_agency),
+    db: Session = Depends(get_db),
+):
+    return _load_interview_or_404(db, agency, interview_id)
+
+
+@interviews_router.patch("/{interview_id}", response_model=InterviewOut)
+def update_interview(
+    interview_id: int,
+    payload: InterviewUpdate,
+    agency: Agency = Depends(require_unlocked_agency),
+    db: Session = Depends(get_db),
+):
+    iv = _load_interview_or_404(db, agency, interview_id)
+    from app.recruiter.enums import InterviewStage, InterviewType, InterviewStatus
+    if payload.stage:
+        try: iv.stage = InterviewStage(payload.stage)
+        except ValueError: raise HTTPException(400, "Invalid interview stage")
+    if payload.interview_type is not None:
+        try: iv.interview_type = InterviewType(payload.interview_type) if payload.interview_type else None
+        except ValueError: raise HTTPException(400, "Invalid interview_type")
+    if payload.status:
+        try: iv.status = InterviewStatus(payload.status)
+        except ValueError: raise HTTPException(400, "Invalid interview status")
+    if payload.interviewers is not None: iv.interviewers = payload.interviewers
+    if payload.proposed_times is not None:
+        iv.proposed_times = [t.isoformat() for t in payload.proposed_times]
+    if payload.confirmed_time is not None: iv.confirmed_time = payload.confirmed_time
+    if payload.duration_minutes is not None: iv.duration_minutes = payload.duration_minutes
+    if payload.location is not None: iv.location = payload.location
+    if payload.meeting_url is not None: iv.meeting_url = payload.meeting_url
+    if payload.notes is not None: iv.notes = payload.notes
+    db.commit(); db.refresh(iv)
+    return iv
+
+
+@interviews_router.post(
+    "/{interview_id}/feedback", response_model=InterviewFeedbackOut, status_code=201,
+)
+def create_interview_feedback(
+    interview_id: int,
+    payload: InterviewFeedbackCreate,
+    agency: Agency = Depends(require_unlocked_agency),
+    db: Session = Depends(get_db),
+):
+    iv = _load_interview_or_404(db, agency, interview_id)
+    from app.recruiter.enums import ClientDecision
+    dec = None
+    if payload.decision:
+        try: dec = ClientDecision(payload.decision)
+        except ValueError: raise HTTPException(400, "Invalid decision")
+    fb = InterviewFeedback(
+        agency_id=agency.id, interview_id=interview_id,
+        interviewer_name=payload.interviewer_name,
+        technical=payload.technical, communication=payload.communication,
+        role_understanding=payload.role_understanding,
+        domain_knowledge=payload.domain_knowledge,
+        leadership=payload.leadership, culture_alignment=payload.culture_alignment,
+        decision=dec, comment=payload.comment,
+    )
+    db.add(fb); db.commit(); db.refresh(fb)
+    return fb
+
+
+@interviews_router.get(
+    "/{interview_id}/feedback", response_model=list[InterviewFeedbackOut],
+)
+def list_interview_feedback(
+    interview_id: int,
+    agency: Agency = Depends(get_agency),
+    db: Session = Depends(get_db),
+):
+    _load_interview_or_404(db, agency, interview_id)
+    return (
+        db.query(InterviewFeedback)
+        .filter(InterviewFeedback.interview_id == interview_id)
+        .order_by(InterviewFeedback.id.desc()).all()
+    )
+
+
+@interviews_router.get("/{interview_id}/brief", response_model=InterviewBriefOut)
+def interview_ai_brief(
+    interview_id: int,
+    agency: Agency = Depends(require_unlocked_agency),
+    db: Session = Depends(get_db),
+):
+    iv = _load_interview_or_404(db, agency, interview_id)
+    app_row = db.get(Application, iv.application_id)
+    cand = db.get(CandidateProfile, iv.candidate_id)
+    role = db.get(Role, iv.role_id)
+    prior = (
+        db.query(InterviewFeedback)
+        .join(Interview, Interview.id == InterviewFeedback.interview_id)
+        .filter(
+            Interview.agency_id == agency.id,
+            Interview.application_id == iv.application_id,
+            InterviewFeedback.interview_id != iv.id,
+        ).all()
+    )
+    brief = interviews_service.interview_brief(role, cand, app_row, iv, prior)
+    return {"interview_id": iv.id, **brief}
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Recruiter OS — Phase 5 routes: Offers + Placements
+# ═══════════════════════════════════════════════════════════════════════
+offers_router = APIRouter(
+    prefix="/agencies/{agency_id}/offers", tags=["recruiter: offers"]
+)
+
+
+@offers_router.post("", response_model=OfferOut, status_code=201)
+def create_offer(
+    payload: OfferCreate,
+    agency: Agency = Depends(require_unlocked_agency),
+    recruiter: Recruiter | None = Depends(_soft_recruiter),
+    db: Session = Depends(get_db),
+):
+    app_row = _load_application_or_404(db, agency, payload.application_id)
+    role = db.get(Role, app_row.role_id) if app_row.role_id else None
+    offer = Offer(
+        agency_id=agency.id, application_id=app_row.id,
+        role_id=app_row.role_id, candidate_id=app_row.candidate_id,
+        client_id=role.client_id if role else None,
+        base_compensation=payload.base_compensation,
+        bonus=payload.bonus, equity=payload.equity, allowances=payload.allowances,
+        benefits=payload.benefits, start_date=payload.start_date,
+        offer_date=payload.offer_date, expiry_date=payload.expiry_date,
+        assigned_recruiter_id=recruiter.id if recruiter else None,
+        notes=payload.notes,
+    )
+    db.add(offer); db.commit(); db.refresh(offer)
+    return offer
+
+
+@offers_router.get("", response_model=list[OfferOut])
+def list_offers(
+    agency: Agency = Depends(get_agency),
+    role_id: int | None = Query(default=None),
+    candidate_id: int | None = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    q = db.query(Offer).filter(Offer.agency_id == agency.id)
+    if role_id is not None: q = q.filter(Offer.role_id == role_id)
+    if candidate_id is not None: q = q.filter(Offer.candidate_id == candidate_id)
+    return q.order_by(Offer.id.desc()).all()
+
+
+@offers_router.patch("/{offer_id}", response_model=OfferOut)
+def update_offer(
+    offer_id: int,
+    payload: OfferUpdate,
+    agency: Agency = Depends(require_unlocked_agency),
+    db: Session = Depends(get_db),
+):
+    offer = db.get(Offer, offer_id)
+    if offer is None or offer.agency_id != agency.id:
+        raise HTTPException(status_code=404, detail="Offer not found")
+    from app.recruiter.enums import OfferStatus
+    for f in ("base_compensation", "bonus", "equity", "allowances", "benefits",
+              "start_date", "offer_date", "expiry_date", "notes"):
+        v = getattr(payload, f)
+        if v is not None:
+            setattr(offer, f, v)
+    if payload.status:
+        try: offer.status = OfferStatus(payload.status)
+        except ValueError: raise HTTPException(400, "Invalid offer status")
+    db.commit(); db.refresh(offer)
+    return offer
+
+
+@offers_router.post(
+    "/{offer_id}/negotiations", response_model=OfferNegotiationOut, status_code=201,
+)
+def add_offer_negotiation(
+    offer_id: int,
+    payload: OfferNegotiationCreate,
+    agency: Agency = Depends(require_unlocked_agency),
+    recruiter: Recruiter | None = Depends(_soft_recruiter),
+    db: Session = Depends(get_db),
+):
+    offer = db.get(Offer, offer_id)
+    if offer is None or offer.agency_id != agency.id:
+        raise HTTPException(status_code=404, detail="Offer not found")
+    n = OfferNegotiation(
+        agency_id=agency.id, offer_id=offer_id,
+        round_label=payload.round_label, from_party=payload.from_party,
+        compensation=payload.compensation, comment=payload.comment,
+        author_recruiter_id=recruiter.id if recruiter else None,
+    )
+    db.add(n); db.commit(); db.refresh(n)
+    return n
+
+
+@offers_router.get(
+    "/{offer_id}/negotiations", response_model=list[OfferNegotiationOut],
+)
+def list_offer_negotiations(
+    offer_id: int,
+    agency: Agency = Depends(get_agency),
+    db: Session = Depends(get_db),
+):
+    offer = db.get(Offer, offer_id)
+    if offer is None or offer.agency_id != agency.id:
+        raise HTTPException(status_code=404, detail="Offer not found")
+    return (
+        db.query(OfferNegotiation)
+        .filter(OfferNegotiation.offer_id == offer_id)
+        .order_by(OfferNegotiation.id.asc()).all()
+    )
+
+
+placements_router = APIRouter(
+    prefix="/agencies/{agency_id}/placements", tags=["recruiter: placements"]
+)
+
+
+@placements_router.post("", response_model=PlacementOut, status_code=201)
+def create_placement(
+    payload: PlacementCreate,
+    agency: Agency = Depends(require_unlocked_agency),
+    recruiter: Recruiter | None = Depends(_soft_recruiter),
+    db: Session = Depends(get_db),
+):
+    role = db.get(Role, payload.role_id)
+    if role is None or role.agency_id != agency.id:
+        raise HTTPException(404, "Role not found")
+    fee_amount = payload.fee_amount
+    if fee_amount is None:
+        fee_amount = offers_service.compute_placement_fee(
+            payload.final_compensation, payload.fee_percent,
+        )
+    guarantee_end = offers_service.guarantee_end_date(
+        payload.start_date, payload.guarantee_weeks,
+    )
+    pl = Placement(
+        agency_id=agency.id, offer_id=payload.offer_id,
+        role_id=payload.role_id, candidate_id=payload.candidate_id,
+        client_id=payload.client_id or role.client_id,
+        recruiter_id=recruiter.id if recruiter else None,
+        start_date=payload.start_date,
+        final_compensation=payload.final_compensation,
+        fee_percent=payload.fee_percent, fee_amount=fee_amount,
+        guarantee_weeks=payload.guarantee_weeks,
+        guarantee_ends_at=guarantee_end,
+        notes=payload.notes,
+    )
+    db.add(pl); db.commit(); db.refresh(pl)
+    # Seed default check-ins
+    for c in offers_service.default_checkin_schedule(payload.start_date):
+        due = None
+        if c["due_date"]:
+            from datetime import date as _date
+            due = _date.fromisoformat(c["due_date"])
+        db.add(PostPlacementCheckin(
+            agency_id=agency.id, placement_id=pl.id,
+            day_offset=c["day_offset"], due_date=due,
+        ))
+    db.commit()
+    return pl
+
+
+@placements_router.get("", response_model=list[PlacementOut])
+def list_placements(
+    agency: Agency = Depends(get_agency),
+    role_id: int | None = Query(default=None),
+    client_id: int | None = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    q = db.query(Placement).filter(Placement.agency_id == agency.id)
+    if role_id is not None: q = q.filter(Placement.role_id == role_id)
+    if client_id is not None: q = q.filter(Placement.client_id == client_id)
+    return q.order_by(Placement.id.desc()).all()
+
+
+@placements_router.patch("/{placement_id}", response_model=PlacementOut)
+def update_placement(
+    placement_id: int,
+    payload: PlacementUpdate,
+    agency: Agency = Depends(require_unlocked_agency),
+    db: Session = Depends(get_db),
+):
+    pl = db.get(Placement, placement_id)
+    if pl is None or pl.agency_id != agency.id:
+        raise HTTPException(404, "Placement not found")
+    from app.recruiter.enums import PlacementStatus
+    for f in ("start_date", "final_compensation", "fee_percent", "fee_amount",
+              "guarantee_weeks", "guarantee_ends_at", "notes"):
+        v = getattr(payload, f)
+        if v is not None:
+            setattr(pl, f, v)
+    if payload.status:
+        try: pl.status = PlacementStatus(payload.status)
+        except ValueError: raise HTTPException(400, "Invalid placement status")
+    db.commit(); db.refresh(pl)
+    return pl
+
+
+@placements_router.get(
+    "/{placement_id}/checkins", response_model=list[PostPlacementCheckinOut],
+)
+def list_placement_checkins(
+    placement_id: int,
+    agency: Agency = Depends(get_agency),
+    db: Session = Depends(get_db),
+):
+    pl = db.get(Placement, placement_id)
+    if pl is None or pl.agency_id != agency.id:
+        raise HTTPException(404, "Placement not found")
+    return (
+        db.query(PostPlacementCheckin)
+        .filter(PostPlacementCheckin.placement_id == placement_id)
+        .order_by(PostPlacementCheckin.day_offset.asc()).all()
+    )
+
+
+@placements_router.patch(
+    "/{placement_id}/checkins/{checkin_id}", response_model=PostPlacementCheckinOut,
+)
+def update_placement_checkin(
+    placement_id: int,
+    checkin_id: int,
+    payload: PostPlacementCheckinUpdate,
+    agency: Agency = Depends(require_unlocked_agency),
+    recruiter: Recruiter | None = Depends(_soft_recruiter),
+    db: Session = Depends(get_db),
+):
+    c = db.get(PostPlacementCheckin, checkin_id)
+    if c is None or c.agency_id != agency.id or c.placement_id != placement_id:
+        raise HTTPException(404, "Checkin not found")
+    if payload.completed_at is not None:
+        c.completed_at = payload.completed_at
+        c.completed_by = recruiter.id if recruiter else None
+    if payload.outcome is not None: c.outcome = payload.outcome
+    if payload.notes is not None: c.notes = payload.notes
+    db.commit(); db.refresh(c)
+    return c
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Recruiter OS — Phase 6 routes: Tasks + Notifications + Daily brief
+# ═══════════════════════════════════════════════════════════════════════
+tasks_router = APIRouter(
+    prefix="/agencies/{agency_id}/tasks", tags=["recruiter: tasks"]
+)
+
+
+@tasks_router.post("", response_model=RecruiterTaskOut, status_code=201)
+def create_task(
+    payload: RecruiterTaskCreate,
+    agency: Agency = Depends(require_unlocked_agency),
+    db: Session = Depends(get_db),
+):
+    from app.recruiter.enums import TaskPriority
+    try: prio = TaskPriority(payload.priority)
+    except ValueError: raise HTTPException(400, "Invalid priority")
+    t = RecruiterTask(
+        agency_id=agency.id, owner_recruiter_id=payload.owner_recruiter_id,
+        title=payload.title, detail=payload.detail, priority=prio,
+        due_at=payload.due_at, parent_kind=payload.parent_kind,
+        parent_id=payload.parent_id, ai_generated=payload.ai_generated,
+    )
+    db.add(t); db.commit(); db.refresh(t)
+    return t
+
+
+@tasks_router.get("", response_model=list[RecruiterTaskOut])
+def list_tasks(
+    agency: Agency = Depends(get_agency),
+    status: str | None = Query(default=None),
+    owner_recruiter_id: int | None = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    q = db.query(RecruiterTask).filter(RecruiterTask.agency_id == agency.id)
+    if status is not None: q = q.filter(RecruiterTask.status == status)
+    if owner_recruiter_id is not None:
+        q = q.filter(RecruiterTask.owner_recruiter_id == owner_recruiter_id)
+    return q.order_by(RecruiterTask.due_at.asc().nulls_last(), RecruiterTask.id.desc()).all()
+
+
+@tasks_router.patch("/{task_id}", response_model=RecruiterTaskOut)
+def update_task(
+    task_id: int,
+    payload: RecruiterTaskUpdate,
+    agency: Agency = Depends(require_unlocked_agency),
+    db: Session = Depends(get_db),
+):
+    t = db.get(RecruiterTask, task_id)
+    if t is None or t.agency_id != agency.id:
+        raise HTTPException(404, "Task not found")
+    from app.recruiter.enums import TaskStatus, TaskPriority
+    if payload.title is not None: t.title = payload.title
+    if payload.detail is not None: t.detail = payload.detail
+    if payload.owner_recruiter_id is not None: t.owner_recruiter_id = payload.owner_recruiter_id
+    if payload.due_at is not None: t.due_at = payload.due_at
+    if payload.status is not None:
+        try: t.status = TaskStatus(payload.status)
+        except ValueError: raise HTTPException(400, "Invalid task status")
+        if t.status == TaskStatus.done and t.completed_at is None:
+            t.completed_at = datetime.utcnow()
+    if payload.priority is not None:
+        try: t.priority = TaskPriority(payload.priority)
+        except ValueError: raise HTTPException(400, "Invalid task priority")
+    db.commit(); db.refresh(t)
+    return t
+
+
+notifications_router = APIRouter(
+    prefix="/agencies/{agency_id}/notifications", tags=["recruiter: notifications"]
+)
+
+
+@notifications_router.get("", response_model=list[NotificationOut])
+def list_notifications(
+    agency: Agency = Depends(get_agency),
+    unread_only: bool = Query(default=False),
+    db: Session = Depends(get_db),
+):
+    q = db.query(Notification).filter(Notification.agency_id == agency.id)
+    if unread_only: q = q.filter(Notification.is_read == False)  # noqa: E712
+    return q.order_by(Notification.created_at.desc()).limit(200).all()
+
+
+@notifications_router.post("/mark", response_model=int)
+def mark_notifications(
+    payload: NotificationBulkUpdate,
+    agency: Agency = Depends(require_unlocked_agency),
+    db: Session = Depends(get_db),
+):
+    n = (
+        db.query(Notification)
+        .filter(
+            Notification.agency_id == agency.id,
+            Notification.id.in_(payload.ids),
+        )
+        .update({"is_read": payload.is_read}, synchronize_session=False)
+    )
+    db.commit()
+    return n
+
+
+daily_brief_router = APIRouter(
+    prefix="/agencies/{agency_id}/daily-brief", tags=["recruiter: daily brief"]
+)
+
+
+@daily_brief_router.get("", response_model=DailyBriefOut)
+def daily_brief(
+    agency: Agency = Depends(get_agency),
+    recruiter: Recruiter | None = Depends(_soft_recruiter),
+    db: Session = Depends(get_db),
+):
+    return productivity_service.daily_brief(
+        db, agency.id, recruiter.id if recruiter else None,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Recruiter OS — Phase 7 routes: AI intelligence
+# ═══════════════════════════════════════════════════════════════════════
+intelligence_router = APIRouter(
+    prefix="/agencies/{agency_id}/intelligence", tags=["recruiter: intelligence"]
+)
+
+
+@intelligence_router.post("/ask-pool", response_model=AskPoolResult)
+def ask_the_pool(
+    payload: AskPoolRequest,
+    agency: Agency = Depends(require_unlocked_agency),
+    db: Session = Depends(get_db),
+):
+    return intelligence_service.ask_the_pool(db, agency.id, payload.query, payload.limit)
+
+
+@intelligence_router.get("/roles/{role_id}/quality-check", response_model=RoleQualityCheckOut)
+def role_quality_check(
+    role_id: int,
+    agency: Agency = Depends(get_agency),
+    db: Session = Depends(get_db),
+):
+    role = db.get(Role, role_id)
+    if role is None or role.agency_id != agency.id:
+        raise HTTPException(404, "Role not found")
+    return intelligence_service.role_quality_check(db, agency.id, role)
+
+
+@intelligence_router.get("/roles/{role_id}/health", response_model=RoleHealthOut)
+def role_health(
+    role_id: int,
+    agency: Agency = Depends(get_agency),
+    db: Session = Depends(get_db),
+):
+    role = db.get(Role, role_id)
+    if role is None or role.agency_id != agency.id:
+        raise HTTPException(404, "Role not found")
+    return intelligence_service.role_health(db, agency.id, role_id)
+
+
+@intelligence_router.get("/clients/{client_id}/intelligence", response_model=ClientIntelligenceOut)
+def client_intelligence_route(
+    client_id: int,
+    agency: Agency = Depends(get_agency),
+    db: Session = Depends(get_db),
+):
+    client = db.get(Client, client_id)
+    if client is None or client.agency_id != agency.id:
+        raise HTTPException(404, "Client not found")
+    return intelligence_service.client_intelligence(db, agency.id, client_id)

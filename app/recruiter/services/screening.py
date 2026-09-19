@@ -153,3 +153,127 @@ def draft_screening_questions(
         "used_llm": True,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
+
+
+# ── Recruiter OS Phase 1: AI screening copilot ──────────────────────────
+
+_IMPROVE_SYSTEM = (
+    "You are a senior technical recruiter. Rewrite the recruiter's rough notes "
+    "into a concise, professional summary suitable for a client. Preserve "
+    "every claim the recruiter made — never invent skills, salary, notice, or "
+    "experience the recruiter did not state. If a fact is not present, omit "
+    "it. Return STRICT JSON only."
+)
+
+_IMPROVE_SCHEMA = (
+    'Return JSON: {"summary": string, "unsupported_gaps": [string, ...]}\n'
+    "  - summary: 2-4 sentences, third person, client-safe, no bullet points.\n"
+    "  - unsupported_gaps: any topic the client will likely ask about but the "
+    "notes do not cover (compensation, availability, notice, technical depth).\n"
+)
+
+
+def improve_summary(rough_notes: str, cand_name: str | None = None, role_title: str | None = None) -> dict[str, Any]:
+    """
+    Cleans rough recruiter notes into a client-ready summary. Never persists;
+    the caller must save via PATCH .../screening after review. Falls back to a
+    trimmed version of the input when the LLM is unavailable.
+    """
+    text = (rough_notes or "").strip()
+    if not text:
+        return {"summary": "", "unsupported_gaps": [], "used_llm": False,
+                "generated_at": datetime.now(timezone.utc).isoformat()}
+
+    if not ai_support.llm_enabled():
+        # Deterministic fallback: normalise whitespace + capitalise sentences.
+        cleaned = " ".join(text.split())
+        if cleaned and cleaned[-1] not in ".!?":
+            cleaned += "."
+        return {
+            "summary": cleaned,
+            "unsupported_gaps": [],
+            "used_llm": False,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    ctx = [
+        f"Candidate: {cand_name or 'unnamed'}",
+        f"Role: {role_title or 'unspecified'}",
+        "",
+        "Recruiter rough notes:",
+        text,
+    ]
+    data = ai_support.generate_json(_IMPROVE_SYSTEM, _IMPROVE_SCHEMA + "\n\n" + "\n".join(ctx))
+    if not isinstance(data, dict) or not isinstance(data.get("summary"), str):
+        return {
+            "summary": text,
+            "unsupported_gaps": [],
+            "used_llm": False,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+    return {
+        "summary": data["summary"].strip(),
+        "unsupported_gaps": [str(x).strip() for x in (data.get("unsupported_gaps") or []) if isinstance(x, str)],
+        "used_llm": True,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+_EXTRACT_SYSTEM = (
+    "You are a senior technical recruiter. Given rough screening notes, "
+    "extract structured screening fields the recruiter mentioned. NEVER "
+    "invent values. When a field is not mentioned, return null. Return "
+    "STRICT JSON only."
+)
+
+_EXTRACT_SCHEMA = (
+    'Return JSON with these keys (any may be null):\n'
+    '  {\n'
+    '    "expected_compensation": {"amount": int, "currency": string, "period": "YEAR"|"MONTH"|"DAY"|"HOUR"} | null,\n'
+    '    "current_compensation":  {"amount": int, "currency": string, "period": "YEAR"|"MONTH"|"DAY"|"HOUR"} | null,\n'
+    '    "notice_period":         {"value": int, "unit": "DAY"|"WEEK"|"MONTH", "negotiable": bool} | null,\n'
+    '    "availability_immediate": bool | null,\n'
+    '    "preferred_work_model":   "remote"|"hybrid"|"onsite"|"flexible" | null,\n'
+    '    "preferred_location":     string | null,\n'
+    '    "candidate_motivation":   string | null,\n'
+    '    "motivation_categories":  [string, ...] | null\n'
+    '  }\n'
+    "Use ISO currency codes (GBP, INR, AED, USD, EUR, CAD, AUD, SGD).\n"
+    "For INR salaries expressed as LPA, convert to annual INR (multiply by 100000).\n"
+)
+
+
+def extract_structured_notes(rough_notes: str, country_code: str | None = None) -> dict[str, Any]:
+    """
+    Parses rough recruiter notes into a proposed structured payload. The UI
+    surfaces each field with a confirm/edit affordance — none of this is
+    persisted until the recruiter PATCHes .../screening.
+    """
+    text = (rough_notes or "").strip()
+    empty = {
+        "expected_compensation": None,
+        "current_compensation": None,
+        "notice_period": None,
+        "availability_immediate": None,
+        "preferred_work_model": None,
+        "preferred_location": None,
+        "candidate_motivation": None,
+        "motivation_categories": None,
+    }
+    if not text or not ai_support.llm_enabled():
+        return {**empty, "used_llm": False,
+                "generated_at": datetime.now(timezone.utc).isoformat()}
+
+    ctx = _EXTRACT_SCHEMA + f"\n\nCountry: {country_code or 'unspecified'}\n\nRecruiter rough notes:\n{text}"
+    data = ai_support.generate_json(_EXTRACT_SYSTEM, ctx)
+    if not isinstance(data, dict):
+        return {**empty, "used_llm": False,
+                "generated_at": datetime.now(timezone.utc).isoformat()}
+
+    result: dict[str, Any] = dict(empty)
+    for k in empty.keys():
+        if k in data:
+            result[k] = data[k]
+    result["used_llm"] = True
+    result["generated_at"] = datetime.now(timezone.utc).isoformat()
+    return result

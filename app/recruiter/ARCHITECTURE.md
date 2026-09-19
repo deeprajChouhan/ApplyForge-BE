@@ -179,3 +179,202 @@ which is the shipped consumer-side job-clipper. The recruiter extension
 authenticates against `/api/v1/recruiter/auth/login`, keeps tokens in
 `chrome.storage.local`, and POSTs scraped `/in/*` payloads to the
 `capture-linkedin` endpoint above. See `extension-recruiter/README.md`.
+
+---
+
+## Recruiter OS — Phase 1 (2026-09)
+
+`rec_applications` is the **CandidateRole** join entity — same row for stage,
+notes, SWOT, and now the role-specific screening block. We deliberately did
+not add a parallel `rec_candidate_role` table.
+
+### New columns
+
+- **`rec_roles.country_code`** — ISO-3166 alpha-2. Drives the MarketConfig used
+  by the UI (compensation schema, salary display, notice-period presets).
+- **`rec_candidate_profiles.market_preferences`** — optional per-country
+  compensation preferences JSON on the candidate's global profile; used only
+  to pre-populate a fresh screening form. Not authoritative.
+- **`rec_applications` screening block** (all nullable, additive):
+  `screening_outcome` (suitable/maybe/not_suitable), `screening_completed_at`,
+  `screening_completed_by`, `assigned_recruiter_id`, `recruiter_summary`,
+  `candidate_motivation`, `internal_notes`, `motivation_categories` (JSON list),
+  `expected_compensation` / `current_compensation` (structured JSON),
+  `notice_period` (structured JSON), `availability_date`,
+  `availability_immediate`, `preferred_work_model`, `preferred_location`,
+  `relocation`, `relocation_notes`, `client_visibility` (JSON map).
+
+Migration: `alembic/versions/0031_candidate_role_screening.py`.
+
+### MarketConfig
+
+`app/recruiter/services/market_config.py` — code-level registry (no DB table)
+of country presentation rules. Supported: GB, IN, AE, US, CA, AU, SG, DE.
+Each entry defines default currency + salary period, salary display format
+(`annual` / `lpa` / `monthly`), notice-period presets, compensation schema
+(the fields the UI renders), and market terminology (e.g. India uses "CTC").
+Format helper `format_compensation(comp, country_code)` renders the value the
+way the market expects it.
+
+### Visibility
+
+`services/visibility.py::to_client_view(app_row)` is the **only** serializer
+allowed on client-facing endpoints. It strips fields in `NEVER_CLIENT_VISIBLE`
+unconditionally (`internal_notes`, `screening_outcome`, `current_compensation`,
+`motivation_categories`, `assigned_recruiter_id`, `screening_completed_by`)
+regardless of `client_visibility` overrides — the map only opts *out* of
+client-visible fields; it can't opt *in* to internal ones. Backend
+enforcement, never frontend hiding.
+
+### AI screening copilot
+
+`services/screening.py` gains two additional entry points:
+
+- `improve_summary(rough_notes, cand_name?, role_title?)` — cleans rough
+  notes into a client-safe summary. Returns `{summary, unsupported_gaps,
+  used_llm, generated_at}`. Never persists; recruiter reviews then PATCHes.
+- `extract_structured_notes(rough_notes, country_code?)` — parses rough
+  notes into a proposed structured payload (comp, notice, availability,
+  motivation, work model). Returns `{...fields, used_llm, generated_at}`
+  with each field null when not mentioned. Never invents values.
+
+`draft_screening_questions` (already existed) is the third arm — used for the
+"AI Screening Assistant" side panel.
+
+### New endpoints (all `/api/v1/recruiter`)
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/agencies/{id}/applications/{app_id}/screening` | Full screening block for a candidate on a role. |
+| PATCH | `/agencies/{id}/applications/{app_id}/screening` | Partial update; `mark_completed:true` stamps completion + system activity note. Requires the application to be linked to a role. |
+| GET | `/agencies/{id}/applications/{app_id}/client-view` | Server-side client-visible serialisation preview. |
+| POST | `/agencies/{id}/applications/{app_id}/screening/ai-improve-summary` | AI rewrites rough notes → client-safe summary draft. |
+| POST | `/agencies/{id}/applications/{app_id}/screening/ai-extract-notes` | AI extracts structured fields from rough notes. |
+| GET | `/market-configs` | All supported country configs. |
+| GET | `/market-configs/{country_code}` | One country config. |
+
+### AI grounding rule
+
+Every new AI endpoint returns drafts only. Nothing is persisted until the
+recruiter issues a PATCH. Prompts include "return null / UNKNOWN if not
+present in evidence" and heuristic fallbacks are always available so the
+UI never sees a blank state.
+
+### Tests
+
+`tests/test_recruiter_screening.py` covers screening CRUD, agency isolation,
+client-view visibility enforcement (including the "force internal_notes on
+via map" attack), market config schema, and the no-role → 400 guard.
+
+---
+
+## Recruiter OS — Phases 2-7 (2026-09)
+
+Migration: `alembic/versions/0032_recruiter_os_phases_2_7.py`
+(chains from `0031`, additive, no existing table touched).
+
+### New tables (all `rec_`-prefixed, agency-scoped, no consumer FKs)
+
+**Phase 2**
+- `rec_candidate_consents` — per-role consent (`pending|confirmed|declined|expired`) with method/evidence/expires_at, `captured_by` (recruiter id, no FK).
+- `rec_client_submissions` — client-facing candidate submission, **snapshotted at submit** (compensation/notice/availability/motivation frozen on the row). Feeds Phase 3-5 downstream.
+
+**Phase 3**
+- `rec_submission_feedback` — structured decision + reasons taxonomy on a submission.
+- `rec_client_sla_configs` — per-client feedback SLA (hours) with notify_recruiter flag; default 48h in code.
+
+**Phase 4**
+- `rec_interviews` — interview slot bound to `application_id` (survives submission re-issue). Fields cover stage/type/interviewers/proposed_times/confirmed_time/status.
+- `rec_interview_feedback` — 1-5 rubric across technical/communication/role_understanding/domain_knowledge/leadership/culture_alignment + decision + comment.
+
+**Phase 5**
+- `rec_offers` — draft/sent/negotiating/accepted/declined/withdrawn; base_compensation/bonus/equity/allowances as JSON.
+- `rec_offer_negotiations` — append-only history rows.
+- `rec_placements` — closed-hire record with `fee_percent`, computed `fee_amount`, `guarantee_ends_at`. Auto-seeds 4 check-ins on create.
+- `rec_post_placement_checkins` — day-offset 7/30/60/90 with outcome + completed_at.
+
+**Phase 6**
+- `rec_recruiter_tasks` — next-action items with priority + optional AI-generated flag; loose parent references (no FK) so tasks survive parent deletion.
+- `rec_notifications` — in-app persistent notification store, grouped by kind + parent.
+
+**Phase 7**
+- `rec_ai_insight_cache` — cache for role_health / client_intel / feedback_pattern insights.
+
+### New services
+
+- `services/submissions.py` — readiness checklist, screening-into-submission snapshot, AI submission draft (grounded, refuses to invent facts).
+- `services/collaboration.py` — SLA helpers, candidate comparison, feedback pattern rollups.
+- `services/interviews.py` — AI interview brief (heuristic fallback + LLM polish).
+- `services/offers.py` — placement fee calc, guarantee end-date, offer talking-point AI helper.
+- `services/productivity.py` — daily brief (offers expiring / feedback overdue / interviews soon / consent missing / guarantee ending).
+- `services/intelligence.py` — Ask-the-pool with LLM query parsing + deterministic scoring, role quality check, role health, client intelligence.
+
+### New endpoints (agency-scoped, `require_unlocked_agency` for writes)
+
+Phase 2:
+- `POST/GET/PATCH /agencies/{id}/consents[/{cid}]`
+- `GET /agencies/{id}/applications/{app_id}/readiness`
+- `POST/GET/GET one/PATCH /agencies/{id}/submissions[/{sub_id}]`
+- `POST /agencies/{id}/submissions/{sub_id}/ai-draft`
+
+Phase 3:
+- `POST/GET /agencies/{id}/submissions/{sub_id}/feedback`
+- `GET/PUT /agencies/{id}/clients/{cid}/sla`
+- `GET /agencies/{id}/clients/{cid}/sla-summary`
+- `POST /agencies/{id}/candidate-comparison`
+
+Phase 4:
+- `POST/GET/GET one/PATCH /agencies/{id}/interviews[/{iid}]`
+- `POST/GET /agencies/{id}/interviews/{iid}/feedback`
+- `GET /agencies/{id}/interviews/{iid}/brief`
+
+Phase 5:
+- `POST/GET/PATCH /agencies/{id}/offers[/{oid}]`
+- `POST/GET /agencies/{id}/offers/{oid}/negotiations`
+- `POST/GET/PATCH /agencies/{id}/placements[/{pid}]`
+- `GET/PATCH /agencies/{id}/placements/{pid}/checkins[/{cid}]`
+
+Phase 6:
+- `POST/GET/PATCH /agencies/{id}/tasks[/{tid}]`
+- `GET /agencies/{id}/notifications` (+ `POST .../mark`)
+- `GET /agencies/{id}/daily-brief`
+
+Phase 7:
+- `POST /agencies/{id}/intelligence/ask-pool`
+- `GET /agencies/{id}/intelligence/roles/{rid}/health`
+- `GET /agencies/{id}/intelligence/roles/{rid}/quality-check`
+- `GET /agencies/{id}/intelligence/clients/{cid}/intelligence`
+
+### AI grounding rules (unchanged across phases)
+
+Every AI endpoint returns drafts only — nothing writes back to the domain
+without an explicit recruiter action. Every prompt includes
+"return UNKNOWN / null if not present in evidence"; heuristic fallbacks are
+always available; agency-scoped data only. `intelligence.py` never calls
+any candidate "best" — comparisons and health checks are described as
+observations, not decisions.
+
+### Frontend screens (recruiter-frontend)
+
+- `/roles/[id]/candidates/[appId]` — Phase 1 Candidate Role Detail with tabs, market-driven forms, AI copilot.
+- `/submissions/[id]` — Phase 2 submission detail with AI draft, feedback capture.
+- `/roles/[id]/compare` — Phase 3 candidate comparison.
+- `/clients/[id]/sla` — Phase 3 SLA dashboard.
+- `/interviews/[id]` — Phase 4 interview with AI brief + feedback.
+- `/offers/[id]` — Phase 5 offer with negotiation history.
+- `/placements/[id]` — Phase 5 placement with check-ins.
+- `/daily-brief` — Phase 6 daily brief (Today).
+- `/tasks` — Phase 6 tasks board.
+- `/intelligence` — Phase 7 Ask-the-Pool + role/client intelligence.
+
+Sidebar now includes Daily brief / Tasks / Intelligence entries.
+
+### Tests
+
+- `tests/test_recruiter_screening.py` — Phase 1 (Phase 1's dedicated suite).
+- `tests/test_recruiter_os_all_phases.py` — smoke tests per phase + cross-phase agency isolation.
+
+Run inside the backend container:
+```
+pytest tests/test_recruiter_screening.py tests/test_recruiter_os_all_phases.py -q
+```

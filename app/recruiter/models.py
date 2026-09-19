@@ -36,9 +36,28 @@ from app.recruiter.enums import (
     ApplicationStage,
     BillingModel,
     CandidateSource,
+    ClientDecision,
+    CompensationPeriod,
+    ConsentMethod,
+    ConsentStatus,
     EmploymentType,
+    FeedbackReason,
+    InterviewStage,
+    InterviewStatus,
+    InterviewType,
+    MotivationCategory,
+    NoticeUnit,
+    NotificationKind,
+    OfferStatus,
+    PlacementStatus,
     RecruiterSeatRole,
+    RelocationPreference,
     RoleStatus,
+    ScreeningOutcome,
+    SubmissionStatus,
+    TaskPriority,
+    TaskStatus,
+    WorkModel,
 )
 
 
@@ -167,6 +186,10 @@ class Role(Base, RecTimestampMixin):
     location: Mapped[str | None] = mapped_column(String(200))
     seniority: Mapped[str | None] = mapped_column(String(80))
 
+    # Country the role is based in (ISO 3166-1 alpha-2). Drives MarketConfig
+    # lookup for compensation/notice/employment-type schemas in the UI.
+    country_code: Mapped[str | None] = mapped_column(String(2), index=True)
+
     required_skills: Mapped[list[str]] = mapped_column(JSON, default=list)
     preferred_skills: Mapped[list[str]] = mapped_column(JSON, default=list)
     min_years_experience: Mapped[float | None] = mapped_column(Float)
@@ -232,6 +255,12 @@ class CandidateProfile(Base, RecTimestampMixin):
     expected_budget_currency: Mapped[str] = mapped_column(
         String(8), default="USD", server_default="USD", nullable=False
     )
+
+    # Optional per-country compensation preferences the recruiter captures on
+    # the candidate's global profile. Used to pre-populate role-specific
+    # screening compensation when a role is in that country. Shape:
+    #   {"GB": {"amount": 95000, "currency": "GBP", "period": "YEAR"}, ...}
+    market_preferences: Mapped[dict | None] = mapped_column(JSON)
 
     # Set once converted to a real ApplyForge user (provisioning bridge).
     provisioned_user_id: Mapped[int | None] = mapped_column(Integer)
@@ -377,6 +406,55 @@ class Application(Base, RecTimestampMixin):
     #    "threats": [str], "generated_at": iso, "model": str}
     swot: Mapped[dict | None] = mapped_column(JSON)
 
+    # ── Role-specific screening (Recruiter OS Phase 1) ────────────────────
+    # This entity is effectively the CandidateRole join: candidate + role +
+    # agency, with the recruiter's per-opportunity view of the candidate.
+    # Screening data lives here (NOT on CandidateProfile) so the same person
+    # can have different summaries, expected comp, notice, and motivation for
+    # different roles.
+    screening_outcome: Mapped[ScreeningOutcome | None] = mapped_column(
+        SAEnum(ScreeningOutcome)
+    )
+    screening_completed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    screening_completed_by: Mapped[int | None] = mapped_column(Integer)
+    assigned_recruiter_id: Mapped[int | None] = mapped_column(Integer, index=True)
+
+    # Recruiter-authored narrative. `recruiter_summary` is CLIENT-VISIBLE by
+    # default (subject to client_visibility). `internal_notes` is NEVER
+    # exposed to clients regardless of the map.
+    recruiter_summary: Mapped[str | None] = mapped_column(Text)
+    candidate_motivation: Mapped[str | None] = mapped_column(Text)
+    internal_notes: Mapped[str | None] = mapped_column(Text)
+    motivation_categories: Mapped[list[str] | None] = mapped_column(JSON)
+
+    # Structured compensation for this specific opportunity. Shape:
+    #   {"amount": int, "currency": str, "period": "YEAR"|"MONTH"|"DAY"|"HOUR",
+    #    "fixed"?: int, "variable"?: int, "bonus"?: int,
+    #    "allowances"?: {...}, "rate"?: int, "rate_period"?: str,
+    #    "contract_classification"?: str}
+    expected_compensation: Mapped[dict | None] = mapped_column(JSON)
+    current_compensation: Mapped[dict | None] = mapped_column(JSON)
+
+    # Structured notice: {"value": int, "unit": "DAY"|"WEEK"|"MONTH",
+    #                     "negotiable": bool, "available_from": iso date str?}
+    notice_period: Mapped[dict | None] = mapped_column(JSON)
+
+    availability_date: Mapped[date | None] = mapped_column(Date)
+    availability_immediate: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="0", nullable=False
+    )
+
+    preferred_work_model: Mapped[WorkModel | None] = mapped_column(SAEnum(WorkModel))
+    preferred_location: Mapped[str | None] = mapped_column(String(200))
+    relocation: Mapped[RelocationPreference | None] = mapped_column(
+        SAEnum(RelocationPreference)
+    )
+    relocation_notes: Mapped[str | None] = mapped_column(String(500))
+
+    # Per-application map of field-name -> visible-to-client. Missing keys
+    # resolve to DEFAULT_CLIENT_VISIBILITY. Never exposes internal_notes.
+    client_visibility: Mapped[dict] = mapped_column(JSON, default=dict)
+
     candidate: Mapped["CandidateProfile"] = relationship()
 
 
@@ -516,6 +594,351 @@ class SpecSheetTemplate(Base, RecTimestampMixin):
     )
 
 
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Recruiter OS — Phase 2-7 domain objects
+#
+# Every table below is agency-scoped and rec_-prefixed. No FKs into consumer
+# tables — the data wall stays intact. Cross-references between recruiter
+# tables use ON DELETE CASCADE where the child has no meaning without its
+# parent (e.g. Interview → Application), SET NULL where the parent's
+# absence is survivable (e.g. Offer's assigned_recruiter_id).
+# ═════════════════════════════════════════════════════════════════════════
+
+
+# ── Phase 2: Consent + ClientSubmission ─────────────────────────────────
+class CandidateConsent(Base, RecTimestampMixin):
+    """
+    Role-specific representation/submission consent (Phase 2). The same
+    candidate consents per-role, per-agency — a candidate happy to be
+    submitted to Role A hasn't consented to Role B.
+    """
+    __tablename__ = "rec_candidate_consents"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    agency_id: Mapped[int] = mapped_column(ForeignKey("rec_agencies.id", ondelete="CASCADE"), index=True)
+    candidate_id: Mapped[int] = mapped_column(
+        ForeignKey("rec_candidate_profiles.id", ondelete="CASCADE"), index=True
+    )
+    role_id: Mapped[int] = mapped_column(ForeignKey("rec_roles.id", ondelete="CASCADE"), index=True)
+    status: Mapped[ConsentStatus] = mapped_column(
+        SAEnum(ConsentStatus), default=ConsentStatus.pending, nullable=False, index=True
+    )
+    method: Mapped[ConsentMethod | None] = mapped_column(SAEnum(ConsentMethod))
+    captured_at: Mapped[datetime | None] = mapped_column(DateTime)
+    captured_by: Mapped[int | None] = mapped_column(Integer)  # recruiter id
+    evidence: Mapped[str | None] = mapped_column(Text)        # optional reference / URL / note
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class ClientSubmission(Base, RecTimestampMixin):
+    """
+    A recruiter-authored candidate submission sent to a client.
+    Snapshotted at submit time — later mutations to the source Application
+    do NOT rewrite history a client already saw.
+    """
+    __tablename__ = "rec_client_submissions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    agency_id: Mapped[int] = mapped_column(ForeignKey("rec_agencies.id", ondelete="CASCADE"), index=True)
+    client_id: Mapped[int | None] = mapped_column(ForeignKey("rec_clients.id", ondelete="SET NULL"))
+    role_id: Mapped[int] = mapped_column(ForeignKey("rec_roles.id", ondelete="CASCADE"), index=True)
+    candidate_id: Mapped[int] = mapped_column(
+        ForeignKey("rec_candidate_profiles.id", ondelete="CASCADE"), index=True
+    )
+    application_id: Mapped[int] = mapped_column(
+        ForeignKey("rec_applications.id", ondelete="CASCADE"), index=True
+    )
+    submitted_by: Mapped[int | None] = mapped_column(Integer)  # recruiter id
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime)
+    status: Mapped[SubmissionStatus] = mapped_column(
+        SAEnum(SubmissionStatus), default=SubmissionStatus.draft, nullable=False, index=True
+    )
+
+    # Snapshotted client-safe narrative + structured fields (frozen at submit).
+    client_summary: Mapped[str | None] = mapped_column(Text)
+    key_strengths: Mapped[list[str] | None] = mapped_column(JSON)
+    potential_gaps: Mapped[list[str] | None] = mapped_column(JSON)
+    compensation_snapshot: Mapped[dict | None] = mapped_column(JSON)
+    notice_period_snapshot: Mapped[dict | None] = mapped_column(JSON)
+    availability_snapshot: Mapped[dict | None] = mapped_column(JSON)
+    motivation_snapshot: Mapped[str | None] = mapped_column(Text)
+    cv_version_id: Mapped[str | None] = mapped_column(String(120))
+
+    # Feedback / decision (mirrored from RoleFeedback for quick lookups).
+    client_decision: Mapped[ClientDecision | None] = mapped_column(SAEnum(ClientDecision))
+    client_feedback: Mapped[str | None] = mapped_column(Text)
+    client_viewed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    client_responded_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+# ── Phase 3: Structured client feedback + comparison + SLA ─────────────
+class SubmissionFeedback(Base, RecTimestampMixin):
+    """
+    Structured client feedback on a submission. Extends the free-text
+    RoleFeedback with a decision + reasons taxonomy so AI can spot patterns.
+    """
+    __tablename__ = "rec_submission_feedback"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    agency_id: Mapped[int] = mapped_column(ForeignKey("rec_agencies.id", ondelete="CASCADE"), index=True)
+    submission_id: Mapped[int] = mapped_column(
+        ForeignKey("rec_client_submissions.id", ondelete="CASCADE"), index=True
+    )
+    decision: Mapped[ClientDecision] = mapped_column(SAEnum(ClientDecision), nullable=False)
+    reasons: Mapped[list[str] | None] = mapped_column(JSON)   # list of FeedbackReason values
+    comment: Mapped[str | None] = mapped_column(Text)
+    client_contact_name: Mapped[str | None] = mapped_column(String(200))
+    client_contact_email: Mapped[str | None] = mapped_column(String(255))
+    submitted_via: Mapped[str | None] = mapped_column(String(40))  # "portal" | "email" | "manual"
+
+
+class ClientSlaConfig(Base, RecTimestampMixin):
+    """
+    Per-client feedback SLA (Phase 3). If missing, we fall back to the
+    agency-wide default in code (48h).
+    """
+    __tablename__ = "rec_client_sla_configs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    agency_id: Mapped[int] = mapped_column(ForeignKey("rec_agencies.id", ondelete="CASCADE"), index=True)
+    client_id: Mapped[int] = mapped_column(
+        ForeignKey("rec_clients.id", ondelete="CASCADE"), index=True, unique=True
+    )
+    expected_feedback_hours: Mapped[int] = mapped_column(Integer, default=48, server_default="48", nullable=False)
+    notify_recruiter: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1", nullable=False)
+
+
+# ── Phase 4: Interviews ─────────────────────────────────────────────────
+class Interview(Base, RecTimestampMixin):
+    """
+    An interview slot for a candidate on a role. Bound to the Application
+    (candidate + role) rather than to the ClientSubmission so the record
+    survives if a submission is re-issued.
+    """
+    __tablename__ = "rec_interviews"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    agency_id: Mapped[int] = mapped_column(ForeignKey("rec_agencies.id", ondelete="CASCADE"), index=True)
+    application_id: Mapped[int] = mapped_column(
+        ForeignKey("rec_applications.id", ondelete="CASCADE"), index=True
+    )
+    submission_id: Mapped[int | None] = mapped_column(
+        ForeignKey("rec_client_submissions.id", ondelete="SET NULL")
+    )
+    role_id: Mapped[int] = mapped_column(ForeignKey("rec_roles.id", ondelete="CASCADE"), index=True)
+    candidate_id: Mapped[int] = mapped_column(
+        ForeignKey("rec_candidate_profiles.id", ondelete="CASCADE"), index=True
+    )
+    client_id: Mapped[int | None] = mapped_column(ForeignKey("rec_clients.id", ondelete="SET NULL"))
+
+    stage: Mapped[InterviewStage] = mapped_column(SAEnum(InterviewStage), default=InterviewStage.first)
+    interview_type: Mapped[InterviewType | None] = mapped_column(SAEnum(InterviewType))
+    interviewers: Mapped[list[dict] | None] = mapped_column(JSON)   # [{name, email, role}]
+    proposed_times: Mapped[list[str] | None] = mapped_column(JSON)  # iso strings
+    confirmed_time: Mapped[datetime | None] = mapped_column(DateTime)
+    duration_minutes: Mapped[int | None] = mapped_column(Integer)
+    location: Mapped[str | None] = mapped_column(String(300))
+    meeting_url: Mapped[str | None] = mapped_column(String(500))
+    status: Mapped[InterviewStatus] = mapped_column(
+        SAEnum(InterviewStatus), default=InterviewStatus.scheduled, index=True
+    )
+    notes: Mapped[str | None] = mapped_column(Text)
+
+
+class InterviewFeedback(Base, RecTimestampMixin):
+    """Structured post-interview feedback."""
+    __tablename__ = "rec_interview_feedback"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    agency_id: Mapped[int] = mapped_column(ForeignKey("rec_agencies.id", ondelete="CASCADE"), index=True)
+    interview_id: Mapped[int] = mapped_column(
+        ForeignKey("rec_interviews.id", ondelete="CASCADE"), index=True
+    )
+    interviewer_name: Mapped[str | None] = mapped_column(String(200))
+    technical: Mapped[int | None] = mapped_column(Integer)          # 1-5
+    communication: Mapped[int | None] = mapped_column(Integer)
+    role_understanding: Mapped[int | None] = mapped_column(Integer)
+    domain_knowledge: Mapped[int | None] = mapped_column(Integer)
+    leadership: Mapped[int | None] = mapped_column(Integer)
+    culture_alignment: Mapped[int | None] = mapped_column(Integer)
+    decision: Mapped[ClientDecision | None] = mapped_column(SAEnum(ClientDecision))
+    comment: Mapped[str | None] = mapped_column(Text)
+
+
+# ── Phase 5: Offers + Placements ────────────────────────────────────────
+class Offer(Base, RecTimestampMixin):
+    """
+    A formal offer to a candidate on a role. Negotiation is recorded in
+    OfferNegotiation rows; the top-level fields reflect the CURRENT state.
+    """
+    __tablename__ = "rec_offers"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    agency_id: Mapped[int] = mapped_column(ForeignKey("rec_agencies.id", ondelete="CASCADE"), index=True)
+    application_id: Mapped[int] = mapped_column(
+        ForeignKey("rec_applications.id", ondelete="CASCADE"), index=True
+    )
+    submission_id: Mapped[int | None] = mapped_column(
+        ForeignKey("rec_client_submissions.id", ondelete="SET NULL")
+    )
+    role_id: Mapped[int] = mapped_column(ForeignKey("rec_roles.id", ondelete="CASCADE"), index=True)
+    candidate_id: Mapped[int] = mapped_column(
+        ForeignKey("rec_candidate_profiles.id", ondelete="CASCADE"), index=True
+    )
+    client_id: Mapped[int | None] = mapped_column(ForeignKey("rec_clients.id", ondelete="SET NULL"))
+
+    base_compensation: Mapped[dict | None] = mapped_column(JSON)   # CompensationBlock shape
+    bonus: Mapped[dict | None] = mapped_column(JSON)
+    equity: Mapped[dict | None] = mapped_column(JSON)
+    allowances: Mapped[dict | None] = mapped_column(JSON)
+    benefits: Mapped[str | None] = mapped_column(Text)
+    start_date: Mapped[date | None] = mapped_column(Date)
+    offer_date: Mapped[date | None] = mapped_column(Date)
+    expiry_date: Mapped[date | None] = mapped_column(Date)
+    status: Mapped[OfferStatus] = mapped_column(
+        SAEnum(OfferStatus), default=OfferStatus.draft, nullable=False, index=True
+    )
+    assigned_recruiter_id: Mapped[int | None] = mapped_column(Integer)
+    notes: Mapped[str | None] = mapped_column(Text)
+
+
+class OfferNegotiation(Base):
+    """Append-only offer negotiation history."""
+    __tablename__ = "rec_offer_negotiations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    agency_id: Mapped[int] = mapped_column(ForeignKey("rec_agencies.id", ondelete="CASCADE"), index=True)
+    offer_id: Mapped[int] = mapped_column(ForeignKey("rec_offers.id", ondelete="CASCADE"), index=True)
+    round_label: Mapped[str] = mapped_column(String(60), default="counter")  # "initial" | "counter" | "final"
+    from_party: Mapped[str | None] = mapped_column(String(20))   # "client" | "candidate" | "recruiter"
+    compensation: Mapped[dict | None] = mapped_column(JSON)
+    comment: Mapped[str | None] = mapped_column(Text)
+    author_recruiter_id: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class Placement(Base, RecTimestampMixin):
+    """
+    A closed hire — the final revenue-generating record. Created when an
+    Offer is accepted; guarantee period drives post-placement reminders.
+    """
+    __tablename__ = "rec_placements"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    agency_id: Mapped[int] = mapped_column(ForeignKey("rec_agencies.id", ondelete="CASCADE"), index=True)
+    offer_id: Mapped[int | None] = mapped_column(ForeignKey("rec_offers.id", ondelete="SET NULL"))
+    role_id: Mapped[int] = mapped_column(ForeignKey("rec_roles.id", ondelete="CASCADE"), index=True)
+    candidate_id: Mapped[int] = mapped_column(
+        ForeignKey("rec_candidate_profiles.id", ondelete="CASCADE"), index=True
+    )
+    client_id: Mapped[int | None] = mapped_column(ForeignKey("rec_clients.id", ondelete="SET NULL"))
+    recruiter_id: Mapped[int | None] = mapped_column(Integer)
+
+    start_date: Mapped[date | None] = mapped_column(Date)
+    final_compensation: Mapped[dict | None] = mapped_column(JSON)   # CompensationBlock
+    fee_percent: Mapped[float | None] = mapped_column(Float)
+    fee_amount: Mapped[int | None] = mapped_column(Integer)         # numeric, currency = final_compensation.currency
+    guarantee_weeks: Mapped[int | None] = mapped_column(Integer)
+    guarantee_ends_at: Mapped[date | None] = mapped_column(Date)
+    status: Mapped[PlacementStatus] = mapped_column(
+        SAEnum(PlacementStatus), default=PlacementStatus.upcoming, index=True
+    )
+    notes: Mapped[str | None] = mapped_column(Text)
+
+
+class PostPlacementCheckin(Base):
+    """Scheduled or completed check-ins during the guarantee period."""
+    __tablename__ = "rec_post_placement_checkins"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    agency_id: Mapped[int] = mapped_column(ForeignKey("rec_agencies.id", ondelete="CASCADE"), index=True)
+    placement_id: Mapped[int] = mapped_column(
+        ForeignKey("rec_placements.id", ondelete="CASCADE"), index=True
+    )
+    day_offset: Mapped[int] = mapped_column(Integer)   # 7, 30, 60, 90
+    due_date: Mapped[date | None] = mapped_column(Date)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    completed_by: Mapped[int | None] = mapped_column(Integer)
+    outcome: Mapped[str | None] = mapped_column(String(40))  # "on_track" | "at_risk" | "replaced"
+    notes: Mapped[str | None] = mapped_column(Text)
+
+
+# ── Phase 6: Tasks + Notifications ──────────────────────────────────────
+class RecruiterTask(Base, RecTimestampMixin):
+    """
+    A next-action item. Can be attached to any parent (application,
+    submission, interview, offer, placement, role, client) or float free.
+    AI can propose these; recruiter accepts them.
+    """
+    __tablename__ = "rec_recruiter_tasks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    agency_id: Mapped[int] = mapped_column(ForeignKey("rec_agencies.id", ondelete="CASCADE"), index=True)
+    owner_recruiter_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    title: Mapped[str] = mapped_column(String(240), nullable=False)
+    detail: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[TaskStatus] = mapped_column(
+        SAEnum(TaskStatus), default=TaskStatus.open, nullable=False, index=True
+    )
+    priority: Mapped[TaskPriority] = mapped_column(
+        SAEnum(TaskPriority), default=TaskPriority.medium, nullable=False
+    )
+    due_at: Mapped[datetime | None] = mapped_column(DateTime, index=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+    # Loose parent references — no FKs so a task survives if its parent is
+    # deleted (the task text still tells the recruiter what happened).
+    parent_kind: Mapped[str | None] = mapped_column(String(30))
+    parent_id: Mapped[int | None] = mapped_column(Integer, index=True)
+
+    # True when AI proposed it; recruiter accepts by editing / marking done.
+    ai_generated: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="0", nullable=False
+    )
+
+
+class Notification(Base):
+    """
+    In-app notification. Grouped in the UI by (kind, parent). Delivery to
+    email/push is a Phase 6.5 concern; this table is the persistent store.
+    """
+    __tablename__ = "rec_notifications"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    agency_id: Mapped[int] = mapped_column(ForeignKey("rec_agencies.id", ondelete="CASCADE"), index=True)
+    recruiter_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    kind: Mapped[NotificationKind] = mapped_column(SAEnum(NotificationKind), nullable=False, index=True)
+    title: Mapped[str] = mapped_column(String(240), nullable=False)
+    body: Mapped[str | None] = mapped_column(Text)
+    parent_kind: Mapped[str | None] = mapped_column(String(30))
+    parent_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    priority: Mapped[TaskPriority] = mapped_column(
+        SAEnum(TaskPriority), default=TaskPriority.medium, nullable=False
+    )
+    is_read: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), index=True)
+
+
+# ── Phase 7: AI intelligence cache ──────────────────────────────────────
+class AiInsightCache(Base):
+    """
+    Cache for AI-derived insights (role pipeline health, client patterns,
+    feedback rollups). Never authoritative — cheap-refresh, expiry-driven.
+    """
+    __tablename__ = "rec_ai_insight_cache"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    agency_id: Mapped[int] = mapped_column(ForeignKey("rec_agencies.id", ondelete="CASCADE"), index=True)
+    scope: Mapped[str] = mapped_column(String(40), index=True)      # "role_health" | "client_intel" | "pipeline_health" | "feedback_pattern"
+    scope_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    generated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime)
+    used_llm: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0", nullable=False)
+
+
 # All recruiter tables — used to create just these on startup without touching
 # the consumer schema.
 RECRUITER_TABLES = [
@@ -536,4 +959,18 @@ RECRUITER_TABLES = [
     AgencyInvite.__table__,
     MarketSnapshot.__table__,
     SpecSheetTemplate.__table__,
+    # Recruiter OS Phases 2-7
+    CandidateConsent.__table__,
+    ClientSubmission.__table__,
+    SubmissionFeedback.__table__,
+    ClientSlaConfig.__table__,
+    Interview.__table__,
+    InterviewFeedback.__table__,
+    Offer.__table__,
+    OfferNegotiation.__table__,
+    Placement.__table__,
+    PostPlacementCheckin.__table__,
+    RecruiterTask.__table__,
+    Notification.__table__,
+    AiInsightCache.__table__,
 ]
