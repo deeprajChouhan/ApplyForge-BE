@@ -2465,7 +2465,7 @@ def list_tasks(
     if status is not None: q = q.filter(RecruiterTask.status == status)
     if owner_recruiter_id is not None:
         q = q.filter(RecruiterTask.owner_recruiter_id == owner_recruiter_id)
-    return q.order_by(RecruiterTask.due_at.asc().nulls_last(), RecruiterTask.id.desc()).all()
+    return q.order_by(RecruiterTask.due_at.is_(None), RecruiterTask.due_at.asc(), RecruiterTask.id.desc()).all()
 
 
 @tasks_router.patch("/{task_id}", response_model=RecruiterTaskOut)
@@ -2610,7 +2610,7 @@ def _public_submissions(db: Session, role: Role) -> list[PublicSubmission]:
                 "submitted", "client_reviewing", "progressed", "on_hold",
             ]),
         )
-        .order_by(ClientSubmission.submitted_at.desc().nulls_last(), ClientSubmission.id.desc())
+        .order_by(ClientSubmission.submitted_at.desc(), ClientSubmission.id.desc())
         .all()
     )
     if not subs:
