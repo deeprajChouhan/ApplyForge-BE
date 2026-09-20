@@ -922,6 +922,35 @@ class Notification(Base):
 
 
 # ── Phase 7: AI intelligence cache ──────────────────────────────────────
+class ClientShareToken(Base):
+    """
+    A public read-only client status link. One active token per client;
+    rotating a token revokes the previous URL. The client-facing page shows
+    role status, stage counts and an optional AI-generated summary — never
+    candidate PII. view_count/last_viewed_at let the recruiter see if the
+    client actually opened it.
+    """
+    __tablename__ = "rec_client_share_tokens"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    agency_id: Mapped[int] = mapped_column(
+        ForeignKey("rec_agencies.id", ondelete="CASCADE"), index=True
+    )
+    client_id: Mapped[int] = mapped_column(
+        ForeignKey("rec_clients.id", ondelete="CASCADE"), index=True
+    )
+    token: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true", nullable=False)
+    view_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    last_viewed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    # AI-generated, client-safe status summary (bullets). Cached to keep the
+    # public page fast; refreshed on demand from the recruiter-facing client page.
+    ai_summary: Mapped[str | None] = mapped_column(Text)
+    ai_summary_generated_at: Mapped[datetime | None] = mapped_column(DateTime)
+    ai_summary_used_llm: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
 class AiInsightCache(Base):
     """
     Cache for AI-derived insights (role pipeline health, client patterns,
@@ -973,4 +1002,5 @@ RECRUITER_TABLES = [
     RecruiterTask.__table__,
     Notification.__table__,
     AiInsightCache.__table__,
+    ClientShareToken.__table__,
 ]

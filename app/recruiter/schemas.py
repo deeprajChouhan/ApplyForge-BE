@@ -869,6 +869,65 @@ class ApplicationNoteCreate(BaseModel):
     body: str = Field(min_length=1, max_length=8000)
 
 
+class ClientShareTokenOut(ORMModel):
+    """Recruiter-facing client share token metadata."""
+    id: int
+    client_id: int
+    token: str
+    is_active: bool
+    view_count: int
+    last_viewed_at: datetime | None = None
+    ai_summary: str | None = None
+    ai_summary_generated_at: datetime | None = None
+    ai_summary_used_llm: bool = False
+    created_at: datetime | None = None
+    share_url: str | None = None
+
+
+class PublicClientRoleRow(BaseModel):
+    """Client-safe row for one role on the shared status page. No candidate PII."""
+    role_id: int
+    title: str
+    seniority: str | None = None
+    status: str
+    is_draft: bool = False
+    active_pipeline: int = 0
+    submitted: int = 0
+    interviewing: int = 0
+    offer: int = 0
+    placed: int = 0
+    last_activity_at: datetime | None = None
+
+
+class PublicClientPlacementRow(BaseModel):
+    """Client-safe placement summary. Role title + start date only."""
+    role_title: str | None = None
+    start_date: date | None = None
+
+
+class PublicClientView(BaseModel):
+    """
+    Client-facing status page payload. Deliberately excludes candidate names,
+    contact details, compensation, and any consumer-side identifiers — the
+    recruiter/consumer data wall stays intact.
+    """
+    agency_name: str
+    client_name: str
+    industry: str | None = None
+    generated_at: datetime
+    roles_open: int = 0
+    roles_filled: int = 0
+    active_pipeline: int = 0
+    placements_total: int = 0
+    avg_time_to_fill_days: float | None = None
+    top_skills: list[str] = []
+    roles: list[PublicClientRoleRow] = []
+    recent_placements: list[PublicClientPlacementRow] = []
+    ai_summary: str | None = None
+    ai_summary_generated_at: datetime | None = None
+    ai_summary_used_llm: bool = False
+
+
 class RoleShareTokenOut(ORMModel):
     id: int
     role_id: int

@@ -42,6 +42,7 @@ from app.recruiter.models import (
     Role,
     RoleFeedback,
     RoleShareToken,
+    ClientShareToken,
     Shortlist,
     ShortlistEntry,
     SpecSheetTemplate,
@@ -62,6 +63,10 @@ from app.recruiter.schemas import (
     CandidateOut,
     CandidateRoleMatchesOut,
     ClientAnalyticsOut,
+    ClientShareTokenOut,
+    PublicClientView,
+    PublicClientRoleRow,
+    PublicClientPlacementRow,
     ClientCreate,
     ClientOut,
     ClientUpdate,
@@ -158,6 +163,7 @@ from app.recruiter.services import visibility as visibility_service
 from app.recruiter.services.screening import improve_summary, extract_structured_notes
 from app.recruiter.services.advisory import next_hire_advisory
 from app.recruiter.services.client_analytics import compute_client_analytics
+from app.recruiter.services.client_share_ai import build_summary as build_client_share_summary
 from app.recruiter.services.ingestion import ingest_batch
 from app.recruiter.services.linkedin_capture import capture_linkedin_profile
 from app.recruiter.services.listing import generate_listing
@@ -281,6 +287,136 @@ def client_analytics(
     """Fulfilment metrics, pipeline health, top skills, and recent placements."""
     client = _load_client(db, agency, client_id)
     return ClientAnalyticsOut(**compute_client_analytics(db, client))
+
+
+@clients_router.get("/{client_id}/share", response_model=ClientShareTokenOut | None)
+def get_client_share(
+    client_id: int,
+    agency: Agency = Depends(get_agency),
+    db: Session = Depends(get_db),
+):
+    """Return the currently active client-share token, if any."""
+    client = _load_client(db, agency, client_id)
+    tok = (
+        db.query(ClientShareToken)
+        .filter(
+            ClientShareToken.client_id == client.id,
+            ClientShareToken.is_active.is_(True),
+        )
+        .order_by(ClientShareToken.id.desc())
+        .first()
+    )
+    if not tok:
+        return None
+    return _client_share_out(tok)
+
+
+@clients_router.post("/{client_id}/share", response_model=ClientShareTokenOut, status_code=201)
+def create_client_share(
+    client_id: int,
+    agency: Agency = Depends(require_unlocked_agency),
+    db: Session = Depends(get_db),
+):
+    """Mint (or rotate) a public client-share token. Previous token is revoked.
+
+    Also seeds the AI summary so the first client visit is fast; the summary
+    can be re-generated on demand from POST .../share/ai-summary.
+    """
+    client = _load_client(db, agency, client_id)
+    (
+        db.query(ClientShareToken)
+        .filter(
+            ClientShareToken.client_id == client.id,
+            ClientShareToken.is_active.is_(True),
+        )
+        .update({ClientShareToken.is_active: False})
+    )
+    tok = ClientShareToken(
+        agency_id=agency.id,
+        client_id=client.id,
+        token=secrets.token_urlsafe(24),
+        is_active=True,
+    )
+    db.add(tok)
+    db.flush()
+    try:
+        summary, used_llm = build_client_share_summary(db, client)
+        tok.ai_summary = summary
+        tok.ai_summary_generated_at = datetime.utcnow()
+        tok.ai_summary_used_llm = used_llm
+    except Exception:
+        # AI seeding is best-effort; a failure never blocks the share link.
+        tok.ai_summary = None
+    db.commit()
+    db.refresh(tok)
+    return _client_share_out(tok)
+
+
+@clients_router.delete("/{client_id}/share", status_code=204)
+def revoke_client_share(
+    client_id: int,
+    agency: Agency = Depends(require_unlocked_agency),
+    db: Session = Depends(get_db),
+):
+    """Revoke the active client-share token. Old URL immediately 404s."""
+    client = _load_client(db, agency, client_id)
+    (
+        db.query(ClientShareToken)
+        .filter(
+            ClientShareToken.client_id == client.id,
+            ClientShareToken.is_active.is_(True),
+        )
+        .update({ClientShareToken.is_active: False})
+    )
+    db.commit()
+    return None
+
+
+@clients_router.post(
+    "/{client_id}/share/ai-summary",
+    response_model=ClientShareTokenOut,
+)
+def regenerate_client_share_summary(
+    client_id: int,
+    agency: Agency = Depends(require_unlocked_agency),
+    db: Session = Depends(get_db),
+):
+    """Rebuild the AI summary on the active share token. Grounded in analytics."""
+    client = _load_client(db, agency, client_id)
+    tok = (
+        db.query(ClientShareToken)
+        .filter(
+            ClientShareToken.client_id == client.id,
+            ClientShareToken.is_active.is_(True),
+        )
+        .order_by(ClientShareToken.id.desc())
+        .first()
+    )
+    if tok is None:
+        raise HTTPException(status_code=404, detail="No active share link for this client")
+    summary, used_llm = build_client_share_summary(db, client)
+    tok.ai_summary = summary
+    tok.ai_summary_generated_at = datetime.utcnow()
+    tok.ai_summary_used_llm = used_llm
+    db.commit()
+    db.refresh(tok)
+    return _client_share_out(tok)
+
+
+def _client_share_out(tok: ClientShareToken) -> ClientShareTokenOut:
+    return ClientShareTokenOut(
+        id=tok.id,
+        client_id=tok.client_id,
+        token=tok.token,
+        is_active=tok.is_active,
+        view_count=tok.view_count,
+        last_viewed_at=tok.last_viewed_at,
+        ai_summary=tok.ai_summary,
+        ai_summary_generated_at=tok.ai_summary_generated_at,
+        ai_summary_used_llm=tok.ai_summary_used_llm,
+        created_at=tok.created_at,
+        share_url=None,
+    )
 
 
 @clients_router.get("/{client_id}/next-hire", response_model=NextHireAdvisoryOut)
@@ -1258,6 +1394,118 @@ def _public_shortlist(db: Session, role: Role, limit: int = 5) -> list[PublicSho
             )
         )
     return out
+
+
+@public_router.get("/clients/{token}", response_model=PublicClientView)
+def public_client_view(token: str, db: Session = Depends(get_db)):
+    """Client-facing status page. Bumps view_count; excludes candidate PII.
+
+    Guardrails:
+     - No candidate names/emails/phones, no compensation numbers.
+     - Roles reduced to title, seniority, status and stage counts.
+     - Placements reduced to role title + start date only.
+     - AI summary is cached on the token; the client sees whatever the recruiter
+       last regenerated.
+    """
+    tok = (
+        db.query(ClientShareToken)
+        .filter(
+            ClientShareToken.token == token,
+            ClientShareToken.is_active.is_(True),
+        )
+        .first()
+    )
+    if tok is None:
+        raise HTTPException(status_code=404, detail="Share link is not active")
+    client = db.get(Client, tok.client_id)
+    if client is None:
+        raise HTTPException(status_code=404, detail="Client no longer exists")
+    agency = db.get(Agency, client.agency_id)
+
+    tok.view_count += 1
+    tok.last_viewed_at = datetime.utcnow()
+    db.commit()
+
+    analytics = compute_client_analytics(db, client)
+
+    # Fold Application stage counts into per-role rows. compute_client_analytics
+    # already returns per-role active_pipeline + placed; we add finer submitted/
+    # interviewing/offer counts derived from the same apps table.
+    from app.recruiter.enums import ApplicationStage
+    role_ids = [r["id"] for r in analytics.get("roles", []) if r.get("id")]
+    stage_by_role: dict[int, dict[str, int]] = {}
+    if role_ids:
+        apps = (
+            db.query(Application)
+            .filter(
+                Application.agency_id == client.agency_id,
+                Application.role_id.in_(role_ids),
+            )
+            .all()
+        )
+        for a in apps:
+            if a.role_id is None:
+                continue
+            counts = stage_by_role.setdefault(
+                a.role_id,
+                {"submitted": 0, "interviewing": 0, "offer": 0, "placed": 0, "last": None},
+            )
+            if a.stage in (ApplicationStage.submitted, ApplicationStage.screening):
+                counts["submitted"] += 1
+            elif a.stage == ApplicationStage.interview:
+                counts["interviewing"] += 1
+            elif a.stage == ApplicationStage.offer:
+                counts["offer"] += 1
+            elif a.stage == ApplicationStage.placed:
+                counts["placed"] += 1
+            if a.last_activity_at and (counts["last"] is None or a.last_activity_at > counts["last"]):
+                counts["last"] = a.last_activity_at
+
+    role_rows: list[PublicClientRoleRow] = []
+    for r in analytics.get("roles", []):
+        rid = r.get("id")
+        c = stage_by_role.get(rid, {})
+        role_rows.append(
+            PublicClientRoleRow(
+                role_id=rid,
+                title=r.get("title") or "",
+                seniority=r.get("seniority"),
+                status=r.get("status") or "",
+                is_draft=bool(r.get("is_draft")),
+                active_pipeline=r.get("active_pipeline") or 0,
+                submitted=int(c.get("submitted") or 0),
+                interviewing=int(c.get("interviewing") or 0),
+                offer=int(c.get("offer") or 0),
+                placed=int(c.get("placed") or r.get("placed") or 0),
+                last_activity_at=c.get("last"),
+            )
+        )
+
+    recent_rows = [
+        PublicClientPlacementRow(
+            role_title=p.get("role_title"),
+            start_date=p.get("placed_at").date() if p.get("placed_at") else None,
+        )
+        for p in (analytics.get("recent_placements") or [])[:5]
+    ]
+
+    return PublicClientView(
+        agency_name=agency.name if agency else "",
+        client_name=client.name,
+        industry=client.industry,
+        generated_at=datetime.utcnow(),
+        roles_open=analytics.get("roles_open") or 0,
+        roles_filled=analytics.get("roles_filled") or 0,
+        active_pipeline=analytics.get("active_pipeline") or 0,
+        placements_total=analytics.get("placements_total") or 0,
+        avg_time_to_fill_days=analytics.get("avg_time_to_fill_days"),
+        top_skills=list((analytics.get("top_skills") or [])[:10]),
+        roles=role_rows,
+        recent_placements=recent_rows,
+        ai_summary=tok.ai_summary,
+        ai_summary_generated_at=tok.ai_summary_generated_at,
+        ai_summary_used_llm=tok.ai_summary_used_llm,
+    )
 
 
 @public_router.get("/roles/{token}", response_model=PublicRoleView)
