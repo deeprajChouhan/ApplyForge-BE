@@ -935,6 +935,36 @@ class PublicRoleView(BaseModel):
     is_draft: bool
     agency_name: str
     shortlist: list[PublicShortlistCandidate] = Field(default_factory=list)
+    submissions: list["PublicSubmission"] = Field(default_factory=list)
+
+
+
+
+class PublicSubmission(BaseModel):
+    """One recruiter-approved submission the client is being asked to review.
+    Only client-visible fields; never internal_notes / suitability outcome."""
+    submission_id: int
+    candidate_id: int
+    display_name: str
+    headline: str | None = None
+    recruiter_summary: str | None = None
+    key_strengths: list[str] = Field(default_factory=list)
+    potential_gaps: list[str] = Field(default_factory=list)
+    expected_compensation: dict | None = None
+    notice_period: dict | None = None
+    availability_date: str | None = None
+    availability_immediate: bool | None = None
+    preferred_work_model: str | None = None
+    preferred_location: str | None = None
+    submitted_at: datetime | None = None
+    client_decision: str | None = None
+
+
+class PublicSubmissionDecision(BaseModel):
+    decision: str  # progress | hold | reject
+    reasons: list[str] | None = None
+    comment: str | None = None
+    client_contact_name: str | None = None
 
 
 class PublicFeedbackCreate(BaseModel):

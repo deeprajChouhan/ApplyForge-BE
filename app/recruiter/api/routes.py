@@ -83,6 +83,8 @@ from app.recruiter.schemas import (
     PublicCandidateDetail,
     PublicCandidateExperience,
     PublicRoleView,
+    PublicSubmission,
+    PublicSubmissionDecision,
     PublicShortlistCandidate,
     RoleFeedbackOut,
     ScreeningQuestion,
@@ -1276,6 +1278,15 @@ def public_role_view(token: str, db: Session = Depends(get_db)):
 
     tok.view_count += 1
     tok.last_viewed_at = datetime.utcnow()
+    # First-view stamp on each not-yet-viewed submission for this role.
+    now = datetime.utcnow()
+    for _sub in db.query(ClientSubmission).filter(
+        ClientSubmission.agency_id == role.agency_id,
+        ClientSubmission.role_id == role.id,
+        ClientSubmission.client_viewed_at.is_(None),
+        ClientSubmission.status.in_(["submitted", "client_reviewing"]),
+    ).all():
+        _sub.client_viewed_at = now
     db.commit()
 
     return PublicRoleView(
@@ -1294,6 +1305,7 @@ def public_role_view(token: str, db: Session = Depends(get_db)):
         is_draft=role.is_draft,
         agency_name=agency.name if agency else "",
         shortlist=_public_shortlist(db, role),
+        submissions=_public_submissions(db, role),
     )
 
 
@@ -2584,3 +2596,115 @@ def client_intelligence_route(
     if client is None or client.agency_id != agency.id:
         raise HTTPException(404, "Client not found")
     return intelligence_service.client_intelligence(db, agency.id, client_id)
+
+
+def _public_submissions(db: Session, role: Role) -> list[PublicSubmission]:
+    """Recruiter-approved submissions for this role, client-safe payload.
+    Filters through the same visibility rules as the recruiter UI would."""
+    subs = (
+        db.query(ClientSubmission)
+        .filter(
+            ClientSubmission.agency_id == role.agency_id,
+            ClientSubmission.role_id == role.id,
+            ClientSubmission.status.in_([
+                "submitted", "client_reviewing", "progressed", "on_hold",
+            ]),
+        )
+        .order_by(ClientSubmission.submitted_at.desc().nulls_last(), ClientSubmission.id.desc())
+        .all()
+    )
+    if not subs:
+        return []
+    cand_ids = {s.candidate_id for s in subs}
+    cand_map = {
+        c.id: c for c in db.query(CandidateProfile).filter(CandidateProfile.id.in_(cand_ids)).all()
+    }
+    apps = {
+        a.id: a
+        for a in db.query(Application).filter(
+            Application.id.in_([s.application_id for s in subs])
+        ).all()
+    }
+
+    out: list[PublicSubmission] = []
+    for sub in subs:
+        cand = cand_map.get(sub.candidate_id)
+        app_row = apps.get(sub.application_id)
+        # Enforce client visibility from the underlying application, not the sub.
+        # Snapshotted fields on the submission take precedence for structured data.
+        vmap = (app_row.client_visibility if app_row else None) or {}
+        def allowed(field: str) -> bool:
+            if field not in vmap:
+                # default visible (Phase 1 defaults) unless field is off-limit
+                return True
+            return bool(vmap.get(field))
+
+        out.append(PublicSubmission(
+            submission_id=sub.id,
+            candidate_id=sub.candidate_id,
+            display_name=_client_display_name(cand.full_name if cand else None, sub.candidate_id),
+            headline=cand.headline if cand else None,
+            recruiter_summary=sub.client_summary if allowed("recruiter_summary") else None,
+            key_strengths=sub.key_strengths or [],
+            potential_gaps=sub.potential_gaps or [],
+            expected_compensation=sub.compensation_snapshot if allowed("expected_compensation") else None,
+            notice_period=sub.notice_period_snapshot if allowed("notice_period") else None,
+            availability_date=(sub.availability_snapshot or {}).get("date") if allowed("availability") else None,
+            availability_immediate=(sub.availability_snapshot or {}).get("immediate") if allowed("availability") else None,
+            preferred_work_model=None,  # not in snapshot yet; keeps payload safe
+            preferred_location=None,
+            submitted_at=sub.submitted_at,
+            client_decision=sub.client_decision.value if getattr(sub.client_decision, "value", None) else sub.client_decision,
+        ))
+    return out
+
+
+@public_router.post(
+    "/roles/{token}/submissions/{submission_id}/decision",
+    response_model=PublicSubmission,
+)
+def public_submission_decision(
+    token: str,
+    submission_id: int,
+    payload: PublicSubmissionDecision,
+    db: Session = Depends(get_db),
+):
+    """Client posts a decision on an approved submission through the public
+    share link. Writes a SubmissionFeedback row and mirrors the decision +
+    responded_at onto the submission (drives the recruiter SLA metrics).
+    """
+    tok = (
+        db.query(RoleShareToken)
+        .filter(RoleShareToken.token == token, RoleShareToken.is_active.is_(True))
+        .first()
+    )
+    if tok is None:
+        raise HTTPException(status_code=404, detail="Share link is not active")
+    sub = db.get(ClientSubmission, submission_id)
+    if sub is None or sub.agency_id != tok.agency_id or sub.role_id != tok.role_id:
+        raise HTTPException(status_code=404, detail="Submission not on this shared role")
+    from app.recruiter.enums import ClientDecision
+    try:
+        decision = ClientDecision(payload.decision)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid decision")
+
+    db.add(SubmissionFeedback(
+        agency_id=sub.agency_id, submission_id=sub.id, decision=decision,
+        reasons=payload.reasons, comment=payload.comment,
+        client_contact_name=payload.client_contact_name,
+        submitted_via="portal",
+    ))
+    sub.client_decision = decision
+    if sub.client_responded_at is None:
+        sub.client_responded_at = datetime.utcnow()
+    if sub.client_viewed_at is None:
+        sub.client_viewed_at = datetime.utcnow()
+    db.commit(); db.refresh(sub)
+
+    # Return the fresh client-view of just this submission for the UI.
+    role = db.get(Role, sub.role_id)
+    only = [x for x in _public_submissions(db, role) if x.submission_id == sub.id]
+    if only:
+        return only[0]
+    raise HTTPException(status_code=500, detail="Submission update failed")
