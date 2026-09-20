@@ -963,6 +963,7 @@ class PublicRoleView(BaseModel):
     agency_name: str
     shortlist: list[PublicShortlistCandidate] = Field(default_factory=list)
     submissions: list[PublicSubmission] = Field(default_factory=list)
+    placement_journey: dict | None = None
 
 
 

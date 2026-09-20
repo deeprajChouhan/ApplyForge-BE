@@ -1306,6 +1306,7 @@ def public_role_view(token: str, db: Session = Depends(get_db)):
         agency_name=agency.name if agency else "",
         shortlist=_public_shortlist(db, role),
         submissions=_public_submissions(db, role),
+        placement_journey=_placement_journey_payload(db, role),
     )
 
 
@@ -2315,6 +2316,25 @@ def create_placement(
     role = db.get(Role, payload.role_id)
     if role is None or role.agency_id != agency.id:
         raise HTTPException(404, "Role not found")
+
+    # One-active-placement-per-role guard. Cancelled / refunded / replaced
+    # placements are ignored so a role can be re-filled after a fall-through.
+    from app.recruiter.enums import PlacementStatus as _PS
+    existing = (
+        db.query(Placement)
+        .filter(
+            Placement.agency_id == agency.id,
+            Placement.role_id == payload.role_id,
+            Placement.status.in_([_PS.upcoming, _PS.started, _PS.completed]),
+        )
+        .first()
+    )
+    if existing:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Role already has an active placement (#{existing.id}, status: {existing.status.value}).",
+        )
+
     fee_amount = payload.fee_amount
     if fee_amount is None:
         fee_amount = offers_service.compute_placement_fee(
@@ -2708,3 +2728,160 @@ def public_submission_decision(
     if only:
         return only[0]
     raise HTTPException(status_code=500, detail="Submission update failed")
+
+
+
+# ── Placement journey (used by role detail + public share when filled) ──
+def _placement_journey_payload(db: Session, role: Role) -> dict:
+    """
+    Consolidated timeline for the placed candidate on this role.
+    Returns None if the role has no active placement.
+    """
+    from app.recruiter.enums import PlacementStatus as _PS
+    pl = (
+        db.query(Placement)
+        .filter(
+            Placement.agency_id == role.agency_id,
+            Placement.role_id == role.id,
+            Placement.status.in_([_PS.upcoming, _PS.started, _PS.completed]),
+        )
+        .order_by(Placement.id.desc())
+        .first()
+    )
+    if pl is None:
+        return None
+
+    cand = db.get(CandidateProfile, pl.candidate_id)
+    # Application row for the placed candidate (there should be exactly one per
+    # candidate+role).
+    app_row = (
+        db.query(Application)
+        .filter(
+            Application.agency_id == role.agency_id,
+            Application.role_id == role.id,
+            Application.candidate_id == pl.candidate_id,
+        )
+        .order_by(Application.id.desc())
+        .first()
+    )
+    subs = (
+        db.query(ClientSubmission)
+        .filter(
+            ClientSubmission.agency_id == role.agency_id,
+            ClientSubmission.role_id == role.id,
+            ClientSubmission.candidate_id == pl.candidate_id,
+        )
+        .order_by(ClientSubmission.id.asc())
+        .all()
+    )
+    ivs = (
+        db.query(Interview)
+        .filter(
+            Interview.agency_id == role.agency_id,
+            Interview.role_id == role.id,
+            Interview.candidate_id == pl.candidate_id,
+        )
+        .order_by(Interview.confirmed_time.asc(), Interview.id.asc())
+        .all()
+    )
+    iv_ids = [iv.id for iv in ivs]
+    fbs = (
+        db.query(InterviewFeedback)
+        .filter(
+            InterviewFeedback.agency_id == role.agency_id,
+            InterviewFeedback.interview_id.in_(iv_ids) if iv_ids else False,
+        )
+        .all()
+    ) if iv_ids else []
+    fb_by_iv: dict[int, list] = {}
+    for f in fbs:
+        fb_by_iv.setdefault(f.interview_id, []).append(f)
+
+    offers = (
+        db.query(Offer)
+        .filter(
+            Offer.agency_id == role.agency_id,
+            Offer.role_id == role.id,
+            Offer.candidate_id == pl.candidate_id,
+        )
+        .order_by(Offer.id.asc())
+        .all()
+    )
+
+    return {
+        "candidate": {
+            "id": cand.id if cand else pl.candidate_id,
+            "display_name": _client_display_name(cand.full_name if cand else None, pl.candidate_id),
+            "full_name": cand.full_name if cand else None,
+            "headline": cand.headline if cand else None,
+        },
+        "screening": {
+            "outcome": app_row.screening_outcome.value if (app_row and app_row.screening_outcome) else None,
+            "completed_at": app_row.screening_completed_at.isoformat() if (app_row and app_row.screening_completed_at) else None,
+            "recruiter_summary": app_row.recruiter_summary if app_row else None,
+        },
+        "submissions": [
+            {
+                "id": sub.id,
+                "status": sub.status.value if getattr(sub.status, "value", None) else sub.status,
+                "submitted_at": sub.submitted_at.isoformat() if sub.submitted_at else None,
+                "client_decision": sub.client_decision.value if getattr(sub.client_decision, "value", None) else sub.client_decision,
+                "client_responded_at": sub.client_responded_at.isoformat() if sub.client_responded_at else None,
+                "client_summary": sub.client_summary,
+            }
+            for sub in subs
+        ],
+        "interviews": [
+            {
+                "id": iv.id,
+                "stage": iv.stage.value if iv.stage else None,
+                "interview_type": iv.interview_type.value if iv.interview_type else None,
+                "status": iv.status.value if iv.status else None,
+                "confirmed_time": iv.confirmed_time.isoformat() if iv.confirmed_time else None,
+                "duration_minutes": iv.duration_minutes,
+                "feedback": [
+                    {
+                        "interviewer_name": f.interviewer_name,
+                        "decision": f.decision.value if getattr(f.decision, "value", None) else f.decision,
+                        "comment": f.comment,
+                    }
+                    for f in fb_by_iv.get(iv.id, [])
+                ],
+            }
+            for iv in ivs
+        ],
+        "offers": [
+            {
+                "id": o.id,
+                "status": o.status.value if getattr(o.status, "value", None) else o.status,
+                "base_compensation": o.base_compensation,
+                "bonus": o.bonus,
+                "start_date": o.start_date.isoformat() if o.start_date else None,
+                "offer_date": o.offer_date.isoformat() if o.offer_date else None,
+            }
+            for o in offers
+        ],
+        "placement": {
+            "id": pl.id,
+            "status": pl.status.value if getattr(pl.status, "value", None) else pl.status,
+            "start_date": pl.start_date.isoformat() if pl.start_date else None,
+            "final_compensation": pl.final_compensation,
+            "fee_percent": pl.fee_percent,
+            "fee_amount": pl.fee_amount,
+            "guarantee_weeks": pl.guarantee_weeks,
+            "guarantee_ends_at": pl.guarantee_ends_at.isoformat() if pl.guarantee_ends_at else None,
+        },
+    }
+
+
+@roles_router.get("/{role_id}/placement-journey")
+def role_placement_journey(
+    role_id: int,
+    agency: Agency = Depends(get_agency),
+    db: Session = Depends(get_db),
+):
+    role = _load_role(db, agency, role_id)
+    payload = _placement_journey_payload(db, role)
+    if payload is None:
+        raise HTTPException(status_code=404, detail="No active placement for this role")
+    return payload
