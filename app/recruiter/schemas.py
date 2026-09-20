@@ -713,7 +713,7 @@ class ApplicationOut(ORMModel):
     preferred_location: str | None = None
     relocation: str | None = None
     relocation_notes: str | None = None
-    client_visibility: dict = Field(default_factory=dict)
+    client_visibility: dict | None = None
 
 
 # ── Recruiter OS Phase 1: screening payloads ───────────────────────────
