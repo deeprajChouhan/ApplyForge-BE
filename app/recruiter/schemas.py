@@ -918,28 +918,6 @@ class PublicCandidateDetail(BaseModel):
     experiences: list[PublicCandidateExperience] = Field(default_factory=list)
 
 
-class PublicRoleView(BaseModel):
-    """Client-safe payload — no candidate PII, no client budget internals."""
-    role_id: int
-    title: str
-    seniority: str | None
-    location: str | None
-    employment_type: str | None
-    description: str | None
-    required_skills: list[str]
-    preferred_skills: list[str]
-    min_years_experience: float | None
-    salary_min: int | None
-    salary_max: int | None
-    market_snapshot: dict | None
-    is_draft: bool
-    agency_name: str
-    shortlist: list[PublicShortlistCandidate] = Field(default_factory=list)
-    submissions: list["PublicSubmission"] = Field(default_factory=list)
-
-
-
-
 class PublicSubmission(BaseModel):
     """One recruiter-approved submission the client is being asked to review.
     Only client-visible fields; never internal_notes / suitability outcome."""
@@ -965,6 +943,28 @@ class PublicSubmissionDecision(BaseModel):
     reasons: list[str] | None = None
     comment: str | None = None
     client_contact_name: str | None = None
+
+
+class PublicRoleView(BaseModel):
+    """Client-safe payload — no candidate PII, no client budget internals."""
+    role_id: int
+    title: str
+    seniority: str | None
+    location: str | None
+    employment_type: str | None
+    description: str | None
+    required_skills: list[str]
+    preferred_skills: list[str]
+    min_years_experience: float | None
+    salary_min: int | None
+    salary_max: int | None
+    market_snapshot: dict | None
+    is_draft: bool
+    agency_name: str
+    shortlist: list[PublicShortlistCandidate] = Field(default_factory=list)
+    submissions: list[PublicSubmission] = Field(default_factory=list)
+
+
 
 
 class PublicFeedbackCreate(BaseModel):
