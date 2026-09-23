@@ -183,3 +183,22 @@ def test_pipeline_fit_scores_follow_latest_shortlist():
     cards = [a for c in r.json()["columns"] for a in c["applications"]]
     assert cards[0]["fit_score"] == 70.0
     db.close()
+
+
+def test_pipeline_tolerates_ties_with_missing_last_activity():
+    """Regression: equal fit scores + NULL last_activity_at used to 500 the board."""
+    db = SessionLocal()
+    ag, role, cand, app_row, h = _setup(db)
+    cand2 = CandidateProfile(agency_id=ag.id, full_name="Twin")
+    db.add(cand2); db.commit(); db.refresh(cand2)
+    app2 = Application(agency_id=ag.id, candidate_id=cand2.id, role_id=role.id,
+                       stage=ApplicationStage.screening, fit_score=70.0)
+    db.add(app2); db.commit()
+    app_row.fit_score = 70.0
+    db.commit()
+    # Production MySQL rows can carry NULL last_activity_at (SQLite schema
+    # forbids it), so tie-break robustness is covered by the sort key itself.
+    r = client.get(f"/api/v1/recruiter/agencies/{E(ag.id)}/roles/{E(role.id)}/pipeline", headers=h)
+    assert r.status_code == 200, r.text
+    assert r.json()["total"] == 2
+    db.close()

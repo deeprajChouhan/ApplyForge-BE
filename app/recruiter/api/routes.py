@@ -1247,7 +1247,10 @@ def role_pipeline(
                 _application_out(a)
                 for a in sorted(
                     rows,
-                    key=lambda r: (r.fit_score or -1, r.last_activity_at),
+                    key=lambda r: (
+                        r.fit_score if r.fit_score is not None else -1.0,
+                        r.last_activity_at or datetime.min,
+                    ),
                     reverse=True,
                 )
             ],
