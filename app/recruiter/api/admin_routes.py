@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from app.recruiter.ids import PublicIdRoute
 from app.api.deps import require_admin
 from app.core.security import hash_password
 from app.db.session import get_db
@@ -39,6 +40,7 @@ def effective_seat_limit(agency: Agency) -> int | None:
     return agency.seat_limit if agency.seat_limit is not None else default_seat_limit(agency.plan)
 
 router = APIRouter(
+    route_class=PublicIdRoute,
     prefix="/admin",
     tags=["recruiter: admin"],
     dependencies=[Depends(require_admin)],

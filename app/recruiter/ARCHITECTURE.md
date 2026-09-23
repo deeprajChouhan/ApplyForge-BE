@@ -378,3 +378,41 @@ Run inside the backend container:
 ```
 pytest tests/test_recruiter_screening.py tests/test_recruiter_os_all_phases.py -q
 ```
+
+## Public ids (no DB ints over the wire)
+
+Every recruiter router uses `route_class=PublicIdRoute` (`app/recruiter/ids.py`).
+At the HTTP boundary it translates ids so handlers/services/schemas stay int-based:
+
+- Path + query params named `id`, `*_id`, `*_ids` (plus `ids`, `skipped_existing`,
+  `*_by` actor fields) must be GUIDs. A raw int in the URL returns 404.
+- JSON request bodies: GUID strings under those keys are decoded to ints (ints are
+  still tolerated in bodies for older clients).
+- JSON responses: every int under those keys, at any depth, is encoded to a GUID.
+
+GUIDs are a keyed 128-bit Feistel permutation of the int (key: `RECRUITER_ID_KEY`,
+else derived from `SECRET_KEY`). They're stable, non-sequential and tamper-checked,
+and need no DB column. **Never rotate the key**: it changes every recruiter URL.
+New id-bearing fields must follow the naming rule, or be added to `EXTRA_ID_KEYS`.
+
+## Screening: lock, gap-filling, auto-fill
+
+- `PATCH .../applications/{id}/screening` on a completed screening only accepts
+  values for fields that are still empty (409 otherwise). `reopen: true` unlocks.
+  Both paths write a system note to the activity log.
+- When `recruiter_summary`/`internal_notes` are saved, facts stated in the text
+  (salary, "competitive" asks, notice, last working day / early release, work
+  model, relocation) are lifted into **empty** fields
+  (`services/screening_extract.py` deterministic parser, merged with the LLM
+  extractor). It never overwrites recruiter-entered values and never invents numbers.
+- `POST .../screening/autofill` previews (`apply=false`) or applies proposals.
+  Conflicting values are only written when listed in `overwrite`.
+- Expected comp supports `basis: "competitive"` with an estimate
+  (`minimum`/`maximum`/`target`, `estimate_source` market|recruiter|uplift,
+  `uplift_pct`). Readiness accepts a competitive ask once it has an estimate.
+
+## Fit score
+
+`Application.fit_score` is a cache of the latest ranking. `generate_shortlist`
+rewrites it for every application on the role, and the pipeline/screening reads
+reconcile it with the latest shortlist (`refresh_role_fit_scores`).

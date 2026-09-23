@@ -10,10 +10,11 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
+from app.recruiter.ids import PublicIdRoute
 from app.db.session import get_db
 from app.recruiter.services import billing
 
-router = APIRouter(prefix="/billing", tags=["recruiter: billing"])
+router = APIRouter(route_class=PublicIdRoute, prefix="/billing", tags=["recruiter: billing"])
 
 
 @router.post("/webhook")

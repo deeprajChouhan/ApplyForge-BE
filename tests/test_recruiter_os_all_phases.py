@@ -18,9 +18,16 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
+from app.recruiter.ids import encode_id as E
+
 from app.main import app
 from app.db.session import SessionLocal
-from app.core.security import hash_password, create_recruiter_access_token
+from app.core.security import hash_password
+from app.recruiter.api.auth_routes import issue_recruiter_tokens
+
+
+def create_recruiter_access_token(recruiter_id: int) -> str:
+    return issue_recruiter_tokens(recruiter_id)[0]
 from app.recruiter.enums import ApplicationStage, RecruiterSeatRole
 from app.recruiter.models import (
     Agency, Application, CandidateProfile, ClientSubmission, Recruiter, Role,
@@ -73,13 +80,13 @@ def test_phase2_consent_and_submission_flow():
         role = _mk_role(db, ag); cand = _mk_cand(db, ag); app_row = _mk_app(db, ag, cand, role)
 
         # Readiness at start: not ready
-        r = client.get(f"/api/v1/recruiter/agencies/{ag.id}/applications/{app_row.id}/readiness",
+        r = client.get(f"/api/v1/recruiter/agencies/{E(ag.id)}/applications/{E(app_row.id)}/readiness",
                        headers=_auth(rec))
         assert r.status_code == 200
         assert r.json()["ready"] is False
 
         # Create + confirm consent
-        r = client.post(f"/api/v1/recruiter/agencies/{ag.id}/consents",
+        r = client.post(f"/api/v1/recruiter/agencies/{E(ag.id)}/consents",
                         headers=_auth(rec),
                         json={"candidate_id": cand.id, "role_id": role.id,
                               "status": "confirmed", "method": "email"})
@@ -88,7 +95,7 @@ def test_phase2_consent_and_submission_flow():
 
         # Fill screening fields to make it fully ready
         r = client.patch(
-            f"/api/v1/recruiter/agencies/{ag.id}/applications/{app_row.id}/screening",
+            f"/api/v1/recruiter/agencies/{E(ag.id)}/applications/{E(app_row.id)}/screening",
             headers=_auth(rec),
             json={
                 "recruiter_summary": "Strong candidate.",
@@ -99,12 +106,12 @@ def test_phase2_consent_and_submission_flow():
             })
         assert r.status_code == 200
 
-        r = client.get(f"/api/v1/recruiter/agencies/{ag.id}/applications/{app_row.id}/readiness",
+        r = client.get(f"/api/v1/recruiter/agencies/{E(ag.id)}/applications/{E(app_row.id)}/readiness",
                        headers=_auth(rec))
         assert r.json()["ready"] is True
 
         # Create submission — snapshots
-        r = client.post(f"/api/v1/recruiter/agencies/{ag.id}/submissions",
+        r = client.post(f"/api/v1/recruiter/agencies/{E(ag.id)}/submissions",
                         headers=_auth(rec),
                         json={"application_id": app_row.id, "mark_submitted": True})
         assert r.status_code == 201, r.text
@@ -115,7 +122,7 @@ def test_phase2_consent_and_submission_flow():
 
         # AI draft endpoint returns shape even without LLM
         r = client.post(
-            f"/api/v1/recruiter/agencies/{ag.id}/submissions/{sub['id']}/ai-draft",
+            f"/api/v1/recruiter/agencies/{E(ag.id)}/submissions/{sub['id']}/ai-draft",
             headers=_auth(rec),
         )
         assert r.status_code == 200
@@ -141,31 +148,31 @@ def test_phase3_feedback_sla_and_comparison():
         a1 = _mk_app(db, ag, c1, role); a2 = _mk_app(db, ag, c2, role)
 
         # SLA upsert + summary
-        r = client.put(f"/api/v1/recruiter/agencies/{ag.id}/clients/{cl.id}/sla",
+        r = client.put(f"/api/v1/recruiter/agencies/{E(ag.id)}/clients/{E(cl.id)}/sla",
                        headers=_auth(rec),
                        json={"expected_feedback_hours": 24})
         assert r.status_code == 200
         assert r.json()["expected_feedback_hours"] == 24
 
-        r = client.get(f"/api/v1/recruiter/agencies/{ag.id}/clients/{cl.id}/sla-summary",
+        r = client.get(f"/api/v1/recruiter/agencies/{E(ag.id)}/clients/{E(cl.id)}/sla-summary",
                        headers=_auth(rec))
         assert r.status_code == 200
         assert r.json()["expected_feedback_hours"] == 24
 
         # Create a submission, then submit feedback on it
-        r = client.post(f"/api/v1/recruiter/agencies/{ag.id}/submissions",
+        r = client.post(f"/api/v1/recruiter/agencies/{E(ag.id)}/submissions",
                         headers=_auth(rec),
                         json={"application_id": a1.id, "mark_submitted": True})
         sub_id = r.json()["id"]
         r = client.post(
-            f"/api/v1/recruiter/agencies/{ag.id}/submissions/{sub_id}/feedback",
+            f"/api/v1/recruiter/agencies/{E(ag.id)}/submissions/{sub_id}/feedback",
             headers=_auth(rec),
             json={"decision": "reject", "reasons": ["salary", "seniority"], "comment": "no"},
         )
         assert r.status_code == 201
 
         # Comparison
-        r = client.post(f"/api/v1/recruiter/agencies/{ag.id}/candidate-comparison",
+        r = client.post(f"/api/v1/recruiter/agencies/{E(ag.id)}/candidate-comparison",
                         headers=_auth(rec),
                         json={"role_id": role.id, "candidate_ids": [c1.id, c2.id]})
         assert r.status_code == 200
@@ -181,24 +188,24 @@ def test_phase4_interview_flow():
         ag = _mk_agency(db, "P4A"); rec = _mk_recruiter(db, ag, "p4@x.com")
         role = _mk_role(db, ag); cand = _mk_cand(db, ag); app_row = _mk_app(db, ag, cand, role)
 
-        r = client.post(f"/api/v1/recruiter/agencies/{ag.id}/interviews",
+        r = client.post(f"/api/v1/recruiter/agencies/{E(ag.id)}/interviews",
                         headers=_auth(rec),
                         json={"application_id": app_row.id, "stage": "first",
                               "interview_type": "video"})
         assert r.status_code == 201
         iid = r.json()["id"]
 
-        r = client.patch(f"/api/v1/recruiter/agencies/{ag.id}/interviews/{iid}",
+        r = client.patch(f"/api/v1/recruiter/agencies/{E(ag.id)}/interviews/{iid}",
                          headers=_auth(rec),
                          json={"status": "completed"})
         assert r.status_code == 200
 
-        r = client.post(f"/api/v1/recruiter/agencies/{ag.id}/interviews/{iid}/feedback",
+        r = client.post(f"/api/v1/recruiter/agencies/{E(ag.id)}/interviews/{iid}/feedback",
                         headers=_auth(rec),
                         json={"technical": 4, "communication": 5, "decision": "progress"})
         assert r.status_code == 201
 
-        r = client.get(f"/api/v1/recruiter/agencies/{ag.id}/interviews/{iid}/brief",
+        r = client.get(f"/api/v1/recruiter/agencies/{E(ag.id)}/interviews/{iid}/brief",
                        headers=_auth(rec))
         assert r.status_code == 200
         for k in ("likely_topics", "suggested_questions", "used_llm"):
@@ -214,7 +221,7 @@ def test_phase5_offer_placement_and_checkins():
         ag = _mk_agency(db, "P5A"); rec = _mk_recruiter(db, ag, "p5@x.com")
         role = _mk_role(db, ag); cand = _mk_cand(db, ag); app_row = _mk_app(db, ag, cand, role)
 
-        r = client.post(f"/api/v1/recruiter/agencies/{ag.id}/offers",
+        r = client.post(f"/api/v1/recruiter/agencies/{E(ag.id)}/offers",
                         headers=_auth(rec),
                         json={"application_id": app_row.id,
                               "base_compensation": {"amount": 95000, "currency": "GBP", "period": "YEAR"},
@@ -222,13 +229,13 @@ def test_phase5_offer_placement_and_checkins():
         assert r.status_code == 201
         offer_id = r.json()["id"]
 
-        r = client.post(f"/api/v1/recruiter/agencies/{ag.id}/offers/{offer_id}/negotiations",
+        r = client.post(f"/api/v1/recruiter/agencies/{E(ag.id)}/offers/{offer_id}/negotiations",
                         headers=_auth(rec),
                         json={"round_label": "counter", "from_party": "candidate",
                               "compensation": {"amount": 100000, "currency": "GBP", "period": "YEAR"}})
         assert r.status_code == 201
 
-        r = client.post(f"/api/v1/recruiter/agencies/{ag.id}/placements",
+        r = client.post(f"/api/v1/recruiter/agencies/{E(ag.id)}/placements",
                         headers=_auth(rec),
                         json={"role_id": role.id, "candidate_id": cand.id,
                               "offer_id": offer_id, "start_date": "2026-11-01",
@@ -241,7 +248,7 @@ def test_phase5_offer_placement_and_checkins():
 
         # Check-ins auto-seeded
         r = client.get(
-            f"/api/v1/recruiter/agencies/{ag.id}/placements/{placement['id']}/checkins",
+            f"/api/v1/recruiter/agencies/{E(ag.id)}/placements/{placement['id']}/checkins",
             headers=_auth(rec),
         )
         assert r.status_code == 200
@@ -257,18 +264,18 @@ def test_phase6_tasks_and_daily_brief():
     try:
         ag = _mk_agency(db, "P6A"); rec = _mk_recruiter(db, ag, "p6@x.com")
 
-        r = client.post(f"/api/v1/recruiter/agencies/{ag.id}/tasks",
+        r = client.post(f"/api/v1/recruiter/agencies/{E(ag.id)}/tasks",
                         headers=_auth(rec),
                         json={"title": "Chase client", "priority": "high"})
         assert r.status_code == 201
         tid = r.json()["id"]
-        r = client.patch(f"/api/v1/recruiter/agencies/{ag.id}/tasks/{tid}",
+        r = client.patch(f"/api/v1/recruiter/agencies/{E(ag.id)}/tasks/{tid}",
                          headers=_auth(rec),
                          json={"status": "done"})
         assert r.status_code == 200
         assert r.json()["completed_at"] is not None
 
-        r = client.get(f"/api/v1/recruiter/agencies/{ag.id}/daily-brief",
+        r = client.get(f"/api/v1/recruiter/agencies/{E(ag.id)}/daily-brief",
                        headers=_auth(rec))
         assert r.status_code == 200
         body = r.json()
@@ -287,21 +294,21 @@ def test_phase7_ask_pool_and_role_health():
         for i in range(3):
             _mk_cand(db, ag, f"C{i}")
 
-        r = client.post(f"/api/v1/recruiter/agencies/{ag.id}/intelligence/ask-pool",
+        r = client.post(f"/api/v1/recruiter/agencies/{E(ag.id)}/intelligence/ask-pool",
                         headers=_auth(rec),
                         json={"query": "python engineers", "limit": 5})
         assert r.status_code == 200
         assert "matches" in r.json()
 
         r = client.get(
-            f"/api/v1/recruiter/agencies/{ag.id}/intelligence/roles/{role.id}/health",
+            f"/api/v1/recruiter/agencies/{E(ag.id)}/intelligence/roles/{E(role.id)}/health",
             headers=_auth(rec))
         assert r.status_code == 200
         for k in ("sourced", "screened", "submitted", "pipeline_risk"):
             assert k in r.json()
 
         r = client.get(
-            f"/api/v1/recruiter/agencies/{ag.id}/intelligence/roles/{role.id}/quality-check",
+            f"/api/v1/recruiter/agencies/{E(ag.id)}/intelligence/roles/{E(role.id)}/quality-check",
             headers=_auth(rec))
         assert r.status_code == 200
         assert "observations" in r.json()
@@ -319,10 +326,10 @@ def test_cross_phase_agency_isolation():
 
         # r1 (agency A) attempting to reach anything under agency B → 403 or 404
         for path in (
-            f"/api/v1/recruiter/agencies/{a2.id}/applications/{app_b.id}/readiness",
-            f"/api/v1/recruiter/agencies/{a2.id}/tasks",
-            f"/api/v1/recruiter/agencies/{a2.id}/daily-brief",
-            f"/api/v1/recruiter/agencies/{a2.id}/intelligence/roles/{role_b.id}/health",
+            f"/api/v1/recruiter/agencies/{E(a2.id)}/applications/{E(app_b.id)}/readiness",
+            f"/api/v1/recruiter/agencies/{E(a2.id)}/tasks",
+            f"/api/v1/recruiter/agencies/{E(a2.id)}/daily-brief",
+            f"/api/v1/recruiter/agencies/{E(a2.id)}/intelligence/roles/{E(role_b.id)}/health",
         ):
             r = client.get(path, headers=_auth(r1))
             assert r.status_code in (403, 404), f"{path} leaked: {r.status_code}"

@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from jose import JWTError, jwt
 from sqlalchemy.orm import Session
 
+from app.recruiter.ids import PublicIdRoute
 from app.core.config import settings
 from app.core.security import create_token, verify_password
 from app.db.session import get_db
@@ -31,7 +32,7 @@ from app.recruiter.schemas import (
 )
 from app.recruiter.services import onboarding as onboarding_service
 
-router = APIRouter(prefix="/auth", tags=["recruiter: auth"])
+router = APIRouter(route_class=PublicIdRoute, prefix="/auth", tags=["recruiter: auth"])
 
 
 @router.post("/login", response_model=RecruiterTokenResponse)

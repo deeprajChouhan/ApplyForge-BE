@@ -23,6 +23,22 @@ from app.recruiter.models import (
 from app.recruiter.services import ai_support
 
 
+def compensation_confirmed(comp: dict | None) -> bool:
+    """
+    A figure the client can reason about exists: either the candidate's own
+    number, or — for a "competitive" ask — a recorded estimate (range/target,
+    or an uplift % on a known current package).
+    """
+    if not comp:
+        return False
+    if comp.get("amount"):
+        return True
+    if comp.get("basis") == "competitive":
+        if comp.get("target") or comp.get("minimum") or comp.get("maximum"):
+            return True
+    return False
+
+
 def readiness(db: Session, agency_id: int, app_row: Application) -> dict[str, Any]:
     """
     Returns the structured checklist described in the spec §18. Every item is
@@ -40,11 +56,15 @@ def readiness(db: Session, agency_id: int, app_row: Application) -> dict[str, An
         app_row.screening_completed_at is not None,
         "Complete the screening workflow before submitting.",
     )
+    comp = app_row.expected_compensation or {}
     add(
         "salary_confirmed",
-        "Expected compensation confirmed",
-        bool(app_row.expected_compensation and app_row.expected_compensation.get("amount")),
-        "Confirm the candidate's expected compensation for this role.",
+        "Expected compensation confirmed"
+        + (" (competitive — estimate)" if comp.get("basis") == "competitive" and compensation_confirmed(comp) else ""),
+        compensation_confirmed(comp),
+        "Confirm the candidate's expected compensation. If they asked for a "
+        "competitive package, mark it competitive and record an estimate "
+        "(market band, your own range, or an uplift on current pay).",
     )
     add(
         "notice_confirmed",

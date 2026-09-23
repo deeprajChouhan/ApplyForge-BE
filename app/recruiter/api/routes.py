@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 import secrets
 
+from app.recruiter.ids import PublicIdRoute
 from app.db.session import get_db
 from app.recruiter.api.deps import (
     RECRUITER_ACCESS,
@@ -108,6 +109,8 @@ from app.recruiter.schemas import (
     MarketConfigOut,
     ScreeningExtractRequest,
     ScreeningExtractResult,
+    ScreeningAutofillOut,
+    ScreeningAutofillRequest,
     ScreeningImproveRequest,
     ScreeningImproveResult,
     ConsentCreate,
@@ -160,7 +163,12 @@ from app.recruiter.enums import UsageKind
 from app.recruiter.services import usage as usage_service
 from app.recruiter.services import market_config as market_config_service
 from app.recruiter.services import visibility as visibility_service
-from app.recruiter.services.screening import improve_summary, extract_structured_notes
+from app.recruiter.services.screening import (
+    apply_autofill,
+    autofill_proposals,
+    extract_structured_notes,
+    improve_summary,
+)
 from app.recruiter.services.advisory import next_hire_advisory
 from app.recruiter.services.client_analytics import compute_client_analytics
 from app.recruiter.services.client_share_ai import build_summary as build_client_share_summary
@@ -171,7 +179,7 @@ from app.recruiter.services.market import compute_market
 from app.recruiter.services.market_crawler import crawl_agency_market, crawl_role_market
 from app.recruiter.services.matching import embed_role
 from app.recruiter.services.placement import rank_roles_for_candidate
-from app.recruiter.services.shortlist import generate_shortlist
+from app.recruiter.services.shortlist import generate_shortlist, refresh_role_fit_scores
 from app.recruiter.services.skills import normalize_skill
 from app.recruiter.services.candidate_chat import ask_about_candidate
 from app.recruiter.services.jd_parse import parse_jd
@@ -211,7 +219,7 @@ def _soft_recruiter(
 # /recruiter/auth/me. There is intentionally no unauthenticated agency listing.
 
 # ── Clients ──────────────────────────────────────────────────────────────
-clients_router = APIRouter(prefix="/agencies/{agency_id}/clients", tags=["recruiter: clients"])
+clients_router = APIRouter(route_class=PublicIdRoute, prefix="/agencies/{agency_id}/clients", tags=["recruiter: clients"])
 
 
 def _client_out(db: Session, client: Client) -> ClientOut:
@@ -448,7 +456,7 @@ def client_next_hire(
 
 
 # ── Roles ────────────────────────────────────────────────────────────────
-roles_router = APIRouter(prefix="/agencies/{agency_id}/roles", tags=["recruiter: roles"])
+roles_router = APIRouter(route_class=PublicIdRoute, prefix="/agencies/{agency_id}/roles", tags=["recruiter: roles"])
 
 
 def _normalize_skills(skills: list[str]) -> list[str]:
@@ -705,6 +713,7 @@ def draft_listing(
 
 # ── Candidates + ingestion ───────────────────────────────────────────────
 candidates_router = APIRouter(
+    route_class=PublicIdRoute,
     prefix="/agencies/{agency_id}/candidates", tags=["recruiter: candidates"]
 )
 
@@ -1019,6 +1028,7 @@ def candidate_role_matches(
 
 # ── Shortlist / matching ─────────────────────────────────────────────────
 shortlist_router = APIRouter(
+    route_class=PublicIdRoute,
     prefix="/agencies/{agency_id}/roles/{role_id}/shortlist", tags=["recruiter: shortlists"]
 )
 
@@ -1064,6 +1074,7 @@ def latest_shortlist(
 
 # ── Applications (tracking-only) ─────────────────────────────────────────
 applications_router = APIRouter(
+    route_class=PublicIdRoute,
     prefix="/agencies/{agency_id}/applications", tags=["recruiter: applications"]
 )
 
@@ -1200,6 +1211,7 @@ def delete_application_note(
 
 # ── Role pipeline (Kanban board per role) ────────────────────────────────
 pipeline_router = APIRouter(
+    route_class=PublicIdRoute,
     prefix="/agencies/{agency_id}/roles/{role_id}/pipeline", tags=["recruiter: pipeline"]
 )
 
@@ -1216,6 +1228,10 @@ def role_pipeline(
 ):
     """Kanban board: one column per stage, cards ordered by fit_score desc."""
     role = _load_role(db, agency, role_id)
+    # Fit scores on cards are a cache of the latest ranking — reconcile on read
+    # so the board always agrees with the ranked shortlist.
+    if refresh_role_fit_scores(db, role):
+        db.commit()
     apps = (
         db.query(Application)
         .filter(Application.agency_id == agency.id, Application.role_id == role.id)
@@ -1349,7 +1365,7 @@ def application_swot(
 
 
 # ── Public share (unauthenticated, token-guarded) ────────────────────────
-public_router = APIRouter(prefix="/public", tags=["recruiter: public"])
+public_router = APIRouter(route_class=PublicIdRoute, prefix="/public", tags=["recruiter: public"])
 
 
 def _client_display_name(full_name: str | None, cid: int) -> str:
@@ -1692,7 +1708,7 @@ def list_role_feedback(
 
 
 # ── Market analytics (self-contained over the agency's own data) ──────────
-market_router = APIRouter(prefix="/agencies/{agency_id}/market", tags=["recruiter: market"])
+market_router = APIRouter(route_class=PublicIdRoute, prefix="/agencies/{agency_id}/market", tags=["recruiter: market"])
 
 
 @market_router.get("", response_model=MarketOverviewOut)
@@ -1751,6 +1767,11 @@ def get_application_screening(
     db: Session = Depends(get_db),
 ):
     app_row = _load_application_or_404(db, agency, application_id)
+    role = db.get(Role, app_row.role_id) if app_row.role_id else None
+    if role is not None and role.agency_id == agency.id:
+        if refresh_role_fit_scores(db, role):
+            db.commit()
+            db.refresh(app_row)
     return app_row
 
 
@@ -1775,7 +1796,63 @@ def update_application_screening(
         )
 
     data = payload.model_dump(exclude_unset=True)
+    data.pop("reopen", None)
     prev_outcome = app_row.screening_outcome
+    actor_id = recruiter.id if recruiter else None
+    actor_name = (recruiter.full_name or recruiter.email) if recruiter else None
+
+    was_locked = app_row.screening_completed_at is not None
+    amended_fields: list[str] = []
+    if was_locked and payload.reopen:
+        app_row.screening_completed_at = None
+        app_row.screening_completed_by = None
+        was_locked = False
+        db.add(
+            ApplicationNote(
+                agency_id=agency.id,
+                application_id=app_row.id,
+                author_recruiter_id=actor_id,
+                author_name=actor_name,
+                kind="system",
+                body="Screening reopened for editing",
+            )
+        )
+    elif was_locked:
+        # Locked screening: only fill gaps. Anything that already holds a value
+        # needs an explicit reopen so the completed record isn't silently
+        # rewritten after the fact.
+        always_editable = {"assigned_recruiter_id", "client_visibility", "mark_completed"}
+        blocked: list[str] = []
+        for field in data:
+            if field in always_editable:
+                continue
+            if field == "availability_immediate":
+                current_set = app_row.availability_immediate or app_row.availability_date is not None
+            elif field == "availability_date":
+                current_set = app_row.availability_immediate or app_row.availability_date is not None
+            elif field == "expected_compensation":
+                current_set = submissions_service.compensation_confirmed(app_row.expected_compensation)
+            else:
+                cur = getattr(app_row, field, None)
+                current_set = cur not in (None, "", [], {})
+            if current_set:
+                # Idempotent re-sends of the same value are fine.
+                if field in ("expected_compensation", "current_compensation", "notice_period"):
+                    continue_ok = False
+                else:
+                    continue_ok = data[field] == getattr(app_row, field, None)
+                if not continue_ok:
+                    blocked.append(field)
+            elif data[field] not in (None, "", [], {}, False):
+                amended_fields.append(field)
+        if blocked:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Screening is locked. Reopen it to change: "
+                    + ", ".join(sorted(blocked))
+                ),
+            )
 
     if payload.expected_compensation is not None:
         app_row.expected_compensation = payload.expected_compensation.model_dump(exclude_none=True)
@@ -1821,9 +1898,50 @@ def update_application_screening(
         if field in data:
             setattr(app_row, field, data[field])
 
-    if payload.mark_completed:
+    # Smart fill: whenever the recruiter's narrative changes, lift any facts it
+    # states (salary, notice, LWD, work model, relocation…) into the empty
+    # structured fields. Never overwrites a value the recruiter entered.
+    auto_filled: list[str] = []
+    if any(data.get(k) for k in ("recruiter_summary", "internal_notes")):
+        role_for_fill = db.get(Role, app_row.role_id) if app_row.role_id else None
+        _, proposals = autofill_proposals(app_row, role_for_fill)
+        explicitly_sent = {k for k, v in data.items() if v not in (None, "", [], {})}
+        if payload.expected_compensation is not None and payload.expected_compensation.amount:
+            explicitly_sent.add("expected_compensation")
+        if payload.notice_period is not None:
+            explicitly_sent.add("notice_period")
+        auto_filled = apply_autofill(
+            app_row, [p for p in proposals if p["field"] not in explicitly_sent]
+        )
+
+    if payload.mark_completed and app_row.screening_completed_at is None:
         app_row.screening_completed_at = datetime.utcnow()
         app_row.screening_completed_by = recruiter.id if recruiter else None
+
+    if auto_filled:
+        db.add(
+            ApplicationNote(
+                agency_id=agency.id,
+                application_id=app_row.id,
+                author_recruiter_id=actor_id,
+                author_name=actor_name,
+                kind="system",
+                body="Auto-filled from summary: "
+                + ", ".join(f.replace("_", " ") for f in auto_filled),
+            )
+        )
+    if amended_fields:
+        db.add(
+            ApplicationNote(
+                agency_id=agency.id,
+                application_id=app_row.id,
+                author_recruiter_id=actor_id,
+                author_name=actor_name,
+                kind="system",
+                body="Locked screening amended — filled: "
+                + ", ".join(f.replace("_", " ") for f in amended_fields),
+            )
+        )
 
     app_row.last_activity_at = datetime.utcnow()
 
@@ -1900,8 +2018,69 @@ def ai_extract_notes(
     )
 
 
+@applications_router.post(
+    "/{application_id}/screening/autofill",
+    response_model=ScreeningAutofillOut,
+)
+def screening_autofill(
+    application_id: int,
+    payload: ScreeningAutofillRequest,
+    agency: Agency = Depends(require_unlocked_agency),
+    recruiter: Recruiter | None = Depends(_soft_recruiter),
+    db: Session = Depends(get_db),
+):
+    """
+    Read the saved summary / notes and propose structured screening values.
+    Works on locked screenings too: `fill` proposals only ever target empty
+    fields; `conflict` proposals are written only when listed in `overwrite`
+    (an explicit recruiter decision, logged to the activity trail).
+    """
+    app_row = _load_application_or_404(db, agency, application_id)
+    role = db.get(Role, app_row.role_id) if app_row.role_id else None
+    extracted, proposals = autofill_proposals(app_row, role)
+    written: list[str] = []
+    if payload.apply:
+        only = set(payload.fields) if payload.fields else None
+        overwrite = set(payload.overwrite or [])
+        before = {p["field"]: p["current"] for p in proposals}
+        written = apply_autofill(app_row, proposals, only=only, overwrite=overwrite)
+        if written:
+            app_row.last_activity_at = datetime.utcnow()
+            overwritten = [f for f in written if f in overwrite]
+            filled = [f for f in written if f not in overwrite]
+            lines = []
+            if filled:
+                lines.append("filled " + ", ".join(f.replace("_", " ") for f in filled))
+            if overwritten:
+                lines.append(
+                    "replaced "
+                    + ", ".join(f"{f.replace('_', ' ')} (was {before.get(f)!s})" for f in overwritten)
+                )
+            db.add(
+                ApplicationNote(
+                    agency_id=agency.id,
+                    application_id=app_row.id,
+                    author_recruiter_id=recruiter.id if recruiter else None,
+                    author_name=(recruiter.full_name or recruiter.email) if recruiter else None,
+                    kind="system",
+                    body="Auto-fill from summary — " + "; ".join(lines),
+                )
+            )
+            db.commit()
+            db.refresh(app_row)
+            _, proposals = autofill_proposals(app_row, role, use_llm=False)
+    return ScreeningAutofillOut(
+        proposals=proposals,
+        written=written,
+        last_working_day=extracted.get("last_working_day"),
+        early_release_date=extracted.get("early_release_date"),
+        early_release_confirmed=extracted.get("early_release_confirmed"),
+        application=ApplicationOut.model_validate(app_row),
+    )
+
+
 # ── Market configuration (static reference data) ────────────────────────
-market_config_router = APIRouter(prefix="/market-configs", tags=["recruiter: market-config"])
+market_config_router = APIRouter(route_class=PublicIdRoute, prefix="/market-configs", tags=["recruiter: market-config"])
 
 
 @market_config_router.get("", response_model=list[MarketConfigOut])
@@ -1928,6 +2107,7 @@ from app.recruiter.services import intelligence as intelligence_service
 
 
 consent_router = APIRouter(
+    route_class=PublicIdRoute,
     prefix="/agencies/{agency_id}/consents", tags=["recruiter: consent"]
 )
 
@@ -2017,6 +2197,7 @@ def update_consent(
 
 # ── Submission readiness + ClientSubmission CRUD ────────────────────
 submissions_router = APIRouter(
+    route_class=PublicIdRoute,
     prefix="/agencies/{agency_id}/submissions", tags=["recruiter: submissions"]
 )
 
@@ -2202,6 +2383,7 @@ def list_submission_feedback(
 
 
 sla_router = APIRouter(
+    route_class=PublicIdRoute,
     prefix="/agencies/{agency_id}/clients/{client_id}", tags=["recruiter: sla"]
 )
 
@@ -2253,6 +2435,7 @@ def client_sla_summary(
 
 
 comparison_router = APIRouter(
+    route_class=PublicIdRoute,
     prefix="/agencies/{agency_id}/candidate-comparison",
     tags=["recruiter: comparison"],
 )
@@ -2276,6 +2459,7 @@ def compare_candidates(
 # Recruiter OS — Phase 4 routes: Interviews
 # ═══════════════════════════════════════════════════════════════════════
 interviews_router = APIRouter(
+    route_class=PublicIdRoute,
     prefix="/agencies/{agency_id}/interviews", tags=["recruiter: interviews"]
 )
 
@@ -2444,6 +2628,7 @@ def interview_ai_brief(
 # Recruiter OS — Phase 5 routes: Offers + Placements
 # ═══════════════════════════════════════════════════════════════════════
 offers_router = APIRouter(
+    route_class=PublicIdRoute,
     prefix="/agencies/{agency_id}/offers", tags=["recruiter: offers"]
 )
 
@@ -2550,6 +2735,7 @@ def list_offer_negotiations(
 
 
 placements_router = APIRouter(
+    route_class=PublicIdRoute,
     prefix="/agencies/{agency_id}/placements", tags=["recruiter: placements"]
 )
 
@@ -2699,6 +2885,7 @@ def update_placement_checkin(
 # Recruiter OS — Phase 6 routes: Tasks + Notifications + Daily brief
 # ═══════════════════════════════════════════════════════════════════════
 tasks_router = APIRouter(
+    route_class=PublicIdRoute,
     prefix="/agencies/{agency_id}/tasks", tags=["recruiter: tasks"]
 )
 
@@ -2764,6 +2951,7 @@ def update_task(
 
 
 notifications_router = APIRouter(
+    route_class=PublicIdRoute,
     prefix="/agencies/{agency_id}/notifications", tags=["recruiter: notifications"]
 )
 
@@ -2798,6 +2986,7 @@ def mark_notifications(
 
 
 daily_brief_router = APIRouter(
+    route_class=PublicIdRoute,
     prefix="/agencies/{agency_id}/daily-brief", tags=["recruiter: daily brief"]
 )
 
@@ -2817,6 +3006,7 @@ def daily_brief(
 # Recruiter OS — Phase 7 routes: AI intelligence
 # ═══════════════════════════════════════════════════════════════════════
 intelligence_router = APIRouter(
+    route_class=PublicIdRoute,
     prefix="/agencies/{agency_id}/intelligence", tags=["recruiter: intelligence"]
 )
 

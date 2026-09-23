@@ -691,7 +691,8 @@ def test_convert_creates_consumer_user_once(client, setup):
         f"{BASE}/agencies/{agency_id}/candidates/{ada['id']}/convert", headers=rec_h, json={"consent": True}
     )
     assert conv.status_code == 201
-    user_id = conv.json()["provisioned_user_id"]
+    from app.recruiter.ids import decode_id
+    user_id = decode_id(conv.json()["provisioned_user_id"])
 
     from app.models.models import Skill, User as U, UserProfile
     db = TestingSessionLocal()

@@ -12,6 +12,10 @@ class Settings(BaseSettings):
     access_token_exp_minutes: int = 30
     refresh_token_exp_days: int = 14
     jwt_algorithm: str = "HS256"
+    # Key for the recruiter API's opaque public ids (DB ints are never exposed
+    # in URLs/payloads). Falls back to a key derived from SECRET_KEY. Treat as
+    # permanent: changing it changes every recruiter URL (old links 404).
+    recruiter_id_key: SecretStr | None = None
 
     admin_email: str = "deeprajchouhan012@gmail.com"
     admin_password: str | None = None

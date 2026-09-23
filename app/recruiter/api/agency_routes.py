@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from app.recruiter.ids import PublicIdRoute
 from app.core.security import hash_password
 from app.db.session import get_db
 from app.recruiter.api.admin_routes import _recruiter_out, effective_seat_limit
@@ -40,7 +41,7 @@ from app.recruiter.services import billing as billing_service
 from app.recruiter.services import onboarding as onboarding_service
 from app.recruiter.services import usage as usage_service
 
-router = APIRouter(prefix="/agency", tags=["recruiter: agency-admin"])
+router = APIRouter(route_class=PublicIdRoute, prefix="/agency", tags=["recruiter: agency-admin"])
 
 
 def _agency(db: Session, owner: Recruiter) -> Agency:

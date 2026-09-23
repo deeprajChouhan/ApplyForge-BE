@@ -14,12 +14,19 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
+from app.recruiter.ids import encode_id as E
+
 from app.main import app
 from app.db.session import SessionLocal
 from app.recruiter.models import Agency, Application, CandidateProfile, Recruiter, Role
 from app.recruiter.enums import ApplicationStage, RecruiterSeatRole
 from app.recruiter.services.visibility import to_client_view
-from app.core.security import hash_password, create_recruiter_access_token
+from app.core.security import hash_password
+from app.recruiter.api.auth_routes import issue_recruiter_tokens
+
+
+def create_recruiter_access_token(recruiter_id: int) -> str:
+    return issue_recruiter_tokens(recruiter_id)[0]
 
 
 client = TestClient(app)
@@ -65,7 +72,7 @@ def test_screening_patch_and_completion():
         _, _, app_row = _mk_role_and_cand_app(db, agency)
 
         r = client.patch(
-            f"/api/v1/recruiter/agencies/{agency.id}/applications/{app_row.id}/screening",
+            f"/api/v1/recruiter/agencies/{E(agency.id)}/applications/{E(app_row.id)}/screening",
             headers=_auth(rec),
             json={
                 "screening_outcome": "suitable",
@@ -85,7 +92,7 @@ def test_screening_patch_and_completion():
         assert body["notice_period"]["unit"] == "MONTH"
         assert body["preferred_work_model"] == "hybrid"
         assert body["screening_completed_at"] is not None
-        assert body["screening_completed_by"] == rec.id
+        assert body["screening_completed_by"] == E(rec.id)
     finally:
         db.close()
 
@@ -100,7 +107,7 @@ def test_agency_isolation_screening():
 
         # r1 (agency A) cannot patch B's screening
         r = client.patch(
-            f"/api/v1/recruiter/agencies/{a2.id}/applications/{app_b.id}/screening",
+            f"/api/v1/recruiter/agencies/{E(a2.id)}/applications/{E(app_b.id)}/screening",
             headers=_auth(r1),
             json={"recruiter_summary": "hax"},
         )
@@ -127,7 +134,7 @@ def test_client_view_hides_internal_notes():
 
         # Also via the HTTP endpoint
         r = client.get(
-            f"/api/v1/recruiter/agencies/{agency.id}/applications/{app_row.id}/client-view",
+            f"/api/v1/recruiter/agencies/{E(agency.id)}/applications/{E(app_row.id)}/client-view",
             headers=_auth(rec),
         )
         assert r.status_code == 200
@@ -166,7 +173,7 @@ def test_screening_requires_role():
         )
         db.add(app_row); db.commit(); db.refresh(app_row)
         r = client.patch(
-            f"/api/v1/recruiter/agencies/{agency.id}/applications/{app_row.id}/screening",
+            f"/api/v1/recruiter/agencies/{E(agency.id)}/applications/{E(app_row.id)}/screening",
             headers=_auth(rec),
             json={"recruiter_summary": "x"},
         )

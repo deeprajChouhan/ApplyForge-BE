@@ -233,6 +233,8 @@ _EXTRACT_SCHEMA = (
     '    "current_compensation":  {"amount": int, "currency": string, "period": "YEAR"|"MONTH"|"DAY"|"HOUR"} | null,\n'
     '    "notice_period":         {"value": int, "unit": "DAY"|"WEEK"|"MONTH", "negotiable": bool} | null,\n'
     '    "availability_immediate": bool | null,\n'
+    '    "availability_date":      "YYYY-MM-DD" | null,\n'
+    '    "relocation":             "yes"|"no"|"conditional" | null,\n'
     '    "preferred_work_model":   "remote"|"hybrid"|"onsite"|"flexible" | null,\n'
     '    "preferred_location":     string | null,\n'
     '    "candidate_motivation":   string | null,\n'
@@ -240,6 +242,9 @@ _EXTRACT_SCHEMA = (
     '  }\n'
     "Use ISO currency codes (GBP, INR, AED, USD, EUR, CAD, AUD, SGD).\n"
     "For INR salaries expressed as LPA, convert to annual INR (multiply by 100000).\n"
+    "If the candidate asks for a 'competitive' package without naming a number, "
+    "return expected_compensation as {\"basis\": \"competitive\", \"currency\": ..., "
+    "\"period\": ...} with NO amount — never estimate one.\n"
 )
 
 
@@ -255,6 +260,8 @@ def extract_structured_notes(rough_notes: str, country_code: str | None = None) 
         "current_compensation": None,
         "notice_period": None,
         "availability_immediate": None,
+        "availability_date": None,
+        "relocation": None,
         "preferred_work_model": None,
         "preferred_location": None,
         "candidate_motivation": None,
@@ -277,3 +284,151 @@ def extract_structured_notes(rough_notes: str, country_code: str | None = None) 
     result["used_llm"] = True
     result["generated_at"] = datetime.now(timezone.utc).isoformat()
     return result
+
+
+# ── Summary → structured fields auto-fill ───────────────────────────────
+
+AUTOFILL_FIELDS = (
+    "expected_compensation",
+    "current_compensation",
+    "notice_period",
+    "availability_date",
+    "availability_immediate",
+    "preferred_work_model",
+    "preferred_location",
+    "relocation",
+    "candidate_motivation",
+    "motivation_categories",
+)
+
+_VALID_WORK_MODELS = {"remote", "hybrid", "onsite", "flexible"}
+_VALID_RELOCATION = {"yes", "no", "conditional"}
+
+
+def field_is_empty(app_row: Application, field: str) -> bool:
+    """True when the screening field holds no recruiter-confirmed value."""
+    from app.recruiter.services.submissions import compensation_confirmed
+
+    if field in ("availability_date", "availability_immediate"):
+        return not (app_row.availability_immediate or app_row.availability_date)
+    if field == "expected_compensation":
+        comp = app_row.expected_compensation or {}
+        # A competitive ask with no estimate still counts as "has something"
+        # only if the basis is recorded; an estimate can be added on top.
+        return not compensation_confirmed(comp) and comp.get("basis") != "competitive"
+    if field == "current_compensation":
+        return not (app_row.current_compensation or {}).get("amount")
+    val = getattr(app_row, field, None)
+    return val in (None, "", [], {})
+
+
+def _merge_extractions(heur: dict[str, Any], llm: dict[str, Any]) -> dict[str, Any]:
+    """Heuristic values (lifted verbatim from the text) win; LLM fills gaps."""
+    out = dict(heur)
+    for k in AUTOFILL_FIELDS:
+        if k in out:
+            continue
+        v = llm.get(k)
+        if v in (None, "", [], {}):
+            continue
+        if k == "preferred_work_model" and v not in _VALID_WORK_MODELS:
+            continue
+        if k == "relocation" and v not in _VALID_RELOCATION:
+            continue
+        if k in ("expected_compensation", "current_compensation"):
+            if not isinstance(v, dict) or not v.get("amount"):
+                continue
+            v = {**v, "basis": v.get("basis") or "fixed"} if k == "expected_compensation" else v
+        if k == "notice_period":
+            if not isinstance(v, dict) or v.get("value") is None or v.get("unit") not in ("DAY", "WEEK", "MONTH"):
+                continue
+        out[k] = v
+    return out
+
+
+def extract_fields_from_text(
+    text: str,
+    country_code: str | None = None,
+    ref=None,
+    use_llm: bool = True,
+) -> dict[str, Any]:
+    from app.recruiter.services.screening_extract import heuristic_extract
+
+    heur = heuristic_extract(text, country_code=country_code, ref=ref)
+    llm: dict[str, Any] = {}
+    if use_llm and ai_support.llm_enabled():
+        try:
+            llm = extract_structured_notes(text, country_code=country_code) or {}
+        except Exception:  # extraction must never break a save
+            llm = {}
+    return _merge_extractions(heur, llm)
+
+
+def autofill_proposals(
+    app_row: Application, role: Role | None, use_llm: bool = True
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """
+    Reads the recruiter's own text (client summary + internal notes +
+    motivation) and returns (extracted, proposals). Each proposal is
+    {field, value, current, action} where action is:
+      "fill"     — field is empty, safe to write
+      "conflict" — field already holds a different value (never auto-written)
+      "same"     — already matches
+    """
+    parts = [app_row.recruiter_summary or "", app_row.internal_notes or "", app_row.candidate_motivation or ""]
+    text = "\n".join(p for p in parts if p.strip())
+    ref = (app_row.screening_completed_at or datetime.utcnow()).date()
+    extracted = extract_fields_from_text(
+        text, country_code=(role.country_code if role else None), ref=ref, use_llm=use_llm
+    )
+    proposals: list[dict[str, Any]] = []
+    for field in AUTOFILL_FIELDS:
+        if field not in extracted:
+            continue
+        value = extracted[field]
+        current = getattr(app_row, field, None)
+        if field_is_empty(app_row, field):
+            action = "fill"
+        elif field == "expected_compensation" and (current or {}).get("basis") == "competitive" \
+                and not any((current or {}).get(k) for k in ("amount", "target", "minimum", "maximum")) \
+                and any(value.get(k) for k in ("amount", "target", "minimum", "maximum")):
+            action = "fill"  # adds an estimate to a bare "competitive" ask
+        else:
+            cur_cmp = current.isoformat() if hasattr(current, "isoformat") else current
+            action = "same" if cur_cmp == value else "conflict"
+        proposals.append({"field": field, "value": value, "current": current, "action": action})
+    # Informational extras for the UI (not written to columns directly).
+    return extracted, proposals
+
+
+def apply_autofill(
+    app_row: Application, proposals: list[dict[str, Any]], only: set[str] | None = None,
+    overwrite: set[str] | None = None,
+) -> list[str]:
+    """Write `fill` proposals (and explicitly-approved overwrites). Returns fields written."""
+    from datetime import date as _date
+
+    written: list[str] = []
+    overwrite = overwrite or set()
+    for p in proposals:
+        f = p["field"]
+        if only is not None and f not in only:
+            continue
+        if p["action"] == "same":
+            continue
+        if p["action"] == "conflict" and f not in overwrite:
+            continue
+        v = p["value"]
+        if f == "availability_date":
+            try:
+                v = _date.fromisoformat(v) if isinstance(v, str) else v
+            except ValueError:
+                continue
+            app_row.availability_immediate = False
+        if f == "availability_immediate" and v:
+            app_row.availability_date = None
+        if f == "expected_compensation" and isinstance(app_row.expected_compensation, dict):
+            v = {**app_row.expected_compensation, **v}
+        setattr(app_row, f, v)
+        written.append(f)
+    return written

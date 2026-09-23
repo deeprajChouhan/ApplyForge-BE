@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 
+from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 from app.recruiter.enums import (
@@ -731,6 +732,14 @@ class CompensationBlock(BaseModel):
     rate: int | None = None
     rate_period: str | None = None
     contract_classification: str | None = None
+    # "fixed" (default) = candidate named a number. "competitive" = candidate
+    # asked for a competitive package without a figure; the recruiter then
+    # records an estimate (minimum/maximum/target) from market data or, when
+    # no market data exists, their own judgement / an uplift on current comp.
+    basis: Literal["fixed", "competitive"] | None = None
+    uplift_pct: float | None = None  # e.g. 20 = "expects ~20% over current"
+    estimate_source: Literal["market", "recruiter", "uplift"] | None = None
+    note: str | None = Field(default=None, max_length=500)
 
 
 class NoticePeriodBlock(BaseModel):
@@ -758,6 +767,10 @@ class ApplicationScreeningUpdate(BaseModel):
     assigned_recruiter_id: int | None = None
     client_visibility: dict | None = None
     mark_completed: bool = False
+    # Unlock a completed screening so every field is editable again. Logged
+    # to the activity trail. Without it, a locked screening only accepts
+    # values for fields that are still empty (filling readiness gaps).
+    reopen: bool = False
 
 
 class ScreeningImproveRequest(BaseModel):
@@ -784,8 +797,35 @@ class ScreeningExtractResult(BaseModel):
     preferred_location: str | None = None
     candidate_motivation: str | None = None
     motivation_categories: list[str] | None = None
+    availability_date: str | None = None
+    relocation: str | None = None
     used_llm: bool
     generated_at: datetime
+
+
+class ScreeningAutofillRequest(BaseModel):
+    # False = preview only. True = write every "fill" proposal (optionally
+    # restricted to `fields`) plus any field listed in `overwrite`.
+    apply: bool = False
+    fields: list[str] | None = None
+    overwrite: list[str] = Field(default_factory=list)
+
+
+class ScreeningAutofillProposal(BaseModel):
+    field: str
+    value: Any = None
+    current: Any = None
+    action: Literal["fill", "conflict", "same"]
+
+
+class ScreeningAutofillOut(BaseModel):
+    proposals: list[ScreeningAutofillProposal]
+    written: list[str] = Field(default_factory=list)
+    # Dates lifted from the text that don't map to a column 1:1 (shown as hints).
+    last_working_day: str | None = None
+    early_release_date: str | None = None
+    early_release_confirmed: bool | None = None
+    application: ApplicationOut
 
 
 class ClientVisibleApplicationOut(BaseModel):
