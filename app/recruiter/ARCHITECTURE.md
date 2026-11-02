@@ -416,3 +416,24 @@ New id-bearing fields must follow the naming rule, or be added to `EXTRA_ID_KEYS
 `Application.fit_score` is a cache of the latest ranking. `generate_shortlist`
 rewrites it for every application on the role, and the pipeline/screening reads
 reconcile it with the latest shortlist (`refresh_role_fit_scores`).
+
+## Role market research (`services/market_crawler.py`)
+
+1. **Research profile**: title segments minus generic words ("engineer", "senior"…)
+   become domain terms and board queries ("embedded linux engineer", "firmware
+   engineer"…). The role's required/preferred skills drive relevance. When an LLM
+   is configured it adds queries, domain terms and exclusion terms.
+2. **Sources**: Adzuna (local market, local currency; needs `ADZUNA_APP_ID/KEY`),
+   RemoteOK (global remote, USD) and Arbeitnow (EU, EUR). Board keyword matching
+   is loose, so recall is high.
+3. **Precision**: a posting is kept only if its title carries a domain term and
+   its body names part of the required stack (min 2 skills), or its body matches
+   most of the required stack. Ambiguous short skills (CAN, Go, C, OTA…) only
+   match their acronym form.
+4. **Salary**: bands come from local postings in local currency when there are
+   ≥3. Otherwise they come from global postings converted at indicative FX and
+   labelled "not the local market". With <3 paid postings there is no band.
+   Nothing is ever relabelled into another currency without conversion.
+5. **Output** (cached on `role.market_snapshot`): `skill_demand` (% of comparable
+   postings per role skill), `emerging_skills`, `salary_basis`/`salary_note`,
+   `queries`, `scanned` vs `sample_size`.

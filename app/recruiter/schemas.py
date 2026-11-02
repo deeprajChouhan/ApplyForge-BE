@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import date, datetime
 
 from typing import Any, Literal
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_serializer
 
 from app.recruiter.enums import (
     AgencyPlan,
@@ -19,6 +19,16 @@ from app.recruiter.enums import (
 
 class ORMModel(BaseModel):
     model_config = ConfigDict(from_attributes=True)
+
+    # All recruiter timestamps are stored as naive UTC (datetime.utcnow()).
+    # Serialise them with an explicit "Z" so every browser converts to the
+    # viewer's own clock — without it, JS parses "2026-11-05T14:00:00" as
+    # local time and everyone sees the server's wall-clock time.
+    @field_serializer("*", mode="wrap", when_used="json")
+    def _utc_datetimes(self, value, handler):
+        if isinstance(value, datetime) and value.tzinfo is None:
+            return value.isoformat() + "Z"
+        return handler(value)
 
 
 # ── Agency ────────────────────────────────────────────────────────────────
@@ -381,6 +391,35 @@ class ParseJDRequest(BaseModel):
     text: str = Field(min_length=10, max_length=20_000)
 
 
+class KeywordDensifyRequest(BaseModel):
+    title: str = Field(min_length=2, max_length=200)
+    seniority: str | None = Field(default=None, max_length=80)
+    description: str | None = Field(default=None, max_length=20_000)
+    required_skills: list[str] = Field(default_factory=list, max_length=60)
+    preferred_skills: list[str] = Field(default_factory=list, max_length=60)
+
+
+class KeywordSuggestion(BaseModel):
+    skill: str
+    kind: Literal["required", "preferred"] = "preferred"
+    category: str = "adjacent"
+    sources: list[str] = Field(default_factory=list)   # pool | jd | ai
+    reason: str
+    confidence: float
+    pool_count: int = 0
+    aliases: list[str] = Field(default_factory=list)
+
+
+class KeywordDensifyResult(BaseModel):
+    suggestions: list[KeywordSuggestion]
+    synonyms: dict[str, list[str]] = Field(default_factory=dict)
+    boolean_search: str | None = None
+    keyword_count: int
+    is_thin: bool
+    advice: str | None = None
+    used_llm: bool = False
+
+
 class ParseJDResult(BaseModel):
     title: str | None = None
     seniority: str | None = None
@@ -682,6 +721,8 @@ class ApplicationCreate(BaseModel):
 
 class ApplicationStageUpdate(BaseModel):
     stage: ApplicationStage
+    # Optional context logged on the activity trail (e.g. rejection reason).
+    reason: str | None = Field(default=None, max_length=500)
 
 
 class ApplicationOut(ORMModel):
@@ -1282,6 +1323,9 @@ class InterviewCreate(BaseModel):
     interviewers: list[dict] | None = None
     proposed_times: list[datetime] | None = None
     confirmed_time: datetime | None = None
+    # IANA zone the scheduler picked the time in (e.g. "Europe/London").
+    # Display-only context; confirmed_time itself is always UTC.
+    timezone: str | None = Field(default=None, max_length=64)
     duration_minutes: int | None = None
     location: str | None = None
     meeting_url: str | None = None
@@ -1294,6 +1338,7 @@ class InterviewUpdate(BaseModel):
     interviewers: list[dict] | None = None
     proposed_times: list[datetime] | None = None
     confirmed_time: datetime | None = None
+    timezone: str | None = Field(default=None, max_length=64)
     duration_minutes: int | None = None
     location: str | None = None
     meeting_url: str | None = None
@@ -1313,6 +1358,7 @@ class InterviewOut(ORMModel):
     interviewers: list[dict] | None = None
     proposed_times: list[str] | None = None
     confirmed_time: datetime | None = None
+    timezone: str | None = None
     duration_minutes: int | None = None
     location: str | None = None
     meeting_url: str | None = None
@@ -1324,6 +1370,7 @@ class InterviewOut(ORMModel):
 
 class InterviewFeedbackCreate(BaseModel):
     interviewer_name: str | None = None
+    interviewer_email: str | None = Field(default=None, max_length=255)
     technical: int | None = None
     communication: int | None = None
     role_understanding: int | None = None
@@ -1338,6 +1385,7 @@ class InterviewFeedbackOut(ORMModel):
     id: int
     interview_id: int
     interviewer_name: str | None
+    interviewer_email: str | None = None
     technical: int | None
     communication: int | None
     role_understanding: int | None
@@ -1347,6 +1395,7 @@ class InterviewFeedbackOut(ORMModel):
     decision: str | None
     comment: str | None
     created_at: datetime | None = None
+    updated_at: datetime | None = None
 
 
 class InterviewBriefOut(BaseModel):

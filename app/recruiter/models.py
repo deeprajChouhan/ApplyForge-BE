@@ -25,6 +25,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -457,6 +458,12 @@ class Application(Base, RecTimestampMixin):
 
     candidate: Mapped["CandidateProfile"] = relationship()
 
+    # One pipeline record per candidate per role — stops double-click / race
+    # duplicates showing the same name twice on the board and shortlist.
+    __table_args__ = (
+        UniqueConstraint("role_id", "candidate_id", name="uq_rec_app_role_candidate"),
+    )
+
 
 class ApplicationNote(Base):
     """
@@ -737,7 +744,9 @@ class Interview(Base, RecTimestampMixin):
     interview_type: Mapped[InterviewType | None] = mapped_column(SAEnum(InterviewType))
     interviewers: Mapped[list[dict] | None] = mapped_column(JSON)   # [{name, email, role}]
     proposed_times: Mapped[list[str] | None] = mapped_column(JSON)  # iso strings
-    confirmed_time: Mapped[datetime | None] = mapped_column(DateTime)
+    confirmed_time: Mapped[datetime | None] = mapped_column(DateTime)  # naive UTC
+    # IANA zone the time was scheduled in (display context only).
+    timezone: Mapped[str | None] = mapped_column(String(64))
     duration_minutes: Mapped[int | None] = mapped_column(Integer)
     location: Mapped[str | None] = mapped_column(String(300))
     meeting_url: Mapped[str | None] = mapped_column(String(500))
@@ -757,6 +766,9 @@ class InterviewFeedback(Base, RecTimestampMixin):
         ForeignKey("rec_interviews.id", ondelete="CASCADE"), index=True
     )
     interviewer_name: Mapped[str | None] = mapped_column(String(200))
+    # One feedback row per interviewer per interview (upserted on name/email),
+    # so a panel's individual verdicts are kept side by side.
+    interviewer_email: Mapped[str | None] = mapped_column(String(255))
     technical: Mapped[int | None] = mapped_column(Integer)          # 1-5
     communication: Mapped[int | None] = mapped_column(Integer)
     role_understanding: Mapped[int | None] = mapped_column(Integer)

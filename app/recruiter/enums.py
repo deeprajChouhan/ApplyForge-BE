@@ -105,9 +105,10 @@ class CandidateSource(str, enum.Enum):
 
 class ApplicationStage(str, enum.Enum):
     """Tracking-only pipeline stages (Domain 2). Never a live submission."""
+    # Declaration order == pipeline order (board columns iterate this enum).
     sourced = "sourced"
-    submitted = "submitted"
     screening = "screening"
+    submitted = "submitted"
     interview = "interview"
     offer = "offer"
     placed = "placed"
@@ -116,8 +117,8 @@ class ApplicationStage(str, enum.Enum):
 
 ACTIVE_STAGES = {
     ApplicationStage.sourced,
-    ApplicationStage.submitted,
     ApplicationStage.screening,
+    ApplicationStage.submitted,
     ApplicationStage.interview,
     ApplicationStage.offer,
 }

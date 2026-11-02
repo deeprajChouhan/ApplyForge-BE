@@ -603,3 +603,62 @@ a second call.
 - `401` Unauthorized (missing/invalid token, invalid refresh token)
 - `404` Not Found (resource not found or not owned by current user)
 - `422` Validation error (Pydantic/FastAPI request validation)
+
+## RECRUITER — pipeline unification & user-testing fixes (2026-11-02)
+
+Base: `/api/v1/recruiter`. This contract did not previously cover the recruiter
+module; this section documents only what changed in this release.
+
+### Timestamps
+All recruiter `*Out` models now serialise naive-UTC datetimes with a trailing
+`Z` (e.g. `"2026-11-05T10:00:00Z"`). Clients must render with the viewer's clock.
+
+### Stage automation (single source of truth: `Application.stage`)
+Pipeline order: `sourced → screening → submitted → interview → offer → placed`, `rejected` terminal.
+Auto-advances are forward-only and logged as `system` activity notes:
+
+| Action | New stage |
+|---|---|
+| `PATCH /agencies/{a}/applications/{id}/screening` with `mark_completed: true` | `screening` |
+| `POST /agencies/{a}/submissions` with `mark_submitted: true`, or `PATCH …/submissions/{id}` → `status: submitted` | `submitted` |
+| `POST /agencies/{a}/interviews` | `interview` |
+| `POST /agencies/{a}/offers` | `offer` |
+| `POST /agencies/{a}/placements` (`application_id` optional; else matched on role+candidate) | `placed` |
+| Client decision `reject` (submission feedback, public share link, or submission `status: rejected`) while at `submitted` | `rejected` |
+
+`PATCH /agencies/{a}/applications/{id}/stage` — body `{ "stage": ApplicationStage, "reason"?: string ≤500 }`. Manual moves may go any direction; `reason` is logged.
+
+### Duplicates
+`(role_id, candidate_id)` is unique on `rec_applications` (migration `0034`).
+`POST …/roles/{r}/pipeline/assign` de-dupes repeated ids; a lost race returns **409**.
+`POST /agencies/{a}/applications` with a `role_id` already in the pipeline returns **409**.
+
+### Interviews
+`InterviewCreate` / `InterviewUpdate` / `InterviewOut` gain `timezone?: string` (IANA, display context).
+`confirmed_time` accepts tz-aware ISO input and is stored as UTC; `proposed_times` are returned as `…Z` strings.
+`interviewers[]` items may carry `timezone`.
+
+`POST /agencies/{a}/interviews/{id}/feedback` — one row **per interviewer**: upserts on
+`interviewer_email` (case-insensitive), else on `interviewer_name`. New field `interviewer_email`.
+Scores must be 1–5. If neither name nor email is sent, the logged-in recruiter is recorded.
+`InterviewFeedbackOut` gains `interviewer_email`, `updated_at`.
+
+### Keyword densification
+`POST /agencies/{a}/roles/keywords/densify`
+```json
+{ "title": "Data Engineer", "seniority": null, "description": "…",
+  "required_skills": ["python", "sql"], "preferred_skills": [] }
+```
+→ `200`
+```json
+{ "suggestions": [{ "skill": "aws", "kind": "required", "category": "domain",
+    "sources": ["jd", "pool"], "reason": "Mentioned in the role title/description",
+    "confidence": 0.95, "pool_count": 12, "aliases": ["amazon web services"] }],
+  "synonyms": { "python": [] }, "boolean_search": "python AND sql AND (…)",
+  "keyword_count": 2, "is_thin": true, "advice": "…", "used_llm": true }
+```
+Sources: `jd` (found in title/description), `pool` (co-occurs in this agency's candidate pool), `ai` (LLM, grounded on the inputs; deterministic adjacency fallback when no LLM). Suggestions only — nothing is written to the role.
+
+### Fit score v2 (`ShortlistEntry.score_breakdown`)
+Keys: `semantic` (30), `required_skills` (35), `preferred_skills` (10), `experience` (15), `title` (10).
+Re-generate shortlists to refresh scores computed by v1.

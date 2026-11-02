@@ -6,6 +6,7 @@ from dataclasses import asdict
 from datetime import date, datetime
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 import secrets
@@ -50,6 +51,8 @@ from app.recruiter.models import (
     SubmissionFeedback,
 )
 from app.recruiter.schemas import (
+    KeywordDensifyRequest,
+    KeywordDensifyResult,
     ApplicationCreate,
     ApplicationOut,
     ApplicationStageUpdate,
@@ -192,6 +195,7 @@ from app.recruiter.services.spec_sheet import (
     resolve_branding,
 )
 from app.recruiter.services.swot import compute_swot
+from app.recruiter.services import pipeline as pipeline_service
 
 from jose import JWTError, jwt
 from app.core.config import settings
@@ -568,6 +572,28 @@ def parse_jd_to_role(
     pre-fill. Fail-soft: returns an empty draft if the LLM isn't configured.
     """
     return ParseJDResult(**parse_jd(payload.text))
+
+
+@roles_router.post("/keywords/densify", response_model=KeywordDensifyResult)
+def densify_role_keywords(
+    payload: KeywordDensifyRequest,
+    agency: Agency = Depends(require_unlocked_agency),
+    db: Session = Depends(get_db),
+):
+    """
+    Expand a thin keyword list (typically 3–4 skills) into a richer, labelled
+    set of suggestions from the JD text, the agency's own pool co-occurrence,
+    and a grounded LLM pass. Suggestions only — the recruiter accepts each one.
+    """
+    from app.recruiter.services.keyword_densify import densify_keywords
+
+    return KeywordDensifyResult(**densify_keywords(
+        db, agency.id,
+        title=payload.title, seniority=payload.seniority,
+        description=payload.description,
+        required_skills=payload.required_skills,
+        preferred_skills=payload.preferred_skills,
+    ))
 
 
 @roles_router.get("/{role_id}/share", response_model=RoleShareTokenOut | None)
@@ -1088,6 +1114,10 @@ def create_application(
     cand = db.get(CandidateProfile, payload.candidate_id)
     if cand is None or cand.agency_id != agency.id:
         raise HTTPException(status_code=404, detail="Candidate not found")
+    if payload.role_id is not None and pipeline_service.find_application(
+        db, agency.id, payload.role_id, payload.candidate_id
+    ):
+        raise HTTPException(status_code=409, detail="Candidate is already in this role's pipeline")
 
     app_row = Application(
         agency_id=agency.id,
@@ -1125,22 +1155,12 @@ def update_stage(
     app_row = db.get(Application, application_id)
     if app_row is None or app_row.agency_id != agency.id:
         raise HTTPException(status_code=404, detail="Application not found")
-    prev_stage = app_row.stage
-    app_row.stage = payload.stage
-    app_row.last_activity_at = datetime.utcnow()
-    # Auto-log the transition so the activity tab always tells the story of the
-    # candidate's journey, even for stage moves the recruiter forgets to note.
-    if prev_stage != payload.stage:
-        db.add(
-            ApplicationNote(
-                agency_id=agency.id,
-                application_id=app_row.id,
-                author_recruiter_id=recruiter.id if recruiter else None,
-                author_name=(recruiter.full_name or recruiter.email) if recruiter else None,
-                kind="system",
-                body=f"Stage moved {prev_stage.value} → {payload.stage.value}",
-            )
-        )
+    # Single source of truth: the pipeline service logs the transition so the
+    # activity tab always tells the story of the candidate's journey.
+    pipeline_service.set_stage(
+        db, app_row, payload.stage, recruiter=recruiter,
+        reason=(payload.reason or None) if hasattr(payload, "reason") else None,
+    )
     db.commit()
     db.refresh(app_row)
     return app_row
@@ -1291,10 +1311,14 @@ def assign_candidates_to_role(
 
     added_rows: list[Application] = []
     skipped: list[int] = []
-    for cand_id in payload.candidate_ids:
+    # dict.fromkeys de-dupes repeated ids in one payload while keeping order;
+    # adding each new id to existing_cand_ids stops a second row being created
+    # for the same candidate in the same request.
+    for cand_id in dict.fromkeys(payload.candidate_ids):
         if cand_id in existing_cand_ids:
             skipped.append(cand_id)
             continue
+        existing_cand_ids.add(cand_id)
         cand = db.get(CandidateProfile, cand_id)
         if cand is None or cand.agency_id != agency.id:
             skipped.append(cand_id)
@@ -1312,7 +1336,15 @@ def assign_candidates_to_role(
         db.add(app_row)
         added_rows.append(app_row)
 
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # Lost a race with a concurrent assign (double-click) — the unique
+        # (role_id, candidate_id) index rejected the duplicate. Retry is safe.
+        db.rollback()
+        raise HTTPException(
+            status_code=409, detail="Candidate is already in this role's pipeline"
+        )
     for a in added_rows:
         db.refresh(a)
     return AssignCandidatesResult(
@@ -1920,6 +1952,10 @@ def update_application_screening(
     if payload.mark_completed and app_row.screening_completed_at is None:
         app_row.screening_completed_at = datetime.utcnow()
         app_row.screening_completed_by = recruiter.id if recruiter else None
+        pipeline_service.advance_stage(
+            db, app_row, ApplicationStage.screening, recruiter=recruiter,
+            reason="screening completed",
+        )
 
     if auto_filled:
         db.add(
@@ -2245,6 +2281,10 @@ def create_submission(
         sub.status = SubmissionStatus.submitted
         sub.submitted_at = datetime.utcnow()
         sub.submitted_by = recruiter.id if recruiter else None
+        pipeline_service.advance_stage(
+            db, app_row, ApplicationStage.submitted, recruiter=recruiter,
+            reason="submitted to client",
+        )
     db.add(sub); db.commit(); db.refresh(sub)
     return sub
 
@@ -2300,6 +2340,16 @@ def update_submission(
         if new_status == SubmissionStatus.submitted and sub.status != SubmissionStatus.submitted:
             sub.submitted_at = datetime.utcnow()
             sub.submitted_by = recruiter.id if recruiter else None
+            pipeline_service.advance_stage(
+                db, db.get(Application, sub.application_id), ApplicationStage.submitted,
+                recruiter=recruiter, reason="submitted to client",
+            )
+        if new_status == SubmissionStatus.rejected and sub.status != SubmissionStatus.rejected:
+            pipeline_service.reject_if_at(
+                db, db.get(Application, sub.application_id),
+                {ApplicationStage.submitted}, recruiter=recruiter,
+                reason="client rejected submission",
+            )
         sub.status = new_status
     if payload.client_decision:
         try:
@@ -2363,6 +2413,11 @@ def create_submission_feedback(
     sub.client_decision = decision
     if sub.client_responded_at is None:
         sub.client_responded_at = datetime.utcnow()
+    if decision == ClientDecision.reject:
+        pipeline_service.reject_if_at(
+            db, db.get(Application, sub.application_id), {ApplicationStage.submitted},
+            reason="client rejected submission",
+        )
     db.commit(); db.refresh(fb)
     return fb
 
@@ -2467,6 +2522,21 @@ interviews_router = APIRouter(
 )
 
 
+def _to_utc_naive(dt: datetime | None) -> datetime | None:
+    """Store every interview time as naive UTC. A tz-aware value from the
+    browser ("…+04:00") is converted; a naive value is assumed already UTC."""
+    if dt is None:
+        return None
+    if dt.tzinfo is not None:
+        from datetime import timezone as _tz
+        dt = dt.astimezone(_tz.utc).replace(tzinfo=None)
+    return dt
+
+
+def _utc_iso(dt: datetime) -> str:
+    return _to_utc_naive(dt).isoformat() + "Z"
+
+
 def _load_interview_or_404(db, agency, iid: int) -> Interview:
     iv = db.get(Interview, iid)
     if iv is None or iv.agency_id != agency.id:
@@ -2478,6 +2548,7 @@ def _load_interview_or_404(db, agency, iid: int) -> Interview:
 def create_interview(
     payload: InterviewCreate,
     agency: Agency = Depends(require_unlocked_agency),
+    recruiter: Recruiter | None = Depends(_soft_recruiter),
     db: Session = Depends(get_db),
 ):
     app_row = _load_application_or_404(db, agency, payload.application_id)
@@ -2498,13 +2569,19 @@ def create_interview(
         client_id=role.client_id if role else None,
         stage=stage, interview_type=itype,
         interviewers=payload.interviewers,
-        proposed_times=[t.isoformat() for t in (payload.proposed_times or [])],
-        confirmed_time=payload.confirmed_time,
+        proposed_times=[_utc_iso(t) for t in (payload.proposed_times or [])],
+        confirmed_time=_to_utc_naive(payload.confirmed_time),
+        timezone=payload.timezone,
         duration_minutes=payload.duration_minutes,
         location=payload.location, meeting_url=payload.meeting_url,
         notes=payload.notes,
     )
-    db.add(iv); db.commit(); db.refresh(iv)
+    db.add(iv)
+    pipeline_service.advance_stage(
+        db, app_row, ApplicationStage.interview, recruiter=recruiter,
+        reason=f"{stage.value} interview scheduled",
+    )
+    db.commit(); db.refresh(iv)
     return iv
 
 
@@ -2550,8 +2627,9 @@ def update_interview(
         except ValueError: raise HTTPException(400, "Invalid interview status")
     if payload.interviewers is not None: iv.interviewers = payload.interviewers
     if payload.proposed_times is not None:
-        iv.proposed_times = [t.isoformat() for t in payload.proposed_times]
-    if payload.confirmed_time is not None: iv.confirmed_time = payload.confirmed_time
+        iv.proposed_times = [_utc_iso(t) for t in payload.proposed_times]
+    if payload.confirmed_time is not None: iv.confirmed_time = _to_utc_naive(payload.confirmed_time)
+    if payload.timezone is not None: iv.timezone = payload.timezone or None
     if payload.duration_minutes is not None: iv.duration_minutes = payload.duration_minutes
     if payload.location is not None: iv.location = payload.location
     if payload.meeting_url is not None: iv.meeting_url = payload.meeting_url
@@ -2567,6 +2645,7 @@ def create_interview_feedback(
     interview_id: int,
     payload: InterviewFeedbackCreate,
     agency: Agency = Depends(require_unlocked_agency),
+    recruiter: Recruiter | None = Depends(_soft_recruiter),
     db: Session = Depends(get_db),
 ):
     iv = _load_interview_or_404(db, agency, interview_id)
@@ -2575,16 +2654,38 @@ def create_interview_feedback(
     if payload.decision:
         try: dec = ClientDecision(payload.decision)
         except ValueError: raise HTTPException(400, "Invalid decision")
-    fb = InterviewFeedback(
-        agency_id=agency.id, interview_id=interview_id,
-        interviewer_name=payload.interviewer_name,
-        technical=payload.technical, communication=payload.communication,
-        role_understanding=payload.role_understanding,
-        domain_knowledge=payload.domain_knowledge,
-        leadership=payload.leadership, culture_alignment=payload.culture_alignment,
-        decision=dec, comment=payload.comment,
-    )
-    db.add(fb); db.commit(); db.refresh(fb)
+    # One row per interviewer: a second interviewer adds their own feedback;
+    # the same interviewer re-submitting updates theirs (matched on email,
+    # falling back to a case-insensitive name match).
+    name = (payload.interviewer_name or "").strip() or None
+    email = (payload.interviewer_email or "").strip().lower() or None
+    if not name and not email:
+        # Recorded by the logged-in recruiter on behalf of an unnamed panel member.
+        name = (recruiter.full_name or recruiter.email) if recruiter else "Interviewer"
+    fb = None
+    for existing in (
+        db.query(InterviewFeedback).filter(InterviewFeedback.interview_id == interview_id).all()
+    ):
+        if email and (existing.interviewer_email or "").lower() == email:
+            fb = existing
+            break
+        if not email and name and (existing.interviewer_name or "").strip().lower() == name.lower():
+            fb = existing
+            break
+    if fb is None:
+        fb = InterviewFeedback(agency_id=agency.id, interview_id=interview_id)
+        db.add(fb)
+    fb.interviewer_name = name or fb.interviewer_name
+    fb.interviewer_email = email or fb.interviewer_email
+    for f in ("technical", "communication", "role_understanding", "domain_knowledge",
+              "leadership", "culture_alignment"):
+        v = getattr(payload, f)
+        if v is not None and not (1 <= v <= 5):
+            raise HTTPException(400, f"{f} must be between 1 and 5")
+        setattr(fb, f, v)
+    fb.decision = dec
+    fb.comment = payload.comment
+    db.commit(); db.refresh(fb)
     return fb
 
 
@@ -2656,7 +2757,11 @@ def create_offer(
         assigned_recruiter_id=recruiter.id if recruiter else None,
         notes=payload.notes,
     )
-    db.add(offer); db.commit(); db.refresh(offer)
+    db.add(offer)
+    pipeline_service.advance_stage(
+        db, app_row, ApplicationStage.offer, recruiter=recruiter, reason="offer created",
+    )
+    db.commit(); db.refresh(offer)
     return offer
 
 
@@ -2792,7 +2897,16 @@ def create_placement(
         guarantee_ends_at=guarantee_end,
         notes=payload.notes,
     )
-    db.add(pl); db.commit(); db.refresh(pl)
+    db.add(pl)
+    placed_app = db.get(Application, payload.application_id) if payload.application_id else None
+    if placed_app is None or placed_app.agency_id != agency.id:
+        placed_app = pipeline_service.find_application(
+            db, agency.id, payload.role_id, payload.candidate_id
+        )
+    pipeline_service.advance_stage(
+        db, placed_app, ApplicationStage.placed, recruiter=recruiter, reason="placement recorded",
+    )
+    db.commit(); db.refresh(pl)
     # Seed default check-ins
     for c in offers_service.default_checkin_schedule(payload.start_date):
         due = None
@@ -3161,6 +3275,11 @@ def public_submission_decision(
         sub.client_responded_at = datetime.utcnow()
     if sub.client_viewed_at is None:
         sub.client_viewed_at = datetime.utcnow()
+    if decision == ClientDecision.reject:
+        pipeline_service.reject_if_at(
+            db, db.get(Application, sub.application_id), {ApplicationStage.submitted},
+            reason="client rejected via share link",
+        )
     db.commit(); db.refresh(sub)
 
     # Return the fresh client-view of just this submission for the UI.
@@ -3278,7 +3397,7 @@ def _placement_journey_payload(db: Session, role: Role) -> dict:
                 "stage": iv.stage.value if iv.stage else None,
                 "interview_type": iv.interview_type.value if iv.interview_type else None,
                 "status": iv.status.value if iv.status else None,
-                "confirmed_time": iv.confirmed_time.isoformat() if iv.confirmed_time else None,
+                "confirmed_time": iv.confirmed_time.isoformat() + "Z" if iv.confirmed_time else None,
                 "duration_minutes": iv.duration_minutes,
                 "feedback": [
                     {

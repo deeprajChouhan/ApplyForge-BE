@@ -5,6 +5,8 @@ Extend freely — matching quality scales with coverage.
 """
 from __future__ import annotations
 
+import re
+
 _SKILL_ALIASES: dict[str, list[str]] = {
     "python": ["py"],
     "javascript": ["js", "ecmascript"],
@@ -136,14 +138,66 @@ def normalize_skill(raw: str) -> str:
     return _ALIAS_TO_CANONICAL.get(key, key)
 
 
+_BOUNDARY_CACHE: dict[str, re.Pattern[str]] = {}
+
+
+def _term_pattern(term: str) -> re.Pattern[str]:
+    pat = _BOUNDARY_CACHE.get(term)
+    if pat is None:
+        # Word-boundary match that tolerates symbol-y skills (c++, c#, node.js,
+        # ci/cd). v1 used raw substring search, so "go" matched "good" and
+        # "ts" matched "results".
+        pat = re.compile(r"(?<![a-z0-9+#])" + re.escape(term) + r"(?![a-z0-9+#]|\.[a-z0-9])")
+        _BOUNDARY_CACHE[term] = pat
+    return pat
+
+
+# Very short / ambiguous aliases that are only trusted when listed as a skill,
+# never when found in free text ("go to market", "next steps", "node" …).
+_TEXT_UNSAFE = {"go", "py", "js", "ts", "ml", "next", "node", "rest", "quota",
+                "churn", "operations", "branding", "selling", "scrum"}
+
+
 def extract_skills(text: str) -> list[str]:
     if not text:
         return []
-    hay = " " + text.lower() + " "
+    hay = text.lower()
     found: list[str] = []
     seen: set[str] = set()
     for term, canon in _ORDERED_TERMS:
-        if term in hay and canon not in seen:
+        if canon in seen or term in _TEXT_UNSAFE:
+            continue
+        if term in hay and _term_pattern(term).search(hay):
             found.append(canon)
             seen.add(canon)
     return found
+
+
+# Adjacent skills that earn partial credit in matching (symmetric).
+_RELATED: dict[str, set[str]] = {}
+for _group in (
+    {"sql", "postgresql", "mysql"},
+    {"javascript", "typescript"},
+    {"react", "next.js"},
+    {"aws", "gcp", "azure"},
+    {"docker", "kubernetes"},
+    {"machine learning", "deep learning", "pytorch", "tensorflow", "data science"},
+    {"pandas", "numpy", "data analysis", "data science"},
+    {"django", "flask", "fastapi"},
+    {"tableau", "data analysis", "excel"},
+    {"recruiting", "talent acquisition"},
+    {"customer success", "account management"},
+    {"sales", "business development", "lead generation"},
+    {"accounting", "auditing", "gaap"},
+    {"financial analysis", "financial modeling", "fp&a", "forecasting", "budgeting"},
+    {"seo", "sem", "digital marketing", "paid advertising"},
+    {"project management", "product management", "agile"},
+    {"supply chain", "logistics", "inventory management"},
+    {"salesforce", "crm", "hubspot"},
+):
+    for _s in _group:
+        _RELATED.setdefault(_s, set()).update(_group - {_s})
+
+
+def related_skills(skill: str) -> set[str]:
+    return _RELATED.get(normalize_skill(skill), set())

@@ -79,7 +79,7 @@ def daily_brief(db: Session, agency_id: int, recruiter_id: int | None = None) ->
         Interview.confirmed_time <= soon,
         Interview.confirmed_time >= now,
     ).all():
-        high.append(_item("high", f"Interview at {iv.confirmed_time.isoformat()}",
+        high.append(_item("high", f"Interview at {iv.confirmed_time:%d %b %H:%M} UTC",
                           action_kind="prep_interview", parent_kind="interview", parent_id=iv.id))
 
     # ── Screenings without consent ──────────────────────────────────
