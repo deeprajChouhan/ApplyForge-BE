@@ -446,3 +446,52 @@ class ApplicantForm(BaseModel):
             if q:
                 out.append({"question": q, "answer": a})
         return out
+
+
+# ── Job applicants (portal list) ───────────────────────────────────────
+class ApplicantContact(BaseModel):
+    email: str | None = None
+    phone: str | None = None
+    linkedin_url: str | None = None
+
+
+class ApplicantSkills(BaseModel):
+    matched_required: list[str] = Field(default_factory=list)
+    matched_preferred: list[str] = Field(default_factory=list)
+    missing_required: list[str] = Field(default_factory=list)
+    other: list[str] = Field(default_factory=list)
+
+
+class ApplicantOut(BaseModel):
+    rank: int
+    application_id: int
+    candidate_id: int
+    name: str | None = None
+    headline: str | None = None
+    location: str | None = None
+    years_experience: float | None = None
+    fit_score: float | None = None
+    match: MatchExplanation | None = None
+    skills: ApplicantSkills
+    stage: ApplicationStage
+    source: str
+    channel: str | None = None          # careers_site | server | app
+    processing_status: str
+    applied_at: datetime | None = None
+    last_activity_at: datetime | None = None
+    cover_letter: str | None = None
+    answers: list[dict] = Field(default_factory=list)
+    contact: ApplicantContact | None = None
+    documents: list[DocumentOut] | None = None
+    # Recruiter-screened, client-safe fields (recruiter summary, motivation,
+    # expected compensation, notice, availability, work model…) — only those
+    # the recruiter has left visible to clients. Never internal notes.
+    screening: dict = Field(default_factory=dict)
+
+
+class ApplicantList(Page):
+    job_id: int
+    stage: str
+    total: int
+    scored: int
+    data: list[ApplicantOut]

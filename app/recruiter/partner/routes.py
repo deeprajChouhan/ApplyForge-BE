@@ -848,6 +848,103 @@ def list_applications(
     return S.ApplicationList(data=[_app_out(a) for a in rows[:limit]], **_page(len(rows), limit, offset))
 
 
+@router.get("/jobs/{job_id}/applicants", response_model=S.ApplicantList)
+def job_applicants(
+    job_id: int,
+    stage: str = Query(default="sourced", description="A pipeline stage, or 'all'"),
+    sort: str = Query(default="fit_score", pattern="^(fit_score|applied_at)$"),
+    limit: int = Query(default=50, ge=1, le=MAX_PAGE),
+    offset: int = Query(default=0, ge=0),
+    ctx: PartnerContext = Depends(require_scope("applications:read")),
+    db: Session = Depends(get_db),
+):
+    """
+    Ranked applicants for one job — built for a client portal list view.
+
+    Default: everyone at `sourced` (new applicants), best fit first; unscored
+    applicants (still processing) sort last. Each row carries the fit score
+    with its evidence (reasons, gaps, breakdown, parse quality), matched and
+    missing skills against the job, the applicant's own form answers, and the
+    recruiter-screened fields the agency has left client-visible.
+
+    A client-scoped key only ever sees applicants it submitted itself.
+    Contact details need `candidates:read` (agency keys) or are the client's
+    own applicants (client keys). Documents need `documents:read`.
+    """
+    from app.recruiter.services.visibility import to_client_view
+
+    role = _load_job(db, ctx, job_id)
+    q = _apps_q(db, ctx).filter(Application.role_id == role.id)
+    if stage != "all":
+        try:
+            q = q.filter(Application.stage == ApplicationStage(stage))
+        except ValueError:
+            raise _err(422, "invalid_stage", "stage must be a pipeline stage or 'all'.")
+    total = q.count()
+    scored = q.filter(Application.fit_score.isnot(None)).count()
+    if sort == "fit_score":
+        q = q.order_by(Application.fit_score.is_(None), Application.fit_score.desc(), Application.id.desc())
+    else:
+        q = q.order_by(Application.created_at.desc(), Application.id.desc())
+    rows = q.offset(offset).limit(limit + 1).all()
+
+    req = [normalize_skill(x) for x in (role.required_skills or []) if x]
+    pref = [normalize_skill(x) for x in (role.preferred_skills or []) if x]
+    show_contact = ctx.client_id is not None or "candidates:read" in ctx.scopes
+    show_docs = "documents:read" in ctx.scopes
+
+    data: list[S.ApplicantOut] = []
+    for i, a in enumerate(rows[:limit]):
+        c = a.candidate
+        cand_skills = [s.name for s in (c.skills if c else []) if s.name]
+        have = {normalize_skill(x) for x in cand_skills}
+        matched_req = [x for x in req if x in have]
+        matched_pref = [x for x in pref if x in have]
+        listed = set(matched_req) | set(matched_pref)
+        view = to_client_view(a)
+        screening = {k: v for k, v in view.items() if k not in ("application_id", "role_id", "candidate_id", "stage")}
+        docs = None
+        if show_docs:
+            docs = [_doc_out(d) for d in documents_service.list_documents(
+                db, ctx.agency_id, a.candidate_id,
+                application_id=a.id if ctx.client_id is not None else None,
+            )]
+        m = a.match_explanation or None
+        data.append(S.ApplicantOut(
+            rank=offset + i + 1,
+            application_id=a.id,
+            candidate_id=a.candidate_id,
+            name=c.full_name if c else None,
+            headline=c.headline if c else None,
+            location=c.location if c else None,
+            years_experience=c.years_experience if c else None,
+            fit_score=a.fit_score,
+            match=S.MatchExplanation(**m) if m else None,
+            skills=S.ApplicantSkills(
+                matched_required=matched_req,
+                matched_preferred=matched_pref,
+                missing_required=[x for x in req if x not in have],
+                other=[x for x in cand_skills if normalize_skill(x) not in listed][:15],
+            ),
+            stage=a.stage,
+            source=a.source or "app",
+            channel=(a.source_detail or {}).get("channel") or ("app" if (a.source or "app") == "app" else None),
+            processing_status=a.processing_status or "none",
+            applied_at=a.created_at,
+            last_activity_at=a.last_activity_at,
+            cover_letter=a.cover_letter,
+            answers=a.form_answers or [],
+            contact=S.ApplicantContact(email=c.email, phone=c.phone, linkedin_url=c.linkedin_url)
+            if (show_contact and c) else None,
+            documents=docs,
+            screening=screening,
+        ))
+    return S.ApplicantList(
+        job_id=role.id, stage=stage, total=total, scored=scored, data=data,
+        **_page(len(rows), limit, offset),
+    )
+
+
 @router.get("/applications/{application_id}", response_model=S.ApplicationOut)
 def get_application(
     application_id: int,

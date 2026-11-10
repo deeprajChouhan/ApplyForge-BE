@@ -738,3 +738,74 @@ def test_delivery_blocks_rebinding_to_private_ip(monkeypatch):
                         lambda host, *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("169.254.169.254", 443))])
     code, err = webhooks._post("https://rebind.example.com/x", b"{}", {})
     assert code is None and err == "blocked"
+
+
+# ── Operator: owner role management ────────────────────────────────────
+def test_operator_promotes_owner_and_last_owner_is_protected(client, ctx):
+    a = ctx["admin_h"]
+    recs = client.get(f"{BASE}/admin/recruiters?agency_id={ctx['agency_id']}", headers=a).json()
+    owner = next(r for r in recs if r["role"] == "owner")
+    assert client.patch(f"{BASE}/admin/recruiters/{owner['id']}", headers=a, json={"role": "recruiter"}).status_code == 409
+    assert client.patch(f"{BASE}/admin/recruiters/{owner['id']}", headers=a, json={"is_active": False}).status_code == 409
+    assert client.delete(f"{BASE}/admin/recruiters/{owner['id']}", headers=a).status_code == 409
+    new = client.post(f"{BASE}/admin/recruiters", headers=a, json={
+        "agency_id": ctx["agency_id"], "email": "second@talent-co.example", "password": "secondpass1"}).json()
+    tok = client.post(f"{BASE}/auth/login", json={"email": "second@talent-co.example", "password": "secondpass1"}).json()["access_token"]
+    h = {"Authorization": f"Bearer {tok}"}
+    assert client.get(f"{BASE}/agency/integrations", headers=h).status_code == 403
+    assert client.patch(f"{BASE}/admin/recruiters/{new['id']}", headers=a, json={"role": "owner"}).json()["role"] == "owner"
+    assert client.get(f"{BASE}/agency/integrations", headers=h).status_code == 200  # takes effect immediately
+    assert client.patch(f"{BASE}/admin/recruiters/{owner['id']}", headers=a, json={"role": "recruiter"}).status_code == 200
+    # restore the shared fixture's owner for later tests
+    assert client.patch(f"{BASE}/admin/recruiters/{owner['id']}", headers=a, json={"role": "owner"}).status_code == 200
+
+
+# ── Job applicants list (client portal view) ───────────────────────────
+def test_job_applicants_ranked_with_evidence_and_scoped(client, ctx):
+    ck = _client_key(ctx)
+    job = client.post(f"{P}/jobs", headers=H(ck), json={
+        "title": "Acme Backend", "required_skills": ["Python", "FastAPI", "Kubernetes"],
+        "preferred_skills": ["PostgreSQL"]}).json()
+    strong = b"Strong Dev\nstrong@example.com\nSenior Python engineer. 9 years Python, FastAPI, PostgreSQL.\nSkills: Python, FastAPI, PostgreSQL"
+    weak = b"Weak Dev\nweak@example.com\nGraphic designer.\nSkills: Photoshop"
+    for email, cv, first in (("weak@example.com", weak, "Weak"), ("strong@example.com", strong, "Strong")):
+        r = client.post(f"{P}/jobs/{job['id']}/applications", headers=H(ck),
+                        data={"first_name": first, "last_name": "Dev", "email": email, "consent": "true",
+                              "privacy_notice_version": "v1",
+                              "answers": json.dumps([{"question": "Notice period?", "answer": "1 month"}])},
+                        files={"resume": ("cv.txt", cv, "text/plain")})
+        assert r.status_code == 202
+    # An agency-sourced candidate on the same job must not appear for the client key
+    ada = next(c for c in client.get(f"{BASE}/agencies/{ctx['agency_id']}/candidates", headers=ctx["owner_h"]).json()
+               if c["full_name"] == "Ada Lovelace")
+    client.post(f"{P}/jobs/{job['id']}/pipeline?candidate_id={ada['id']}", headers=H(ctx["secret"]))
+
+    res = client.get(f"{P}/jobs/{job['id']}/applicants", headers=H(ck))
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["stage"] == "sourced" and body["total"] == 2 and body["scored"] == 2
+    names = [a["name"] for a in body["data"]]
+    assert "Ada Lovelace" not in names
+    first, second = body["data"]
+    assert first["rank"] == 1 and first["fit_score"] >= second["fit_score"]
+    assert first["name"] == "Strong Dev"
+    assert "python" in [s.lower() for s in first["skills"]["matched_required"]]
+    assert "kubernetes" in [s.lower() for s in first["skills"]["missing_required"]]
+    assert first["match"]["reasons"] is not None and "gaps" in first["match"]
+    assert first["answers"][0]["answer"] == "1 month"
+    assert first["contact"]["email"] == "strong@example.com"     # client's own applicant
+    assert first["documents"] is None                            # no documents:read scope
+    blob = json.dumps(body)
+    for leak in ("internal_notes", "embedding", "raw_cv_text", "budget", "storage_uri", "current_compensation"):
+        assert leak not in blob
+
+    # Agency key sees everyone; contact only with candidates:read
+    agency_view = client.get(f"{P}/jobs/{job['id']}/applicants", headers=H(ctx["secret"])).json()
+    assert agency_view["total"] == 3 and any(a["name"] == "Ada Lovelace" for a in agency_view["data"])
+    narrow = ctx["key"](ctx["owner_h"], scopes=["applications:read"])
+    assert all(a["contact"] is None for a in client.get(f"{P}/jobs/{job['id']}/applicants", headers=H(narrow)).json()["data"])
+    # sort + stage validation
+    assert client.get(f"{P}/jobs/{job['id']}/applicants?stage=bogus", headers=H(ck)).status_code == 422
+    assert client.get(f"{P}/jobs/{job['id']}/applicants?stage=all&sort=applied_at", headers=H(ck)).status_code == 200
+    # another client's / agency's job is invisible
+    assert client.get(f"{P}/jobs/{ctx['role_id']}/applicants", headers=H(ck)).status_code == 404

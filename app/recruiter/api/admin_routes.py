@@ -17,7 +17,7 @@ from app.api.deps import require_admin
 from app.core.security import hash_password
 from app.db.session import get_db
 from app.models.models import User
-from app.recruiter.enums import PLAN_FEATURES, AgencyStatus, default_seat_limit
+from app.recruiter.enums import PLAN_FEATURES, AgencyStatus, RecruiterSeatRole, default_seat_limit
 from app.recruiter.models import Agency, Recruiter
 from app.recruiter.schemas import (
     AgencyAdminOut,
@@ -226,11 +226,38 @@ def create_recruiter(payload: RecruiterCreate, db: Session = Depends(get_db)):
     return _recruiter_out(recruiter)
 
 
+def _guard_last_owner(db: Session, recruiter: Recruiter) -> None:
+    """An agency must always keep at least one active owner — otherwise nobody
+    can manage its team, plan, API keys or webhooks."""
+    if recruiter.role != RecruiterSeatRole.owner or not recruiter.is_active:
+        return
+    others = (
+        db.query(func.count(Recruiter.id))
+        .filter(
+            Recruiter.agency_id == recruiter.agency_id,
+            Recruiter.id != recruiter.id,
+            Recruiter.role == RecruiterSeatRole.owner,
+            Recruiter.is_active.is_(True),
+        )
+        .scalar()
+        or 0
+    )
+    if others == 0:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This is the agency's only active owner. Make someone else owner first.",
+        )
+
+
 @router.patch("/recruiters/{recruiter_id}", response_model=RecruiterAdminOut)
 def update_recruiter(recruiter_id: int, payload: RecruiterUpdate, db: Session = Depends(get_db)):
     recruiter = db.get(Recruiter, recruiter_id)
     if recruiter is None:
         raise HTTPException(status_code=404, detail="Recruiter not found")
+    demoting = payload.role is not None and payload.role != RecruiterSeatRole.owner
+    deactivating = payload.is_active is False
+    if demoting or deactivating:
+        _guard_last_owner(db, recruiter)
     if payload.full_name is not None:
         recruiter.full_name = payload.full_name
     if payload.is_active is not None:
@@ -258,5 +285,6 @@ def delete_recruiter(recruiter_id: int, db: Session = Depends(get_db)):
     recruiter = db.get(Recruiter, recruiter_id)
     if recruiter is None:
         raise HTTPException(status_code=404, detail="Recruiter not found")
+    _guard_last_owner(db, recruiter)
     db.delete(recruiter)
     db.commit()
