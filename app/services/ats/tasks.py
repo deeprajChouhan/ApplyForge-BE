@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 # transient upstream errors/empty pages without incorrectly deactivating
 # live postings.
 STALE_THRESHOLD = timedelta(days=7)
+LAST_SEEN_REFRESH = timedelta(hours=12)  # must stay well below STALE_THRESHOLD
 
 
 def upsert_company(db: Session, normalized: NormalizedCompany) -> Company:
@@ -109,21 +110,40 @@ def upsert_job(db: Session, company: Company, normalized: NormalizedJob, now: da
             return None
         return value[: limit - 1] + "…" if len(value) > limit else value
 
-    job.company_id = company.id
-    job.title = _clip(normalized.title, 512) or ""
-    job.location = _clip(normalized.location, 255)
-    job.remote_mode = normalized.remote_mode
-    job.employment_type = _clip(normalized.employment_type, 64)
-    job.seniority = _clip(normalized.seniority, 64)
-    job.salary_min = normalized.salary_min
-    job.salary_max = normalized.salary_max
-    job.salary_currency = normalized.salary_currency
-    job.description = normalized.description
-    job.description_html = normalized.description_html
-    job.apply_url = _clip(normalized.apply_url, 2048) or ""
-    job.posted_at = normalized.posted_at
-    job.last_seen_at = now
-    job.is_active = True
+    # Write only what changed. Every UPDATE is logged in MySQL's row-based
+    # binlog with full before/after images (incl. description + description_html),
+    # so blindly re-assigning every column on every poll generated ~200 GB/day
+    # of binlogs and filled the server disk (2026-11-02/03).
+    def _norm_dt(v):
+        if isinstance(v, datetime) and v.tzinfo is not None:
+            return v.astimezone(timezone.utc).replace(tzinfo=None)
+        return v
+
+    def _set(attr: str, value) -> None:
+        if _norm_dt(getattr(job, attr, None)) != _norm_dt(value):
+            setattr(job, attr, value)
+
+    _set("company_id", company.id)
+    _set("title", _clip(normalized.title, 512) or "")
+    _set("location", _clip(normalized.location, 255))
+    _set("remote_mode", normalized.remote_mode)
+    _set("employment_type", _clip(normalized.employment_type, 64))
+    _set("seniority", _clip(normalized.seniority, 64))
+    _set("salary_min", normalized.salary_min)
+    _set("salary_max", normalized.salary_max)
+    _set("salary_currency", normalized.salary_currency)
+    _set("description", normalized.description)
+    _set("description_html", normalized.description_html)
+    _set("apply_url", _clip(normalized.apply_url, 2048) or "")
+    _set("posted_at", normalized.posted_at)
+    # last_seen_at only drives stale-deactivation (STALE_THRESHOLD = 7 days),
+    # so refreshing it at most every LAST_SEEN_REFRESH is enough — this turns
+    # an hourly full-table rewrite into ~2 small writes per job per day.
+    last_seen = _norm_dt(job.last_seen_at)
+    if is_new or last_seen is None or _norm_dt(now) - last_seen >= LAST_SEEN_REFRESH:
+        job.last_seen_at = now
+    if not job.is_active:
+        job.is_active = True
 
     # Cache RCMS jd_features on the first ingest of a Job (or if title/
     # description changed since the last cache). Extraction is cheap

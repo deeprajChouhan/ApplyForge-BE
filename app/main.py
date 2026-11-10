@@ -26,6 +26,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Partner API: per-key CORS (no credentials), security headers, request log.
+# Added after CORSMiddleware so it wraps it (outermost) and owns partner paths.
+from app.recruiter.partner.middleware import PartnerApiMiddleware  # noqa: E402
+
+app.add_middleware(PartnerApiMiddleware)
+
 
 @app.on_event("startup")
 def seed_and_promote_admin() -> None:

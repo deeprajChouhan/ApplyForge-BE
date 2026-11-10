@@ -22,4 +22,9 @@ BEAT_SCHEDULE = {
     # ticks whenever it finds new jobs, so this mostly just handles
     # daily_cap timing and picks up jobs that arrived via the hourly poll.
     "auto-apply-tick-all": {"task": "app.services.auto_apply.orchestrator.tick_all", "schedule": crontab(minute="*/5"), "args": []},
+
+    # ── Recruiter Partner API ─────────────────────────────────────────────
+    # Sweep due webhook retries every minute; purge expired logs nightly.
+    "partner-webhook-retries": {"task": "app.recruiter.partner.tasks.deliver_webhooks", "schedule": crontab(minute="*"), "args": []},
+    "partner-log-retention": {"task": "app.recruiter.partner.tasks.purge_old_logs", "schedule": crontab(minute=17, hour="3"), "args": []},
 }

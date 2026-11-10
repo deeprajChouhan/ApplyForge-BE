@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import date, datetime
 
 from typing import Any, Literal
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_serializer
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_serializer, field_validator
 
 from app.recruiter.enums import (
     AgencyPlan,
@@ -551,8 +551,17 @@ class CandidateDetailOut(CandidateOut):
     phone: str | None = None
     location: str | None = None
     summary: str | None = None
+    # Original filename only (display). Older rows stored a server path here;
+    # the validator strips it so no filesystem/storage location ever leaks.
     source_file: str | None = None
     experiences: list[CandidateExperienceOut] = Field(default_factory=list)
+
+    @field_validator("source_file", mode="before")
+    @classmethod
+    def _basename_only(cls, v):
+        if not v:
+            return None
+        return str(v).replace("\\", "/").split("/")[-1][:255] or None
 
 
 # ── Provisioning bridge (convert profile → consumer user) ─────────────────
@@ -1676,3 +1685,18 @@ class ClientIntelligenceOut(BaseModel):
     summary: str | None
     used_llm: bool
     generated_at: datetime
+
+
+class CandidateDocumentOut(BaseModel):
+    """Stored document metadata. storage_uri is deliberately not exposed."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    candidate_id: int
+    application_id: int | None = None
+    kind: str
+    original_filename: str
+    content_type: str | None = None
+    size_bytes: int
+    uploaded_via: str
+    created_at: datetime | None = None

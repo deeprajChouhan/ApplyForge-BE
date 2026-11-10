@@ -76,7 +76,33 @@ def set_stage(
     if reason:
         body += f" ({reason})"
     _log(db, app_row, body, recruiter)
+    _emit_stage_change(db, app_row, prev, target)
     return True
+
+
+def _emit_stage_change(db: Session, app_row: Application, prev: ApplicationStage, target: ApplicationStage) -> None:
+    """Queue the partner webhook (ids + stages only). Never raises."""
+    try:
+        from app.recruiter.models import Role
+        from app.recruiter.partner import webhooks
+
+        role = db.get(Role, app_row.role_id) if app_row.role_id else None
+        webhooks.emit(
+            db,
+            app_row.agency_id,
+            "application.stage_changed",
+            {
+                "application_id": app_row.id,
+                "job_id": app_row.role_id,
+                "candidate_id": app_row.candidate_id,
+                "previous_stage": prev.value,
+                "stage": target.value,
+            },
+            client_id=role.client_id if role else None,
+            intake_client_id=app_row.intake_client_id,
+        )
+    except Exception:  # pragma: no cover - webhooks must never block a stage move
+        pass
 
 
 def advance_stage(

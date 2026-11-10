@@ -90,6 +90,34 @@ class Settings(BaseSettings):
     # Public base URL of the recruiter app — used to build invite/claim links.
     recruiter_app_url: str = "https://recruiter.applyforge.co.uk"
 
+    # ── Partner API (recruiter integrations) ──
+    # Pepper for API-key HMACs. Falls back to a key derived from SECRET_KEY;
+    # set it explicitly in prod so rotating SECRET_KEY doesn't revoke every key.
+    partner_key_pepper: SecretStr | None = None
+    # Default requests/minute per key (operator can override per agency/key).
+    partner_rate_limit_secret: int = 120
+    partner_rate_limit_publishable: int = 30
+    # Per client-IP cap on public application submissions (per hour).
+    partner_apply_per_ip_per_hour: int = 20
+    # Optional shared limiter store; in-process limiter is used when unset.
+    partner_rate_limit_redis_url: str | None = None
+    # Cloudflare Turnstile secret. When set, publishable-key application
+    # submissions must include a valid `captcha_token`.
+    partner_turnstile_secret: SecretStr | None = None
+    # "inline" runs CV parse/score + webhook delivery in-process after the
+    # response (dev/small deploys); "celery" hands them to the worker.
+    partner_jobs_backend: str = "inline"
+    # Webhook targets must be https + public IPs. Only for local testing.
+    partner_webhook_allow_insecure: bool = False
+    partner_log_retention_days: int = 30
+    # Requests per IP per minute before a key is even looked up (all keys, valid or not).
+    partner_preauth_per_ip_per_minute: int = 600
+    # Max request body for partner endpoints (CV ≤10 MB + form fields).
+    partner_max_body_bytes: int = 11 * 1024 * 1024
+    # How many reverse proxies we sit behind (X-Forwarded-For entries from the
+    # right that we trust). 1 = Container Apps ingress; 0 = no proxy.
+    partner_trusted_proxy_hops: int = 1
+
     model_config = SettingsConfigDict(env_file=str(_ENV_FILE), extra="ignore")
 
     @property

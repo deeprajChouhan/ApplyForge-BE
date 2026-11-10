@@ -5,6 +5,9 @@ from app.recruiter.api.admin_routes import router as admin_router
 from app.recruiter.api.agency_routes import router as agency_router
 from app.recruiter.api.auth_routes import router as auth_router
 from app.recruiter.api.billing_routes import router as billing_router
+from app.recruiter.partner.management import operator_router as integrations_operator_router
+from app.recruiter.partner.management import owner_router as integrations_owner_router
+from app.recruiter.partner.routes import router as partner_router
 from app.recruiter.api.routes import (
     consent_router, submissions_router, sla_router, comparison_router,
     interviews_router, offers_router, placements_router, tasks_router,
@@ -26,6 +29,9 @@ recruiter_router.include_router(auth_router)
 recruiter_router.include_router(admin_router)
 recruiter_router.include_router(agency_router)
 recruiter_router.include_router(billing_router)
+recruiter_router.include_router(integrations_owner_router)
+recruiter_router.include_router(integrations_operator_router)
+recruiter_router.include_router(partner_router)
 # Agency-scoped resources (recruiter- or operator-authenticated).
 recruiter_router.include_router(clients_router)
 recruiter_router.include_router(roles_router)

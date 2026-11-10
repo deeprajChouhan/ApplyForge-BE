@@ -20,7 +20,7 @@ from app.recruiter.api.deps import (
     require_agency_feature,
     require_unlocked_agency,
 )
-from app.recruiter.enums import ApplicationStage
+from app.recruiter.enums import ApplicationStage, RoleStatus
 from app.recruiter.models import (
     Agency,
     AiInsightCache,
@@ -50,7 +50,10 @@ from app.recruiter.models import (
     SpecSheetTemplate,
     SubmissionFeedback,
 )
+from app.recruiter.services import documents as documents_service
+from app.recruiter.services.erasure import erase_candidate
 from app.recruiter.schemas import (
+    CandidateDocumentOut,
     KeywordDensifyRequest,
     KeywordDensifyResult,
     ApplicationCreate,
@@ -502,9 +505,22 @@ def create_role(
     db.add(role)
     db.flush()
     role.embedding = embed_role(role)
+    _emit_role(db, role, "job.created")
     db.commit()
     db.refresh(role)
     return role
+
+
+def _emit_role(db: Session, role: Role, event: str) -> None:
+    """Partner webhook for app-side role changes (ids + status only)."""
+    from app.recruiter.partner import webhooks as partner_webhooks
+
+    partner_webhooks.emit(
+        db, role.agency_id, event,
+        {"job_id": role.id, "status": role.status.value if role.status else None,
+         "external_ref": role.external_ref},
+        client_id=role.client_id,
+    )
 
 
 @roles_router.patch("/{role_id}", response_model=RoleOut)
@@ -531,11 +547,15 @@ def update_role(
         if k in data:
             reembed = True
 
+    prev_status = role.status
     for k, v in data.items():
         setattr(role, k, v)
 
     if reembed:
         role.embedding = embed_role(role)
+    _emit_role(db, role, "job.updated")
+    if prev_status == RoleStatus.open and role.status != RoleStatus.open:
+        _emit_role(db, role, "job.closed")
     db.commit()
     db.refresh(role)
     return role
@@ -754,11 +774,17 @@ async def ingest_cvs(
     if not files:
         raise HTTPException(status_code=400, detail="No files uploaded")
 
+    if len(files) > 50:
+        raise HTTPException(status_code=400, detail="Upload at most 50 CVs per batch")
     payload: list[tuple[str, bytes]] = []
     for f in files:
-        payload.append((f.filename or "cv.txt", await f.read()))
+        payload.append((f.filename or "cv.txt", await f.read(documents_service.MAX_DOCUMENT_BYTES + 1)))
 
-    ingested = ingest_batch(db, agency.id, payload)
+    try:
+        ingested = ingest_batch(db, agency.id, payload)
+    except documents_service.DocumentRejected as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc))
     usage_service.record(db, agency.id, UsageKind.cv_ingested, len(ingested))
     return IngestResult(
         ingested=len(ingested),
@@ -843,6 +869,64 @@ def get_candidate(
     if cand is None or cand.agency_id != agency.id:
         raise HTTPException(status_code=404, detail="Candidate not found")
     return cand
+
+
+@candidates_router.get("/{candidate_id}/documents", response_model=list[CandidateDocumentOut])
+def list_candidate_documents(
+    candidate_id: int,
+    agency: Agency = Depends(get_agency),
+    db: Session = Depends(get_db),
+):
+    """Stored CVs / cover letters for this candidate (metadata only)."""
+    cand = db.get(CandidateProfile, candidate_id)
+    if cand is None or cand.agency_id != agency.id:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+    return documents_service.list_documents(db, agency.id, candidate_id)
+
+
+@candidates_router.get("/{candidate_id}/documents/{document_id}/download")
+def download_candidate_document(
+    candidate_id: int,
+    document_id: int,
+    agency: Agency = Depends(get_agency),
+    db: Session = Depends(get_db),
+):
+    """Stream the stored file. Tenant-scoped; never exposes the storage location."""
+    doc = documents_service.get_document(db, agency.id, document_id)
+    if doc is None or doc.candidate_id != candidate_id:
+        raise HTTPException(status_code=404, detail="Document not found")
+    try:
+        content = documents_service.read_document(doc)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Document file is no longer available")
+    return Response(
+        content=content,
+        media_type=doc.content_type or "application/octet-stream",
+        headers={
+            "Content-Disposition": documents_service.content_disposition(doc.original_filename),
+            "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "private, no-store",
+        },
+    )
+
+
+@candidates_router.delete("/{candidate_id}", status_code=204)
+def delete_candidate(
+    candidate_id: int,
+    agency: Agency = Depends(require_unlocked_agency),
+    db: Session = Depends(get_db),
+):
+    """Erase a candidate: stored files, then the profile (rows cascade)."""
+    cand = db.get(CandidateProfile, candidate_id)
+    if cand is None or cand.agency_id != agency.id:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+    try:
+        erase_candidate(db, agency.id, cand)
+    except documents_service.DocumentDeleteError:
+        db.rollback()
+        raise HTTPException(status_code=503, detail="Stored files could not be deleted. Nothing was erased — try again.")
+    db.commit()
+    return Response(status_code=204)
 
 
 def _load_export_context(
@@ -1077,6 +1161,11 @@ def create_shortlist(
     role = _load_role(db, agency, role_id)
     shortlist = generate_shortlist(db, role, limit=limit)
     usage_service.record(db, agency.id, UsageKind.shortlist_generated)
+    from app.recruiter.partner import webhooks as partner_webhooks
+
+    partner_webhooks.emit(db, agency.id, "shortlist.completed",
+                          {"job_id": role.id, "shortlist_id": shortlist.id}, client_id=role.client_id)
+    db.commit()
     return shortlist
 
 
@@ -1129,9 +1218,23 @@ def create_application(
         notes=payload.notes,
     )
     db.add(app_row)
+    db.flush()
+    _emit_application_created(db, app_row)
     db.commit()
     db.refresh(app_row)
     return app_row
+
+
+def _emit_application_created(db: Session, app_row: Application) -> None:
+    from app.recruiter.partner import webhooks as partner_webhooks
+
+    role = db.get(Role, app_row.role_id) if app_row.role_id else None
+    partner_webhooks.emit(
+        db, app_row.agency_id, "application.created",
+        {"application_id": app_row.id, "job_id": app_row.role_id, "candidate_id": app_row.candidate_id,
+         "stage": app_row.stage.value, "source": app_row.source or "app"},
+        client_id=role.client_id if role else None,
+    )
 
 
 @applications_router.get("", response_model=list[ApplicationOut])
@@ -1337,6 +1440,9 @@ def assign_candidates_to_role(
         added_rows.append(app_row)
 
     try:
+        db.flush()
+        for a in added_rows:
+            _emit_application_created(db, a)
         db.commit()
     except IntegrityError:
         # Lost a race with a concurrent assign (double-click) — the unique

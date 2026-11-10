@@ -50,7 +50,7 @@ PLAN_SEAT_LIMITS: dict[AgencyPlan, int | None] = {
 
 # Gated "AI insight" features unlocked on paid plans. Core matching + tracking
 # (pool, roles, shortlist, pipeline, placement, clients) is available on all plans.
-AGENCY_FEATURES = ("listings", "market", "advisory")
+AGENCY_FEATURES = ("listings", "market", "advisory", "partner_api")
 
 PLAN_FEATURES: dict[AgencyPlan, set[str]] = {
     AgencyPlan.free: set(),
@@ -73,6 +73,8 @@ class UsageKind(str, enum.Enum):
     role_match_run = "role_match_run"
     advisory_run = "advisory_run"
     spec_sheet_exported = "spec_sheet_exported"   # branded CV/spec-sheet PDF or DOCX
+    api_application_received = "api_application_received"  # Partner API intake
+    api_jd_parsed = "api_jd_parsed"                         # LLM JD parse via Partner API
 
 
 def plan_has_feature(plan: AgencyPlan, feature: str) -> bool:
@@ -101,6 +103,8 @@ class CandidateSource(str, enum.Enum):
     manual = "manual"
     ats_sync = "ats_sync"
     referral = "referral"
+    careers_site = "careers_site"   # applied through a partner careers-site form (Partner API)
+    partner_api = "partner_api"     # pushed server-to-server through the Partner API
 
 
 class ApplicationStage(str, enum.Enum):
@@ -318,4 +322,5 @@ class NotificationKind(str, enum.Enum):
     start_date_upcoming = "start_date_upcoming"
     guarantee_ending = "guarantee_ending"
     stale_pipeline = "stale_pipeline"
+    application_received = "application_received"   # new applicant via Partner API
     other = "other"

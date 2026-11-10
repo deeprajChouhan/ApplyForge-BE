@@ -100,6 +100,18 @@ class Agency(Base, RecTimestampMixin):
     )
     trial_ends_at: Mapped[datetime | None] = mapped_column(DateTime)
 
+    # Partner API (operator-managed). "plan" follows the plan's feature set;
+    # "enabled"/"disabled" are operator overrides (kill switch). The rate limit
+    # override, when set, replaces the per-key default requests/minute.
+    partner_api_access: Mapped[str] = mapped_column(
+        String(16), default="plan", server_default="plan", nullable=False
+    )
+    partner_api_rate_limit: Mapped[int | None] = mapped_column(Integer)
+    # Public XML/JSON job feed at /partner/v1/public/{slug}/jobs.xml (owner toggle).
+    public_job_feed_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="0", nullable=False
+    )
+
     # Branding — applied to exported CV/spec-sheet documents (Phase 1 feature 2).
     # logo_url: URL of an agency-hosted PNG/JPG (we embed it in exports; the
     #   agency uploads/hosts it themselves rather than us running an asset store).
@@ -155,6 +167,8 @@ class Client(Base, RecTimestampMixin):
     __tablename__ = "rec_clients"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # Caller-supplied id from a partner system (Partner API upsert key).
+    external_ref: Mapped[str | None] = mapped_column(String(128), index=True)
     agency_id: Mapped[int] = mapped_column(ForeignKey("rec_agencies.id", ondelete="CASCADE"), index=True)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     industry: Mapped[str | None] = mapped_column(String(120))
@@ -212,11 +226,18 @@ class Role(Base, RecTimestampMixin):
 
     embedding: Mapped[list[float] | None] = mapped_column(JSON)
 
+    # Partner API: caller-supplied id (upsert key, unique per agency) and
+    # where the role was created ("app" | "partner_api").
+    external_ref: Mapped[str | None] = mapped_column(String(128), index=True)
+    source: Mapped[str] = mapped_column(String(20), default="app", server_default="app", nullable=False)
+
     agency: Mapped["Agency"] = relationship(back_populates="roles")
     client: Mapped["Client | None"] = relationship(back_populates="roles")
     shortlists: Mapped[list["Shortlist"]] = relationship(
         back_populates="role", cascade="all, delete-orphan"
     )
+
+    __table_args__ = (UniqueConstraint("agency_id", "external_ref", name="uq_rec_role_external_ref"),)
 
 
 class CandidateProfile(Base, RecTimestampMixin):
@@ -455,6 +476,31 @@ class Application(Base, RecTimestampMixin):
     # Per-application map of field-name -> visible-to-client. Missing keys
     # resolve to DEFAULT_CLIENT_VISIBILITY. Never exposes internal_notes.
     client_visibility: Mapped[dict] = mapped_column(JSON, default=dict)
+
+    # ── Partner API intake ───────────────────────────────────────────────
+    # source: "app" (recruiter-created) | "partner_api" (careers-site form or
+    # server push). source_detail holds the non-sensitive intake context
+    # (site, utm_*, consent record). processing_status tracks the async
+    # parse/score job: none | queued | processing | done | failed.
+    source: Mapped[str] = mapped_column(String(20), default="app", server_default="app", nullable=False)
+    source_detail: Mapped[dict | None] = mapped_column(JSON)
+    external_ref: Mapped[str | None] = mapped_column(String(128), index=True)
+    processing_status: Mapped[str] = mapped_column(
+        String(16), default="none", server_default="none", nullable=False
+    )
+    processing_error: Mapped[str | None] = mapped_column(String(300))
+    # Partner-collected screening answers: [{"question": str, "answer": str}]
+    form_answers: Mapped[list[dict] | None] = mapped_column(JSON)
+    cover_letter: Mapped[str | None] = mapped_column(Text)
+    # Which key/client brought this applicant in. A client-scoped key only
+    # ever reads back applications it submitted itself — agency-sourced
+    # candidates on the same role stay behind the submission/consent flow.
+    intake_api_key_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    intake_client_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    # Evidence-cited fit explanation from the async scorer:
+    #   {"reasons": [...], "gaps": [...], "breakdown": {...},
+    #    "parse_quality": {"score": 0-1, "fields_found": [...], "parsed_by_llm": bool}}
+    match_explanation: Mapped[dict | None] = mapped_column(JSON)
 
     candidate: Mapped["CandidateProfile"] = relationship()
 
@@ -980,6 +1026,158 @@ class AiInsightCache(Base):
     used_llm: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0", nullable=False)
 
 
+# ── Candidate documents (secure CV storage) ─────────────────────────────
+class CandidateDocument(Base):
+    """
+    A stored file (CV, cover letter) for an agency-owned candidate. Bytes live
+    in the StorageService (S3/MinIO/Blob in prod, local disk in dev) under
+    `recruiter/{agency_id}/candidates/{candidate_id}/`; this row is the only
+    pointer. `storage_uri` is internal and never serialised to any client.
+    """
+    __tablename__ = "rec_candidate_documents"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    agency_id: Mapped[int] = mapped_column(ForeignKey("rec_agencies.id", ondelete="CASCADE"), index=True)
+    candidate_id: Mapped[int] = mapped_column(
+        ForeignKey("rec_candidate_profiles.id", ondelete="CASCADE"), index=True
+    )
+    application_id: Mapped[int | None] = mapped_column(
+        ForeignKey("rec_applications.id", ondelete="SET NULL"), index=True
+    )
+    kind: Mapped[str] = mapped_column(String(20), default="cv", nullable=False)  # cv | cover_letter | other
+    storage_uri: Mapped[str] = mapped_column(String(700), nullable=False)
+    original_filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    content_type: Mapped[str | None] = mapped_column(String(120))
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    uploaded_via: Mapped[str] = mapped_column(String(20), default="bulk_cv", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), index=True)
+
+
+# ── Partner API ─────────────────────────────────────────────────────────
+class ApiKey(Base):
+    """
+    An agency's Partner API credential. Only an HMAC of the secret is stored;
+    the plaintext is shown once at creation. `key_prefix` (public, e.g.
+    "afk_live_3f9a1c2e") is the lookup handle. A key may be narrowed to one
+    client (client_id) so an employer's HR portal only ever sees its own roles.
+    """
+    __tablename__ = "rec_api_keys"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    agency_id: Mapped[int] = mapped_column(ForeignKey("rec_agencies.id", ondelete="CASCADE"), index=True)
+    client_id: Mapped[int | None] = mapped_column(ForeignKey("rec_clients.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)          # secret | publishable
+    environment: Mapped[str] = mapped_column(String(8), default="live", nullable=False)  # live | test
+    key_prefix: Mapped[str] = mapped_column(String(40), unique=True, index=True, nullable=False)
+    key_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    last4: Mapped[str] = mapped_column(String(4), nullable=False)
+    scopes: Mapped[list[str]] = mapped_column(JSON, default=list)
+    allowed_origins: Mapped[list[str]] = mapped_column(JSON, default=list)
+    rate_limit_per_minute: Mapped[int | None] = mapped_column(Integer)
+    created_by_recruiter_id: Mapped[int | None] = mapped_column(Integer)
+    created_by_label: Mapped[str | None] = mapped_column(String(255))
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime)
+    last_used_ip: Mapped[str | None] = mapped_column(String(64))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime)
+    revoked_reason: Mapped[str | None] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class IdempotencyRecord(Base):
+    """Replays the stored response for a repeated Idempotency-Key (24h)."""
+    __tablename__ = "rec_api_idempotency"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    agency_id: Mapped[int] = mapped_column(ForeignKey("rec_agencies.id", ondelete="CASCADE"), index=True)
+    api_key_id: Mapped[int] = mapped_column(ForeignKey("rec_api_keys.id", ondelete="CASCADE"), index=True)
+    idem_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    status_code: Mapped[int] = mapped_column(Integer, nullable=False)
+    response_body: Mapped[dict | None] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), index=True)
+
+    __table_args__ = (UniqueConstraint("api_key_id", "idem_key", name="uq_rec_api_idem_key"),)
+
+
+class ApiRequestLog(Base):
+    """Metadata-only request log (never bodies, never secrets). 30-day retention."""
+    __tablename__ = "rec_api_request_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    agency_id: Mapped[int | None] = mapped_column(ForeignKey("rec_agencies.id", ondelete="CASCADE"), index=True)
+    api_key_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    key_prefix: Mapped[str | None] = mapped_column(String(40))
+    method: Mapped[str] = mapped_column(String(8), nullable=False)
+    path: Mapped[str] = mapped_column(String(300), nullable=False)  # route template, not the raw URL
+    status_code: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+    ip: Mapped[str | None] = mapped_column(String(64))
+    origin: Mapped[str | None] = mapped_column(String(255))
+    error_code: Mapped[str | None] = mapped_column(String(60))
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), index=True)
+
+
+class WebhookEndpoint(Base, RecTimestampMixin):
+    """
+    An agency's webhook receiver. The signing secret is stored encrypted
+    (Fernet, key derived from SECRET_KEY) because we need it to sign; it is
+    shown once at creation and on explicit rotation.
+    """
+    __tablename__ = "rec_webhook_endpoints"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    agency_id: Mapped[int] = mapped_column(ForeignKey("rec_agencies.id", ondelete="CASCADE"), index=True)
+    client_id: Mapped[int | None] = mapped_column(ForeignKey("rec_clients.id", ondelete="CASCADE"), index=True)
+    url: Mapped[str] = mapped_column(String(500), nullable=False)
+    description: Mapped[str | None] = mapped_column(String(255))
+    events: Mapped[list[str]] = mapped_column(JSON, default=list)
+    secret_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
+    secret_last4: Mapped[str] = mapped_column(String(4), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1", nullable=False)
+    disabled_reason: Mapped[str | None] = mapped_column(String(255))
+    consecutive_failures: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime)
+    last_failure_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class WebhookDelivery(Base):
+    """One event delivery attempt chain. Payloads carry ids + state only, no PII."""
+    __tablename__ = "rec_webhook_deliveries"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    agency_id: Mapped[int] = mapped_column(ForeignKey("rec_agencies.id", ondelete="CASCADE"), index=True)
+    endpoint_id: Mapped[int] = mapped_column(
+        ForeignKey("rec_webhook_endpoints.id", ondelete="CASCADE"), index=True
+    )
+    event_id: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
+    event: Mapped[str] = mapped_column(String(60), nullable=False, index=True)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False, index=True)  # pending|delivered|failed|dead
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, index=True)
+    last_status_code: Mapped[int | None] = mapped_column(Integer)
+    last_error: Mapped[str | None] = mapped_column(String(300))
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), index=True)
+
+
+class IntegrationAuditEvent(Base):
+    """Who changed which credential/webhook/setting, and when."""
+    __tablename__ = "rec_integration_audit"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    agency_id: Mapped[int] = mapped_column(ForeignKey("rec_agencies.id", ondelete="CASCADE"), index=True)
+    actor: Mapped[str] = mapped_column(String(255), nullable=False)   # "owner:<email>" | "operator:<email>" | "system"
+    action: Mapped[str] = mapped_column(String(60), nullable=False)   # api_key.created, webhook.disabled, ...
+    target: Mapped[str | None] = mapped_column(String(120))
+    detail: Mapped[dict | None] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), index=True)
+
+
+
 # All recruiter tables — used to create just these on startup without touching
 # the consumer schema.
 RECRUITER_TABLES = [
@@ -1015,4 +1213,12 @@ RECRUITER_TABLES = [
     Notification.__table__,
     AiInsightCache.__table__,
     ClientShareToken.__table__,
+    # Secure documents + Partner API
+    CandidateDocument.__table__,
+    ApiKey.__table__,
+    IdempotencyRecord.__table__,
+    ApiRequestLog.__table__,
+    WebhookEndpoint.__table__,
+    WebhookDelivery.__table__,
+    IntegrationAuditEvent.__table__,
 ]

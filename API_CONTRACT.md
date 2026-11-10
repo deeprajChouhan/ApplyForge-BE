@@ -662,3 +662,166 @@ Sources: `jd` (found in title/description), `pool` (co-occurs in this agency's c
 ### Fit score v2 (`ShortlistEntry.score_breakdown`)
 Keys: `semantic` (30), `required_skills` (35), `preferred_skills` (10), `experience` (15), `title` (10).
 Re-generate shortlists to refresh scores computed by v1.
+
+---
+
+## RECRUITER — SECURE CANDIDATE DOCUMENTS
+
+CVs are stored through the StorageService (S3/MinIO/Blob; local disk in dev) under
+`recruiter/{agency}/candidates/{candidate}/`. The storage location is never returned.
+`CandidateDetailOut.source_file` is now the **original filename only** (older rows that held
+a server path are stripped to the basename).
+
+| Method | Path (under `/api/v1/recruiter`) | Notes |
+|---|---|---|
+| GET | `/agencies/{a}/candidates/{c}/documents` | `[{id, candidate_id, application_id, kind, original_filename, content_type, size_bytes, uploaded_via, created_at}]` |
+| GET | `/agencies/{a}/candidates/{c}/documents/{d}/download` | Streams the file. `Content-Disposition: attachment`, `nosniff`, `no-store`. |
+| DELETE | `/agencies/{a}/candidates/{c}` | Erasure: stored files, applications and every child row. `204`. Fires `candidate.deleted`. |
+
+Bulk ingest (`POST /agencies/{a}/candidates/ingest`) now validates each file (PDF/DOCX/DOC/TXT, ≤10 MB,
+magic bytes must match the extension, ≤50 files) and returns `400` with a reason instead of
+silently creating a profile without a file.
+
+---
+
+## RECRUITER PARTNER API v1
+
+Base: **`/api/v1/recruiter/partner/v1`**. Key-authenticated integration surface for agencies and
+their clients. Everything is agency-scoped; ids are opaque GUIDs (raw ints → `404`).
+
+### Authentication
+* `Authorization: Bearer <key>` (or `X-ApplyForge-Key: <key>`). **Never** in the URL — a key-like
+  query parameter returns `400 key_in_url`.
+* **Secret key** `afk_live_…` / `afk_test_…` — server-to-server. Refused (`403 secret_key_in_browser`)
+  when the request carries an `Origin` header.
+* **Publishable key** `afp_live_…` — browser careers forms. Scopes are capped at `jobs:read_public` +
+  `applications:create`; the request `Origin` must exactly match the key's allow-list.
+* **Client-scoped key** — narrowed to one client: only that client's jobs, and only applications that
+  client's keys submitted. It can edit/close only jobs it created through the API (agency-created
+  jobs → `403 agency_managed_job`). Its submissions never link to an agency-sourced profile: if the
+  email already exists in the agency pool, a separate profile is created and the recruiter is told
+  to review/merge — the client never sees the agency's record. Pipeline counts on `GET /jobs/{id}`
+  count only its own applicants. Max scopes: `jobs:read`, `jobs:write`, `jobs:read_public`,
+  `applications:read`, `applications:create`, `documents:read`.
+* **Test keys** (`*_test_*`) validate and dry-run writes (`{"test_mode": true, "valid": true}`) and
+  cannot read private data (`403 test_key_private_read`).
+* API access = plan feature `partner_api` (Pro/Enterprise) unless the operator overrides it
+  (`plan` | `enabled` | `disabled`). Suspended/pending agencies → `403`. Trial-locked → writes `402`.
+
+Errors: `{"detail": {"error": "<code>", "message": "<text>"}}`. Common codes: `unauthenticated`,
+`invalid_key`, `insufficient_scope`, `origin_not_allowed`, `rate_limited`, `not_found`,
+`agency_key_required`, `job_closed`, `invalid_application`, `invalid_resume`, `idempotency_mismatch`.
+
+Request size: bodies over 11 MB → `413`; chunked bodies without `Content-Length` → `411`.
+Pre-auth limit: 600 requests/min per IP (IPv6 grouped by /64) before any key lookup.
+
+Rate limits: per key per minute (default 120 secret / 30 publishable; owner may lower, operator may
+raise). Public application submissions are additionally limited per client IP per hour (default 20).
+Every response carries `X-RateLimit-Limit/Remaining/Reset`; `429` carries `Retry-After`.
+
+Idempotency: send `Idempotency-Key` (1–128 chars `[A-Za-z0-9-_.:]`) on POSTs with a secret key. The
+same key + same body replays the stored response (`Idempotent-Replayed: true`) for 24 h; same key +
+different body → `422 idempotency_mismatch`.
+
+Pagination: `limit` (≤100, default 50) + `offset` → `{data: [...], has_more, next_offset}`.
+
+### Scopes
+`jobs:read`, `jobs:write`, `jobs:read_public`, `applications:read`, `applications:create`,
+`applications:write`, `candidates:read`, `candidates:write`, `candidates:delete`, `documents:read`,
+`clients:read`, `clients:write`, `matching:run`, `usage:read`.
+Default secret key = all except `candidates:delete` (erasure must be granted explicitly).
+
+### Endpoints
+| Method | Path | Scope | Notes |
+|---|---|---|---|
+| GET | `/me` | any | Key name/prefix/kind/env, agency, client scope, scopes, rate limit. Connection test. |
+| GET | `/meta` | any | Pipeline stages, webhook events, scope descriptions. |
+| GET | `/public/jobs` · `/public/jobs/{job_id}` | `jobs:read_public` | Open, published jobs: title, description, type, location, country, seniority, skills, salary range, currency, posted_at. **No** client, budget or notes. |
+| GET | `/jobs` | `jobs:read` | Filters `status`, `external_ref`, `updated_since`. |
+| GET | `/jobs/{job_id}` | `jobs:read` | Adds `pipeline: {stage: count}`. |
+| POST | `/jobs` | `jobs:write` | `JobCreate` (below). `201`. `409` if `external_ref` exists. |
+| PUT | `/jobs/by-external-ref/{external_ref}` | `jobs:write` | Upsert by your own id. `201` created / `200` updated. |
+| PATCH | `/jobs/{job_id}` | `jobs:write` | Partial update. |
+| POST | `/jobs/{job_id}/close?status=closed\|filled\|on_hold` | `jobs:write` | Fires `job.closed`. |
+| POST | `/jobs/parse` | `jobs:write` | `{text}` → `{used_llm, draft}`; nothing saved. |
+| POST | `/jobs/{job_id}/applications` | `applications:create` | **multipart** (below). `202`. |
+| GET | `/applications` | `applications:read` | Filters `job_id`, `stage`, `updated_since`. |
+| GET | `/applications/{application_id}` | `applications:read` | Stage, processing status, fit score, `match {reasons, gaps, breakdown, parse_quality}`. |
+| GET | `/applications/{application_id}/status` | `applications:read` | Interviews (stage/type/status/time/tz/duration), offers (status), placement (status, start date). No fees, notes or compensation. |
+| POST | `/applications/{application_id}/stage` | `applications:write` (agency key) | `{stage, reason?}`. Non-optimistic: response is stored state. |
+| POST | `/applications/{application_id}/notes` | `applications:write` (agency key) | `{body}` ≤5000. |
+| POST | `/jobs/{job_id}/pipeline?candidate_id=` | `applications:write` (agency key) | Put an existing pool candidate on a job at `sourced`. |
+| GET | `/applications/{application_id}/documents` | `documents:read` | Metadata. |
+| GET | `/documents/{document_id}/download` | `documents:read` | Streams the file (no shareable URL is ever minted). |
+| GET | `/candidates/{candidate_id}` | `candidates:read` (agency key) | Name, email, phone, headline, location, YoE, skills, LinkedIn, source, documents. |
+| POST | `/candidates` | `candidates:write` (agency key) | multipart: `email` (req), `full_name`, `phone`, `headline`, `location`, `linkedin_url`, `resume`. Dedupes on email (`200 {created:false}`). |
+| DELETE | `/candidates/{candidate_id}` | `candidates:delete` (agency key) | GDPR erasure → `{erased, files_removed, applications_removed}`. |
+| GET / POST | `/clients` | `clients:read` / `clients:write` (agency key) | `{name, industry?, website?, external_ref?}` |
+| PUT | `/clients/by-external-ref/{external_ref}` | `clients:write` (agency key) | Upsert. |
+| POST | `/jobs/{job_id}/match?limit=25` | `matching:run` (agency key) | Runs inverted matching → ranked entries with `reasons`, `gaps`, `breakdown`. Metered. |
+| GET | `/jobs/{job_id}/shortlist` | `matching:run` (agency key) | Latest shortlist. |
+| GET | `/usage` | `usage:read` (agency key) | This month's metered actions + request count. |
+| GET | `/feeds/{agency_slug}/jobs.xml` | none | Indeed-style XML of open jobs. **Off by default**; owner toggles it. Public job fields only. |
+
+`JobCreate` / `JobWrite` (extra fields rejected):
+`title` (req on create), `description` ≤20000, `status` (open|on_hold|filled|closed), `is_draft`,
+`employment_type` (full_time|part_time|contract|internship|temporary), `location`,
+`country_code` (ISO-2), `seniority`, `required_skills[]`, `preferred_skills[]` (≤50 × ≤60 chars),
+`min_years_experience` (0–60), `salary_min`, `salary_max`, `currency` (ISO-3), `client_id` or
+`client_external_ref` (agency keys; client keys are pinned to their client), `external_ref`
+(`[A-Za-z0-9._:-]{1,128}`). If `description` is given without skills, structured fields are filled in
+the background from the description (empty fields only).
+
+Application form (multipart):
+`resume` (file, req — PDF/DOCX/DOC/TXT ≤10 MB, magic bytes checked), `first_name`, `last_name`,
+`email` (req), `consent=true` (req), `privacy_notice_version` (req), `phone`, `linkedin_url`
+(`https://linkedin.com/…`), `location`, `cover_letter` ≤10000, `answers` (JSON array of
+`{question, answer}`, ≤30), `consent_text`, `source_site`, `utm_source|medium|campaign`,
+`external_ref`, `captcha_token` (required for publishable keys when Turnstile is configured).
+
+Behaviour: dedupes the candidate on email within the agency. A **new** profile is enriched from the
+CV; an **existing** profile is never modified by the form (the new CV is attached for the recruiter).
+Creates the application at `sourced` with `source=partner_api`, records consent (notice version,
+text hash, timestamp, IP), stores the CV, notifies the agency, meters `api_application_received`,
+then parses + scores in the background and fires `application.processed`.
+Responses: secret key → `202 {application_id, candidate_id, job_id, stage, processing_status}`
+(duplicate → `200 … duplicate: true`); publishable key → always `202 {"status": "received"}` so a
+browser can't probe which emails already exist.
+
+### Webhooks
+Events: `job.created`, `job.updated`, `job.closed`, `application.created`, `application.processed`,
+`application.stage_changed`, `candidate.deleted`, `shortlist.completed` (+ `ping` from the test button).
+Payload (ids and state only, never PII): `{"id": "evt_…", "type": "...", "created_at": "...Z", "data": {"application_id": "<guid>", "job_id": "<guid>", "stage": "screening", ...}}`.
+Headers: `ApplyForge-Event`, `ApplyForge-Delivery`, `ApplyForge-Signature: t=<unix>,v1=<hex>` where
+`v1 = HMAC_SHA256(secret, "<t>." + raw_body)`. Reject if |now − t| > 300 s.
+Targets: https, public IPs only (re-checked at delivery), no redirects followed, 5 s timeout.
+Retries at 1m, 5m, 15m, 1h, 3h, 6h, 12h, 24h; endpoint auto-disables after 20 consecutive failures.
+Client-scoped endpoints receive `job.*` for that client's jobs and `application.*` only for
+applicants that client submitted — never agency-sourced candidates, shortlists or erasures.
+Delivery pins the validated IP (no DNS rebinding), ignores proxy env vars, and reports only
+coarse errors (`blocked`, `timeout`, `connection_failed`, or the HTTP status).
+
+### Management — agency owner (`/api/v1/recruiter/agency/integrations`, recruiter owner token)
+`GET ""` overview · `PATCH /settings {public_job_feed_enabled}` ·
+`GET|POST /api-keys` · `PATCH /api-keys/{key_id}` · `POST /api-keys/{key_id}/revoke {reason?}` ·
+`POST /api-keys/{key_id}/roll` · `GET|POST /webhooks` · `PATCH|DELETE /webhooks/{webhook_id}` ·
+`POST /webhooks/{webhook_id}/rotate-secret` · `POST /webhooks/{webhook_id}/test` ·
+`GET /webhook-deliveries?webhook_id&status` · `POST /webhook-deliveries/{delivery_id}/retry` ·
+`GET /request-logs?errors_only&key_prefix` · `GET /audit`.
+Create key: `{name, kind: secret|publishable, environment: live|test, scopes?, client_id?, allowed_origins[], expires_in_days? (1–730), rate_limit_per_minute?}` → includes `secret` **once**.
+Create webhook → includes signing `secret` **once**. Limits: 25 active keys, 10 webhooks per agency.
+
+### Management — operator (`/api/v1/recruiter/admin/integrations`, consumer admin token)
+`GET /agencies` (per-agency access/limits/keys/webhooks/24h traffic) ·
+`GET|PATCH /agencies/{agency_id}` `{partner_api_access: plan|enabled|disabled, partner_api_rate_limit, clear_rate_limit}` ·
+`GET /agencies/{agency_id}/api-keys` · `PATCH /agencies/{agency_id}/api-keys/{key_id}` `{rate_limit_per_minute}` only ·
+`POST /agencies/{agency_id}/api-keys/{key_id}/revoke` · `GET /agencies/{agency_id}/webhooks` ·
+`PATCH /agencies/{agency_id}/webhooks/{webhook_id}` `{is_active}` only · `GET /agencies/{agency_id}/webhook-deliveries` ·
+`GET /agencies/{agency_id}/request-logs` · `GET /agencies/{agency_id}/audit` ·
+`POST /maintenance/backfill-cv-files` (moves legacy CV files into secure storage; idempotent).
+Operators **cannot create keys**, widen scopes/origins, or repoint webhooks — they can only
+toggle access, tune rate limits, revoke keys and disable/enable endpoints. Secrets are only ever
+shown to the agency owner who creates them. Erasure fails closed (`503 erasure_incomplete`) if a
+stored file can't be deleted, and also removes notifications/tasks tied to the candidate and
+clears the agency's AI insight cache. `POST /jobs/parse` and background JD enrichment are metered
+as `api_jd_parsed`; test keys never trigger LLM calls.

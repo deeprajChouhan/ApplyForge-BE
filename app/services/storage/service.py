@@ -53,14 +53,20 @@ class LocalStorageService:
         logger.debug("local_upload key=%s/%s bytes=%d", key_prefix, key, len(content))
         return f"local://{key_prefix}/{key}"
 
-    def download_bytes(self, uri: str) -> bytes:
+    def _safe_path(self, uri: str) -> Path:
+        """Resolve a local:// uri, refusing anything that escapes the upload root."""
         _, _, tail = uri.partition("local://")
-        return (self.base / tail).read_bytes()
+        path = (self.base / tail).resolve()
+        if path != self.base and self.base not in path.parents:
+            raise ValueError("Storage path escapes the upload root")
+        return path
+
+    def download_bytes(self, uri: str) -> bytes:
+        return self._safe_path(uri).read_bytes()
 
     def delete_file(self, uri: str) -> None:
         try:
-            _, _, tail = uri.partition("local://")
-            path = self.base / tail
+            path = self._safe_path(uri)
             if path.exists():
                 path.unlink()
         except Exception as exc:

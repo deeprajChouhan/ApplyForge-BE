@@ -104,6 +104,34 @@ def start_scheduler() -> None:
         misfire_grace_time=300,
     )
 
+    # Recruiter Partner API (inline backend only — Celery beat covers these
+    # when PARTNER_JOBS_BACKEND=celery): webhook retries + log retention.
+    try:
+        from app.core.config import settings as _settings
+        from apscheduler.triggers.interval import IntervalTrigger
+
+        if (_settings.partner_jobs_backend or "inline").lower() != "celery":
+            from app.recruiter.partner.jobs import deliver_webhooks_now, purge_old_logs
+
+            _scheduler.add_job(
+                deliver_webhooks_now,
+                trigger=IntervalTrigger(seconds=60),
+                id="partner_webhook_retries",
+                name="Partner API — webhook retries (every 60s)",
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+            )
+            _scheduler.add_job(
+                purge_old_logs,
+                trigger=CronTrigger(hour=3, minute=17, timezone="UTC"),
+                id="partner_log_retention",
+                name="Partner API — log retention (03:17 UTC)",
+                replace_existing=True,
+            )
+    except Exception as exc:  # never block crawler scheduling
+        logger.warning("partner_scheduler_jobs_failed error=%s", exc)
+
     _scheduler.start()
     logger.info(
         "scheduler_started jobs=%s",
