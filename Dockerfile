@@ -58,7 +58,10 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 # Playwright's own installer pulls Chromium into /ms-playwright and
 # reports the OS packages it still needs. `install-deps` is a thin
 # wrapper that apt-installs them (fonts, libnss, libatk, etc.).
-RUN python -m playwright install --with-deps chromium \
+# Playwright's bundled Node needs libatomic1, which python:*-slim lacks — and
+# `--with-deps` can't install it because Node must run first. Install it up front.
+RUN apt-get update && apt-get install -y --no-install-recommends libatomic1 \
+    && python -m playwright install --with-deps chromium \
     && rm -rf /var/lib/apt/lists/*
 
 # Playwright caches browsers under /ms-playwright by default. Make sure
