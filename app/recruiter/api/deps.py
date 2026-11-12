@@ -27,6 +27,7 @@ from app.models.models import User
 from app.recruiter.enums import RecruiterSeatRole, plan_has_feature
 from app.recruiter.models import Agency, Recruiter
 from app.recruiter.services import access as access_service
+from app.recruiter.services import role_visibility
 
 RECRUITER_ACCESS = "recruiter_access"
 RECRUITER_REFRESH = "recruiter_refresh"
@@ -73,6 +74,7 @@ def get_current_recruiter(
     recruiter = db.get(Recruiter, recruiter_id)
     if recruiter is None or not recruiter.is_active:
         raise cred_exc
+    role_visibility.bind_viewer(db, recruiter)
     return recruiter
 
 
@@ -109,6 +111,8 @@ def get_agency(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="You do not have access to this agency",
             )
+        # Owner-controlled per-seat role visibility (enforced on this Session).
+        role_visibility.bind_viewer(db, recruiter)
     elif ttype == "access":
         # Consumer token — only platform admins may act on recruiter data.
         try:
@@ -117,6 +121,7 @@ def get_agency(
             user = None
         if user is None or user.role != UserRole.admin:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Operator access required")
+        db.info.pop(role_visibility.VIEWER_KEY, None)  # operators see everything
     else:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token type")
 

@@ -1178,6 +1178,38 @@ class IntegrationAuditEvent(Base):
 
 
 
+# ── Per-recruiter role visibility ───────────────────────────────────────
+class RecruiterRoleRestriction(Base):
+    """
+    Presence of a row = this seat only sees the roles granted to it in
+    rec_recruiter_role_grants (plus roles it creates). No row = sees every
+    role in the agency (the default). Owners are never restricted.
+    """
+    __tablename__ = "rec_recruiter_role_restrictions"
+
+    recruiter_id: Mapped[int] = mapped_column(
+        ForeignKey("rec_recruiters.id", ondelete="CASCADE"), primary_key=True
+    )
+    agency_id: Mapped[int] = mapped_column(ForeignKey("rec_agencies.id", ondelete="CASCADE"), index=True)
+    set_by_recruiter_id: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class RecruiterRoleGrant(Base):
+    """A role a restricted seat is allowed to see."""
+    __tablename__ = "rec_recruiter_role_grants"
+    __table_args__ = (UniqueConstraint("recruiter_id", "role_id", name="uq_rec_role_grant"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    agency_id: Mapped[int] = mapped_column(ForeignKey("rec_agencies.id", ondelete="CASCADE"), index=True)
+    recruiter_id: Mapped[int] = mapped_column(
+        ForeignKey("rec_recruiters.id", ondelete="CASCADE"), index=True
+    )
+    role_id: Mapped[int] = mapped_column(ForeignKey("rec_roles.id", ondelete="CASCADE"), index=True)
+    granted_by_recruiter_id: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
 # All recruiter tables — used to create just these on startup without touching
 # the consumer schema.
 RECRUITER_TABLES = [
@@ -1221,4 +1253,7 @@ RECRUITER_TABLES = [
     WebhookEndpoint.__table__,
     WebhookDelivery.__table__,
     IntegrationAuditEvent.__table__,
+    # Per-recruiter role visibility
+    RecruiterRoleRestriction.__table__,
+    RecruiterRoleGrant.__table__,
 ]

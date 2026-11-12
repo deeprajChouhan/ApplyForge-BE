@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import datetime
 
 from fastapi import (
@@ -461,6 +462,49 @@ def _maybe_enrich_role(background: BackgroundTasks, role: Role) -> None:
         background.add_task(partner_jobs.enrich_role_from_description, role.id)
 
 
+def _slug(value: str | None) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", (value or "").strip().lower()).strip("-")
+
+
+def _find_unlinked_role(db: Session, ctx: PartnerContext, external_ref: str, title: str | None) -> Role | None:
+    """
+    A careers site usually keys jobs by a slug of the title. If the agency
+    already created that role in the app (so it has no external_ref yet),
+    link to it instead of creating a duplicate. Only adopts when exactly one
+    role matches — ambiguity falls through to create. Client-scoped keys may
+    not take over app-created roles, so they never adopt.
+    """
+    if ctx.client_id is not None:
+        return None
+    ref_slug = _slug(external_ref)
+    title_slug = _slug(title)
+    rows = (
+        db.query(Role)
+        .filter(Role.agency_id == ctx.agency_id, Role.external_ref.is_(None))
+        .all()
+    )
+    matches = [r for r in rows if _slug(r.title) in {ref_slug, title_slug} - {""}]
+    open_matches = [r for r in matches if _accepting(r)]
+    if len(open_matches) == 1:
+        return open_matches[0]
+    if not open_matches and len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _only_missing_fields(role: Role, payload: S.JobWrite) -> S.JobWrite:
+    """Drop payload fields the role already has a value for."""
+    keep = {}
+    for k in payload.model_fields_set:
+        if k in ("client_id", "client_external_ref", "external_ref", "title"):
+            continue
+        attr = "budget_currency" if k == "currency" else k
+        current = getattr(role, attr, None)
+        if current in (None, "", []):
+            keep[k] = getattr(payload, k)
+    return S.JobWrite.model_construct(_fields_set=set(keep), **keep)
+
+
 @router.put("/jobs/by-external-ref/{external_ref}", response_model=S.JobOut)
 def upsert_job(
     external_ref: str,
@@ -481,7 +525,11 @@ def upsert_job(
     ):
         # Exists for another client of this agency — don't reveal or clobber it.
         raise _err(409, "duplicate_external_ref", "This external_ref is already in use.")
-    if role is not None:
+    adopted = False
+    if role is None:
+        role = _find_unlinked_role(db, ctx, external_ref, payload.title)
+        adopted = role is not None
+    if role is not None and not adopted:
         _assert_client_may_write(ctx, role)
     client_id = _resolve_client_id(db, ctx, payload)
     if role is None and not payload.title:
@@ -495,9 +543,16 @@ def upsert_job(
         role = Role(agency_id=ctx.agency_id, title=payload.title, source="partner_api", status=RoleStatus.open)
         db.add(role)
     role.external_ref = external_ref
-    if client_id is not ...:
-        role.client_id = client_id
-    reembed = _apply_job_fields(role, payload)
+    if adopted:
+        # First sync against a role the agency built in the app: link it, but
+        # only fill gaps — never overwrite what the recruiter wrote.
+        if client_id is not ... and role.client_id is None:
+            role.client_id = client_id
+        reembed = _apply_job_fields(role, _only_missing_fields(role, payload))
+    else:
+        if client_id is not ...:
+            role.client_id = client_id
+        reembed = _apply_job_fields(role, payload)
     if created or reembed:
         role.embedding = embed_role(role)
     db.flush()

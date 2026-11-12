@@ -546,6 +546,32 @@ def update_role(
     for k in ("title", "description", "seniority"):
         if k in data:
             reembed = True
+    if "external_ref" in data:
+        from app.recruiter.partner.schemas import _clean_ref
+
+        ref = (data["external_ref"] or "").strip() or None
+        if ref is not None:
+            try:
+                ref = _clean_ref(ref)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc))
+            from app.recruiter.services import role_visibility
+
+            clash = (
+                db.query(Role)
+                .filter(Role.agency_id == agency.id, Role.external_ref == ref, Role.id != role.id)
+                .execution_options(**{role_visibility.SKIP_OPTION: True})  # must see hidden roles to stay unique
+                .first()
+            )
+            if clash is not None:
+                visible = role_visibility.visible_role_ids(db)
+                if visible is not None and clash.id not in visible:
+                    raise HTTPException(status_code=409, detail=f"Portal reference '{ref}' is already in use.")
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Portal reference '{ref}' is already linked to role \"{clash.title}\". Unlink it there first.",
+                )
+        data["external_ref"] = ref
 
     prev_status = role.status
     for k, v in data.items():

@@ -809,3 +809,47 @@ def test_job_applicants_ranked_with_evidence_and_scoped(client, ctx):
     assert client.get(f"{P}/jobs/{job['id']}/applicants?stage=all&sort=applied_at", headers=H(ck)).status_code == 200
     # another client's / agency's job is invisible
     assert client.get(f"{P}/jobs/{ctx['role_id']}/applicants", headers=H(ck)).status_code == 404
+
+
+# ── Careers-site sync adopts roles created in the app ─────────────────
+def test_upsert_links_existing_app_role_instead_of_duplicating(client, ctx):
+    h = H(ctx["secret"])
+    owner_h = ctx["owner_h"]
+    base = f"{BASE}/agencies/{ctx['agency_id']}/roles"
+    made = client.post(base, headers=owner_h, json={
+        "title": "Core Automotive Embedded Software Developer",
+        "description": "Recruiter-written spec", "required_skills": ["Embedded C", "MATLAB"]}).json()
+    r = client.put(f"{P}/jobs/by-external-ref/core-automotive-embedded-software-developer", headers=h, json={
+        "title": "Core Automotive Embedded Software Developer", "description": "Portal copy",
+        "location": "Dubai"})
+    assert r.status_code == 200, r.text            # updated, not created
+    job = r.json()
+    assert job["external_ref"] == "core-automotive-embedded-software-developer"
+    assert job["description"] == "Recruiter-written spec"   # recruiter content kept
+    assert job["location"] == "Dubai"                          # gap filled
+    role = client.get(f"{base}/{made['id']}", headers=owner_h).json()
+    assert role["external_ref"] == "core-automotive-embedded-software-developer"
+    # Applications from the portal land on that same role
+    assert apply(client, job["id"], ctx["pub"], email="portal@example.com").status_code == 202
+    # A second sync hits the linked role directly
+    assert client.put(f"{P}/jobs/by-external-ref/core-automotive-embedded-software-developer",
+                      headers=h, json={"title": "Core Automotive Embedded Software Developer"}).json()["id"] == job["id"]
+
+
+def test_upsert_does_not_adopt_when_ambiguous(client, ctx):
+    h = H(ctx["secret"])
+    base = f"{BASE}/agencies/{ctx['agency_id']}/roles"
+    for _ in range(2):
+        client.post(base, headers=ctx["owner_h"], json={"title": "Twin Role"})
+    r = client.put(f"{P}/jobs/by-external-ref/twin-role", headers=h, json={"title": "Twin Role"})
+    assert r.status_code == 201 and r.json()["source"] == "partner_api"
+
+
+def test_recruiter_can_set_and_clear_portal_reference(client, ctx):
+    base = f"{BASE}/agencies/{ctx['agency_id']}/roles"
+    a = client.post(base, headers=ctx["owner_h"], json={"title": "Ref A"}).json()
+    b = client.post(base, headers=ctx["owner_h"], json={"title": "Ref B"}).json()
+    assert client.patch(f"{base}/{a['id']}", headers=ctx["owner_h"], json={"external_ref": "job-77"}).json()["external_ref"] == "job-77"
+    assert client.patch(f"{base}/{b['id']}", headers=ctx["owner_h"], json={"external_ref": "job-77"}).status_code == 409
+    assert client.patch(f"{base}/{a['id']}", headers=ctx["owner_h"], json={"external_ref": "bad ref!"}).status_code == 422
+    assert client.patch(f"{base}/{a['id']}", headers=ctx["owner_h"], json={"external_ref": ""}).json()["external_ref"] is None

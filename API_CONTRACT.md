@@ -826,3 +826,63 @@ shown to the agency owner who creates them. Erasure fails closed (`503 erasure_i
 stored file can't be deleted, and also removes notifications/tasks tied to the candidate and
 clears the agency's AI insight cache. `POST /jobs/parse` and background JD enrichment are metered
 as `api_jd_parsed`; test keys never trigger LLM calls.
+
+### Job sync — linking to roles built in the app (2026-11-11)
+
+`PUT /jobs/by-external-ref/{ref}`: when no role carries `ref` yet, the API first looks for exactly one
+role in the agency with **no** `external_ref` whose title slug equals `ref` (or the payload's `title`),
+preferring open roles. If found it is **linked** (returns `200`, not `201`) and only empty fields are
+filled from the payload — recruiter-written content is never overwritten on that first sync. Zero or
+several matches → a new `partner_api` role is created as before. Client-scoped keys never link.
+
+Recruiters can set/clear the link on `PATCH /agencies/{agency_id}/roles/{role_id}` with
+`external_ref` (`""`/`null` clears; `409` if another role in the agency already holds it; `422` on bad
+characters). `RoleOut` now includes `external_ref` and `source`.
+
+---
+
+## RECRUITER — OPERATOR OPS TOOLS
+
+Base: `/api/v1/recruiter/admin/ops` · consumer admin token (`require_admin`) · ids are public GUIDs.
+Every write is appended to `rec_integration_audit` as `operator:<email>`
+(actions `role.merged`, `role.external_ref_set`, `role.external_ref_cleared`).
+Admin UI: **Admin → Operations → Ops tools** (`/admin/ops`).
+
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/agencies/{agency_id}/roles?q=` | Search by title or careers-site ref. Returns `OpsRole[]` (`id, title, status, is_draft, source, external_ref, client_id, location, applications, created_at`). |
+| GET | `/agencies/{agency_id}/duplicate-roles` | Groups of ≥2 roles whose titles slug to the same key: `{key, title, suggested_keep_id, has_portal_copy, roles: OpsRole[]}`. Suggested keep = the app-built role, else the oldest. |
+| POST | `/agencies/{agency_id}/roles/merge` | Body `{source_role_id, target_role_id, move_external_ref=true, delete_source=false, rescore=true, dry_run=true}`. **`dry_run` defaults to true** — returns the plan and writes nothing. With `dry_run=false`: moves the careers-site ref (if asked), moves applications and their consents / submissions / interviews / offers / placements to the target, rescores moved applications against the target spec, optionally deletes the source. Applications whose candidate is already on the target are left on the source (`clashes`). Response: `{source, target, applications_to_move, clashes, related_rows, role_only_rows, warnings, applied, rescored, …options}`. Errors: `422` same role; `409` target already linked to a different ref, or `delete_source` with clashes; `404` role not in agency. |
+| PATCH | `/agencies/{agency_id}/roles/{role_id}/external-ref` | Body `{external_ref: string \| null}`. Link / unlink. `409` if held by another role, `422` bad characters. Returns `OpsRole`. |
+| GET | `/agencies/{agency_id}/history?limit=50` | Ops audit rows for the agency: `{id, actor, action, target, detail, created_at}`. |
+
+CLI fallback when the API is down: `python scripts/merge_duplicate_role.py --ref <ref> [--apply]`.
+
+---
+
+## RECRUITER — PER-RECRUITER ROLE VISIBILITY (2026-11-12)
+
+Agency owners decide which roles each recruiter seat can see (Team & plan → **Role access**).
+
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/api/v1/recruiter/agency/team` | Each member now carries `role_access` (`"all"` \| `"selected"`) and `granted_roles` (count). |
+| GET | `/api/v1/recruiter/agency/team/{member_id}/role-access` | Owner only. `{recruiter_id, mode, is_owner, roles: [{id, title, status, client_name, granted}]}` — every role in the agency with whether this seat can see it. |
+| PUT | `/api/v1/recruiter/agency/team/{member_id}/role-access` | Owner only. Body `{mode: "all" \| "selected", role_ids: [...]}`. `400` for an owner seat (owners always see everything); `404` if any role isn't in the agency. Grants are kept when switching to `all`, so switching back restores them. |
+
+**Semantics**
+- `all` (default for every seat) — sees every role, including new ones.
+- `selected` — sees only granted roles plus roles the seat creates itself (auto-granted). New roles stay hidden until granted.
+- Owners, platform operators, partner-API keys, public share links and background jobs are never restricted.
+
+**Enforcement** — `app/recruiter/services/role_visibility.py`, bound in `get_agency` / `get_current_recruiter`.
+For a restricted seat every ORM statement on the request Session is filtered (`with_loader_criteria`):
+`Role` by id; every `rec_*` model with `role_id`; every model with a FK to a role-bearing table
+(`application_id`, `shortlist_id`, `submission_id`, `interview_id`, `offer_id`, `placement_id`, …);
+`Notification` / `RecruiterTask` by their `parent_kind`/`parent_id`; `AiInsightCache` hidden entirely.
+Lists, detail lookups, aggregates/dashboards and lazy relationships all drop hidden data; hidden ids
+return `404`; writes that point a row at a hidden role/application are rejected with `404`.
+The candidate pool itself is shared — only a candidate's applications/journey on hidden roles is hidden.
+
+Storage: `rec_recruiter_role_restrictions` (row = seat is restricted) and `rec_recruiter_role_grants`
+(Alembic `0036_recruiter_role_visibility`; also created at boot). No existing tables change.

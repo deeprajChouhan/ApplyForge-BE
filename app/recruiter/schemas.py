@@ -364,6 +364,29 @@ class RecruiterAdminOut(ORMModel):
     role: RecruiterSeatRole
     is_active: bool
     created_at: datetime | None = None
+    # Owner-controlled role visibility: "all" (default) or "selected".
+    role_access: str = "all"
+    granted_roles: int = 0
+
+
+class RoleAccessRole(BaseModel):
+    id: int
+    title: str
+    status: str | None
+    client_name: str | None = None
+    granted: bool
+
+
+class RoleAccessOut(BaseModel):
+    recruiter_id: int
+    mode: str  # "all" | "selected"
+    is_owner: bool
+    roles: list[RoleAccessRole]
+
+
+class RoleAccessUpdate(BaseModel):
+    mode: str = Field(pattern="^(all|selected)$")
+    role_ids: list[int] = Field(default_factory=list, max_length=5000)
 
 
 # ── Role ──────────────────────────────────────────────────────────────────
@@ -484,6 +507,8 @@ class RoleUpdate(BaseModel):
     budget_currency: str | None = None
     is_draft: bool | None = None
     notes: str | None = None
+    # Careers-site / ATS job id this role is synced with. "" clears the link.
+    external_ref: str | None = Field(default=None, max_length=128)
 
 
 class RoleOut(ORMModel):
@@ -507,6 +532,8 @@ class RoleOut(ORMModel):
     is_draft: bool = False
     market_snapshot: dict | None = None
     notes: str | None = None
+    external_ref: str | None = None
+    source: str | None = None
 
 
 # ── Candidate ─────────────────────────────────────────────────────────────

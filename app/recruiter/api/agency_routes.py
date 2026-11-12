@@ -19,7 +19,16 @@ from app.db.session import get_db
 from app.recruiter.api.admin_routes import _recruiter_out, effective_seat_limit
 from app.recruiter.api.deps import require_owner
 from app.recruiter.enums import PLAN_FEATURES, InviteStatus, RecruiterSeatRole
-from app.recruiter.models import Agency, AgencyInvite, Recruiter, SpecSheetTemplate
+from app.recruiter.models import (
+    Agency,
+    AgencyInvite,
+    Client,
+    Recruiter,
+    RecruiterRoleGrant,
+    RecruiterRoleRestriction,
+    Role,
+    SpecSheetTemplate,
+)
 from app.recruiter.schemas import (
     AgencyBrandingUpdate,
     AgencyOverviewOut,
@@ -29,6 +38,9 @@ from app.recruiter.schemas import (
     InviteOut,
     RecruiterAdminOut,
     RecruiterPasswordReset,
+    RoleAccessOut,
+    RoleAccessRole,
+    RoleAccessUpdate,
     SpecSheetTemplateCreate,
     SpecSheetTemplateOut,
     SpecSheetTemplateUpdate,
@@ -274,6 +286,28 @@ def revoke_invite(invite_id: int, owner: Recruiter = Depends(require_owner), db:
     db.commit()
 
 
+def _team_out(db: Session, members: list[Recruiter]) -> list[RecruiterAdminOut]:
+    ids = [m.id for m in members]
+    restricted = {
+        r for (r,) in db.query(RecruiterRoleRestriction.recruiter_id)
+        .filter(RecruiterRoleRestriction.recruiter_id.in_(ids)).all()
+    } if ids else set()
+    grants = dict(
+        db.query(RecruiterRoleGrant.recruiter_id, func.count(RecruiterRoleGrant.id))
+        .filter(RecruiterRoleGrant.recruiter_id.in_(ids))
+        .group_by(RecruiterRoleGrant.recruiter_id)
+        .all()
+    ) if ids else {}
+    out = []
+    for m in members:
+        row = _recruiter_out(m)
+        if m.id in restricted and m.role != RecruiterSeatRole.owner:
+            row.role_access = "selected"
+            row.granted_roles = int(grants.get(m.id, 0))
+        out.append(row)
+    return out
+
+
 @router.get("/team", response_model=list[RecruiterAdminOut])
 def list_team(owner: Recruiter = Depends(require_owner), db: Session = Depends(get_db)):
     members = (
@@ -282,7 +316,89 @@ def list_team(owner: Recruiter = Depends(require_owner), db: Session = Depends(g
         .order_by(Recruiter.id.desc())
         .all()
     )
-    return [_recruiter_out(m) for m in members]
+    return _team_out(db, members)
+
+
+def _role_access_out(db: Session, owner: Recruiter, member: Recruiter) -> RoleAccessOut:
+    is_owner = member.role == RecruiterSeatRole.owner
+    restricted = not is_owner and db.get(RecruiterRoleRestriction, member.id) is not None
+    granted = {
+        r for (r,) in db.query(RecruiterRoleGrant.role_id).filter(RecruiterRoleGrant.recruiter_id == member.id).all()
+    }
+    rows = (
+        db.query(Role, Client.name)
+        .outerjoin(Client, Client.id == Role.client_id)
+        .filter(Role.agency_id == owner.agency_id)
+        .order_by(Role.status, Role.title)
+        .all()
+    )
+    return RoleAccessOut(
+        recruiter_id=member.id,
+        mode="selected" if restricted else "all",
+        is_owner=is_owner,
+        roles=[
+            RoleAccessRole(
+                id=r.id, title=r.title, status=r.status.value if r.status else None,
+                client_name=cname, granted=(r.id in granted) if restricted else True,
+            )
+            for r, cname in rows
+        ],
+    )
+
+
+@router.get("/team/{member_id}/role-access", response_model=RoleAccessOut)
+def get_role_access(member_id: int, owner: Recruiter = Depends(require_owner), db: Session = Depends(get_db)):
+    """Which roles this seat can see. Owners always see every role."""
+    return _role_access_out(db, owner, _load_member(db, owner, member_id))
+
+
+@router.put("/team/{member_id}/role-access", response_model=RoleAccessOut)
+def set_role_access(
+    member_id: int,
+    payload: RoleAccessUpdate,
+    owner: Recruiter = Depends(require_owner),
+    db: Session = Depends(get_db),
+):
+    """
+    mode="all"      — the seat sees every role in the agency (default).
+    mode="selected" — the seat sees only `role_ids` (plus roles it creates
+                      itself). Everything attached to other roles —
+                      pipeline, applications, interviews, offers,
+                      placements, notes, notifications — is invisible to it.
+    """
+    member = _load_member(db, owner, member_id)
+    if member.role == RecruiterSeatRole.owner:
+        raise HTTPException(status_code=400, detail="Owners always see every role.")
+    wanted = set(payload.role_ids)
+    if wanted:
+        valid = {
+            r for (r,) in db.query(Role.id).filter(Role.agency_id == owner.agency_id, Role.id.in_(wanted)).all()
+        }
+        if valid != wanted:
+            raise HTTPException(status_code=404, detail="One or more roles were not found in your agency.")
+
+    restriction = db.get(RecruiterRoleRestriction, member.id)
+    if payload.mode == "all":
+        if restriction is not None:
+            db.delete(restriction)
+    else:
+        if restriction is None:
+            db.add(RecruiterRoleRestriction(
+                recruiter_id=member.id, agency_id=owner.agency_id, set_by_recruiter_id=owner.id,
+            ))
+        current = {
+            g.role_id: g for g in db.query(RecruiterRoleGrant).filter(RecruiterRoleGrant.recruiter_id == member.id).all()
+        }
+        for rid, g in current.items():
+            if rid not in wanted:
+                db.delete(g)
+        for rid in wanted - set(current):
+            db.add(RecruiterRoleGrant(
+                agency_id=owner.agency_id, recruiter_id=member.id, role_id=rid,
+                granted_by_recruiter_id=owner.id,
+            ))
+    db.commit()
+    return _role_access_out(db, owner, member)
 
 
 @router.post("/team", response_model=RecruiterAdminOut, status_code=status.HTTP_201_CREATED)
@@ -312,7 +428,7 @@ def add_member(payload: TeamMemberCreate, owner: Recruiter = Depends(require_own
     db.commit()
     db.refresh(member)
     billing_service.sync_seat_quantity(db, agency)  # per-seat billing keeps step
-    return _recruiter_out(member)
+    return _team_out(db, [member])[0]
 
 
 def _load_member(db: Session, owner: Recruiter, member_id: int) -> Recruiter:
@@ -338,7 +454,7 @@ def update_member(
         member.is_active = payload.is_active
     db.commit()
     db.refresh(member)
-    return _recruiter_out(member)
+    return _team_out(db, [member])[0]
 
 
 @router.post("/team/{member_id}/reset-password", response_model=RecruiterAdminOut)
