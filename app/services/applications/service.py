@@ -543,22 +543,20 @@ class ApplicationService:
         self.db.expire_all()
 
         # Phase 2: LLM calls (no DB connection held)
+        from app.services.ai.resume_writing import ATS_FORMAT_RULES, XYZ_BULLET_RULES
+
         RESUME_SYSTEM = (
             "You are an expert ATS-optimised resume writer with 15+ years of experience. "
-            "Your task is to produce a clean, ATS-friendly resume using ONLY the candidate data provided below. "
-            "\n\nATS RULES (follow strictly):\n"
-            "• Use plain text only — NO tables, NO columns, NO text boxes, NO graphics, NO headers/footers\n"
-            "• Use standard section headings only for sections that have real data: CONTACT, PROFESSIONAL SUMMARY, SKILLS, WORK EXPERIENCE, EDUCATION, PROJECTS\n"
-            "• ONLY include a CERTIFICATIONS section if certifications are explicitly listed in the candidate data — NEVER invent or suggest certifications\n"
-            "• OMIT any section entirely if no data was provided for it — do not add placeholder text or invented content\n"
-            "• Use simple bullet points starting with '•' for achievements\n"
-            "• Start each bullet with a strong action verb (Led, Built, Designed, Improved, etc.)\n"
-            "• Include quantifiable achievements wherever the evidence provides numbers/metrics\n"
-            "• Mirror keywords from the job description naturally throughout the resume\n"
-            "• Dates must be in format: Month YYYY – Month YYYY (or Present)\n"
-            "• DO NOT invent any information not present in the candidate data — this includes certifications, awards, publications, and courses\n"
+            "Your task is to produce a clean, ATS-friendly resume using ONLY the candidate data provided below.\n\n"
+            + ATS_FORMAT_RULES
+            + "\n"
+            + XYZ_BULLET_RULES
+            + "\nCONTENT RULES:\n"
+            "• OMIT any section entirely if no data was provided for it — no placeholder text or invented content\n"
+            "• ONLY include CERTIFICATIONS if certifications are explicitly listed in the candidate data\n"
+            "• DO NOT invent any information not present in the candidate data — this includes employers, "
+            "titles, dates, metrics, certifications, awards, publications and courses\n"
             "• DO NOT use placeholders like [Your Email] — use only the exact data provided\n"
-            "• Output clean text with clear section breaks using '---' between sections"
         )
 
         def resume_prompt(profile: str, jd: str) -> str:
@@ -566,7 +564,9 @@ class ApplicationService:
                 f"=== CANDIDATE PROFILE DATA ===\n{profile}\n\n"
                 f"=== TARGET JOB DESCRIPTION ===\n{jd}\n\n"
                 "Write a complete ATS-optimised resume using the EXACT candidate data above. "
-                "Mirror keywords from the JD. Use the real email and location from the profile — never write placeholders."
+                "Rewrite every work-experience and project bullet with the XYZ formula, using only "
+                "metrics that appear in the candidate data. Mirror keywords from the JD. Use the real "
+                "email and location from the profile — never write placeholders."
             )
 
         doc_prompts: dict[str, tuple] = {

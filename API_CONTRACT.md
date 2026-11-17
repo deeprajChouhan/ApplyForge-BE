@@ -886,3 +886,50 @@ The candidate pool itself is shared — only a candidate's applications/journey 
 
 Storage: `rec_recruiter_role_restrictions` (row = seat is restricted) and `rec_recruiter_role_grants`
 (Alembic `0036_recruiter_role_visibility`; also created at boot). No existing tables change.
+
+## RECRUITER — SOURCED STAGE (2026-11-13)
+
+LinkedIn captures from the recruiter Chrome extension (v0.3.0+) now land in **Sourced**, not the pool.
+Recruiters vet them (notes, contact, CV / cover letter), then promote to the pool and optionally a role pipeline.
+Unvetted profiles never reach matching, shortlists, Ask-the-pool or dashboards — they live in their own tables.
+
+Base: `/api/v1/recruiter/agencies/{agency_id}/sourced` (ids are public GUIDs like every recruiter route).
+
+| Method | Path | Notes |
+|---|---|---|
+| POST | `/score-preview` | Body = capture payload + `role_id` (required). Returns `{role_id, role_title, fit_score, tier, reasons, gaps, breakdown, sourced_id, sourced_status, pool_candidate_id}`. **Stores nothing.** Uses the pool matcher (`score_candidate`) unchanged. `tier`: `strong` ≥75, `good` ≥50, else `low`. `404` foreign role. |
+| POST | `` | Add/refresh in Sourced. Body = capture payload (+ optional `role_id`). Dedups on canonical LinkedIn URL per agency; a missing field never blanks a stored one; notes/docs/status kept; archived → back to `sourced`. Scores when a role is set. `201 {created, sourced}`. |
+| GET | `?status=sourced\|promoted\|archived\|all&role_id=` | List (default `sourced`). |
+| GET | `/{sourced_id}` | Detail: scraped about/experiences/education/certifications/languages, notes, `fit_reasons`, `fit_gaps`, `fit_breakdown`, documents. Never returns `page_text`, `storage_uri` or extracted text. |
+| PATCH | `/{sourced_id}` | Any of `notes, email, phone, full_name, headline, location, role_id, status`. Changing `role_id` (incl. `null`) re-scores. `status` only `sourced`/`archived`; `400` once promoted. |
+| POST | `/{sourced_id}/rescore` | Re-score against the current role using LinkedIn data + CV text + captured page text. |
+| DELETE | `/{sourced_id}` | Hard delete (GDPR) incl. stored files. `204`. |
+| POST | `/{sourced_id}/documents` | multipart `file` + `kind` (`cv`\|`cover_letter`\|`other`). Same validation as candidate documents (PDF/DOCX/DOC/TXT, 10 MB, magic bytes). A CV's text is extracted and folded into the score immediately. `400` once promoted. |
+| GET | `/{sourced_id}/documents/{document_id}/download` | Authenticated stream. |
+| DELETE | `/{sourced_id}/documents/{document_id}` | Removes stored object + row; re-scores if it was a CV. |
+| POST | `/{sourced_id}/promote` | Body `{role_id?}`. Copies into the pool via the LinkedIn-capture path (dedups on URL), parses the latest CV and merges it (fills blanks, adds skills, appends CV text; LinkedIn history wins), **moves** documents onto the pool candidate (`uploaded_via="sourced"`), and with `role_id` attaches to that role's pipeline at the first stage. `{sourced_id, candidate_id, created, application_id, documents_moved}`. Repeating with a new `role_id` only adds the attachment; repeating with no role → `400`. Meters `cv_ingested` only when a new pool candidate is created. |
+
+**Capture payload** = `LinkedInCaptureRequest` plus `education[] {school, degree, field, start_date, end_date}`,
+`certifications[] {name, issuer, issued}`, `languages[]`, `page_text` (visible profile text, capped at 20k chars server-side).
+
+**Role visibility** — the target role column is `role_id`, so restricted seats automatically don't see sourced profiles
+targeted at hidden roles (profiles with no role stay visible).
+
+Storage: `rec_sourced_profiles`, `rec_sourced_documents` (Alembic `0037_recruiter_sourced`; also created at boot).
+No FK outside `rec_*`. `POST /candidates/capture-linkedin` is unchanged and still works for older extension builds.
+
+---
+
+## ADMIN — CRAWLED JOBS CLEANUP (2026-11-17)
+
+Base: `/api/v1/admin` · admin token (`require_admin`).
+Admin UI: **Admin → Job Crawler** (`/admin/crawler`) → "Delete old crawled jobs" card.
+
+Covers both stores filled by background workers:
+- **Worker-discovered jobs** — `jobs` (+ `job_sources`) from Celery `poll_provider` and `live_search`. Age = `first_seen_at`. **Kept:** any job referenced by `job_applications.job_id` (incl. soft-deleted) — the auto-apply orchestrator de-dupes by `Job.id`, so deleting those would let a re-poll re-insert the posting and apply twice.
+- **Per-user crawler results** — `crawled_jobs` from the APScheduler crawler. Age = `crawled_at`. **Kept:** `is_saved`, `is_dismissed`, or `application_id` set.
+
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/crawled-jobs/cleanup/preview?older_than_hours=24` | `1 ≤ hours ≤ 2160`. Returns `{older_than_hours, cutoff, discovered_jobs: {total, eligible, protected}, user_crawled_jobs: {total, eligible, protected}}`. `eligible` = will be deleted; `protected` = older than cutoff but kept. |
+| POST | `/crawled-jobs/cleanup` | Body `{older_than_hours=24, include_discovered=true, include_user_crawled=true}`. Hard delete in batches of 1000. Returns `{older_than_hours, cutoff, deleted_discovered_jobs, deleted_job_sources, deleted_user_crawled_jobs}`. Writes an `admin.crawled_jobs.cleanup` audit-log row. |

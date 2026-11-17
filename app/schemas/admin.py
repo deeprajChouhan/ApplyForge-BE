@@ -1,7 +1,7 @@
 import json
 from datetime import datetime
 from typing import Any, List, Optional
-from pydantic import BaseModel, EmailStr, field_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator
 
 from app.models.enums import FeatureFlag, PlanTier, SubscriptionStatus, UserRole
 
@@ -213,3 +213,32 @@ class CrawlerConfigOut(BaseModel):
     @classmethod
     def _validate_job_roles(cls, v: Any) -> list:
         return _parse_json_list(v)
+
+
+# ── Crawled-jobs cleanup ──────────────────────────────────────────────────────
+
+class CleanupStoreCounts(BaseModel):
+    total: int
+    eligible: int   # older than cutoff AND safe to delete
+    protected: int  # older than cutoff but kept (applied / saved / dismissed)
+
+
+class CrawledJobsCleanupPreview(BaseModel):
+    older_than_hours: int
+    cutoff: datetime
+    discovered_jobs: CleanupStoreCounts
+    user_crawled_jobs: CleanupStoreCounts
+
+
+class CrawledJobsCleanupRequest(BaseModel):
+    older_than_hours: int = Field(24, ge=1, le=24 * 90)
+    include_discovered: bool = True
+    include_user_crawled: bool = True
+
+
+class CrawledJobsCleanupResult(BaseModel):
+    older_than_hours: int
+    cutoff: datetime
+    deleted_discovered_jobs: int
+    deleted_job_sources: int
+    deleted_user_crawled_jobs: int

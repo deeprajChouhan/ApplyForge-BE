@@ -1210,6 +1210,92 @@ class RecruiterRoleGrant(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
+class SourcedProfile(Base, RecTimestampMixin):
+    """
+    A candidate the recruiter has *sourced* (e.g. captured from LinkedIn via
+    the Chrome extension) but not yet vetted into the candidate pool.
+
+    Deliberately separate from `CandidateProfile` so nothing in the pool —
+    matching, shortlists, Ask-the-pool, dashboards — sees unvetted people.
+    Holds everything we could scrape plus any documents the recruiter adds
+    later (CV, cover letter). Promotion copies it into the pool via the
+    LinkedIn-capture path and, optionally, onto a role pipeline.
+
+    `role_id` is the role the recruiter was sourcing for; naming it `role_id`
+    lets per-recruiter role visibility filter it automatically.
+    """
+    __tablename__ = "rec_sourced_profiles"
+    __table_args__ = (
+        UniqueConstraint("agency_id", "linkedin_url", name="uq_rec_sourced_agency_url"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    agency_id: Mapped[int] = mapped_column(ForeignKey("rec_agencies.id", ondelete="CASCADE"), index=True)
+    role_id: Mapped[int | None] = mapped_column(
+        ForeignKey("rec_roles.id", ondelete="SET NULL"), index=True
+    )
+    status: Mapped[str] = mapped_column(String(20), default="sourced", nullable=False, index=True)
+
+    linkedin_url: Mapped[str] = mapped_column(String(500), nullable=False)
+    full_name: Mapped[str | None] = mapped_column(String(200))
+    headline: Mapped[str | None] = mapped_column(String(300))
+    location: Mapped[str | None] = mapped_column(String(200))
+    about: Mapped[str | None] = mapped_column(Text)
+    email: Mapped[str | None] = mapped_column(String(255))
+    phone: Mapped[str | None] = mapped_column(String(60))
+    years_experience: Mapped[float | None] = mapped_column(Float)
+    skills: Mapped[list | None] = mapped_column(JSON)
+    experiences: Mapped[list | None] = mapped_column(JSON)
+    education: Mapped[list | None] = mapped_column(JSON)
+    certifications: Mapped[list | None] = mapped_column(JSON)
+    languages: Mapped[list | None] = mapped_column(JSON)
+    # Visible page text at capture time (capped) — kept so nothing the scraper
+    # missed structurally is lost; feeds matching evidence on promotion.
+    page_text: Mapped[str | None] = mapped_column(Text)
+    notes: Mapped[str | None] = mapped_column(Text)
+
+    # Last fit score against `role_id` (null when no role chosen).
+    fit_score: Mapped[float | None] = mapped_column(Float)
+    fit_reasons: Mapped[list | None] = mapped_column(JSON)
+    fit_gaps: Mapped[list | None] = mapped_column(JSON)
+    fit_breakdown: Mapped[dict | None] = mapped_column(JSON)
+    scored_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+    promoted_candidate_id: Mapped[int | None] = mapped_column(
+        ForeignKey("rec_candidate_profiles.id", ondelete="SET NULL"), index=True
+    )
+    promoted_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+    documents: Mapped[list["SourcedDocument"]] = relationship(
+        back_populates="sourced", cascade="all, delete-orphan", order_by="SourcedDocument.id"
+    )
+
+
+class SourcedDocument(Base):
+    """A file (CV, cover letter, other) attached to a sourced profile. Bytes in
+    the StorageService under recruiter/{agency}/sourced/{id}/; `storage_uri`
+    is internal and never serialised."""
+    __tablename__ = "rec_sourced_documents"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    agency_id: Mapped[int] = mapped_column(ForeignKey("rec_agencies.id", ondelete="CASCADE"), index=True)
+    sourced_id: Mapped[int] = mapped_column(
+        ForeignKey("rec_sourced_profiles.id", ondelete="CASCADE"), index=True
+    )
+    kind: Mapped[str] = mapped_column(String(20), default="cv", nullable=False)
+    storage_uri: Mapped[str] = mapped_column(String(700), nullable=False)
+    original_filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    content_type: Mapped[str | None] = mapped_column(String(120))
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Plain text pulled from the file at upload — feeds the fit score before
+    # promotion (the full structured parse runs once, on promotion).
+    extracted_text: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+    sourced: Mapped["SourcedProfile"] = relationship(back_populates="documents")
+
+
 # All recruiter tables — used to create just these on startup without touching
 # the consumer schema.
 RECRUITER_TABLES = [
@@ -1247,6 +1333,8 @@ RECRUITER_TABLES = [
     ClientShareToken.__table__,
     # Secure documents + Partner API
     CandidateDocument.__table__,
+    SourcedProfile.__table__,
+    SourcedDocument.__table__,
     ApiKey.__table__,
     IdempotencyRecord.__table__,
     ApiRequestLog.__table__,

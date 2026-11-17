@@ -6,6 +6,7 @@ from app.recruiter.api.agency_routes import router as agency_router
 from app.recruiter.api.auth_routes import router as auth_router
 from app.recruiter.api.billing_routes import router as billing_router
 from app.recruiter.api.ops_routes import router as ops_router
+from app.recruiter.api.sourcing_routes import router as sourcing_router
 from app.recruiter.partner.management import operator_router as integrations_operator_router
 from app.recruiter.partner.management import owner_router as integrations_owner_router
 from app.recruiter.partner.routes import router as partner_router
@@ -38,6 +39,7 @@ recruiter_router.include_router(partner_router)
 recruiter_router.include_router(clients_router)
 recruiter_router.include_router(roles_router)
 recruiter_router.include_router(candidates_router)
+recruiter_router.include_router(sourcing_router)
 recruiter_router.include_router(shortlist_router)
 recruiter_router.include_router(pipeline_router)
 recruiter_router.include_router(applications_router)

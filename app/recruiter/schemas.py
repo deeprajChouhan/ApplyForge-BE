@@ -1727,3 +1727,117 @@ class CandidateDocumentOut(BaseModel):
     size_bytes: int
     uploaded_via: str
     created_at: datetime | None = None
+
+
+# ── Sourced stage (LinkedIn capture → vet → pool) ─────────────────────────
+class SourcedEducation(BaseModel):
+    school: str | None = None
+    degree: str | None = None
+    field: str | None = None
+    start_date: str | None = None
+    end_date: str | None = None
+
+
+class SourcedCertification(BaseModel):
+    name: str | None = None
+    issuer: str | None = None
+    issued: str | None = None
+
+
+class SourcedCaptureRequest(LinkedInCaptureRequest):
+    """Everything the extension could scrape. Extends the capture payload
+    with sections the pool doesn't model yet; kept on the sourced profile."""
+    education: list[SourcedEducation] = Field(default_factory=list)
+    certifications: list[SourcedCertification] = Field(default_factory=list)
+    languages: list[str] = Field(default_factory=list)
+    page_text: str | None = Field(default=None, max_length=60_000)
+
+
+class FitScoreOut(BaseModel):
+    role_id: int
+    role_title: str
+    fit_score: float
+    tier: str                      # strong (≥75) | good (≥50) | low
+    reasons: list[str]
+    gaps: list[str]
+    breakdown: dict
+    # Where this person already is, so the extension can say so.
+    sourced_id: int | None = None
+    sourced_status: str | None = None
+    pool_candidate_id: int | None = None
+
+
+class SourcedDocumentOut(ORMModel):
+    """storage_uri and extracted text are never exposed."""
+    id: int
+    kind: str
+    original_filename: str
+    content_type: str | None = None
+    size_bytes: int
+    has_text: bool = False
+    created_at: datetime | None = None
+
+
+class SourcedOut(ORMModel):
+    id: int
+    status: str
+    role_id: int | None = None
+    role_title: str | None = None
+    linkedin_url: str
+    full_name: str | None = None
+    headline: str | None = None
+    location: str | None = None
+    email: str | None = None
+    phone: str | None = None
+    years_experience: float | None = None
+    skills: list[str] = Field(default_factory=list)
+    fit_score: float | None = None
+    tier: str | None = None
+    document_count: int = 0
+    promoted_candidate_id: int | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class SourcedDetailOut(SourcedOut):
+    about: str | None = None
+    experiences: list[dict] = Field(default_factory=list)
+    education: list[dict] = Field(default_factory=list)
+    certifications: list[dict] = Field(default_factory=list)
+    languages: list[str] = Field(default_factory=list)
+    notes: str | None = None
+    fit_reasons: list[str] = Field(default_factory=list)
+    fit_gaps: list[str] = Field(default_factory=list)
+    fit_breakdown: dict = Field(default_factory=dict)
+    scored_at: datetime | None = None
+    promoted_at: datetime | None = None
+    documents: list[SourcedDocumentOut] = Field(default_factory=list)
+
+
+class SourcedSaveResult(BaseModel):
+    created: bool
+    sourced: SourcedOut
+
+
+class SourcedUpdate(BaseModel):
+    notes: str | None = None
+    email: str | None = None
+    phone: str | None = None
+    full_name: str | None = None
+    headline: str | None = None
+    location: str | None = None
+    role_id: int | None = None
+    status: str | None = None      # sourced | archived
+
+
+class SourcedPromoteRequest(BaseModel):
+    # When set, also attach to this role's pipeline (first stage).
+    role_id: int | None = None
+
+
+class SourcedPromoteResult(BaseModel):
+    sourced_id: int
+    candidate_id: int
+    created: bool                  # False when the person was already in the pool
+    application_id: int | None = None
+    documents_moved: int

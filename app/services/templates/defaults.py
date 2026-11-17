@@ -89,7 +89,10 @@ SYSTEM_TEMPLATES: list[dict[str, Any]] = [
     {
         "name": "Classic ATS",
         "base_template": "classic",
-        "config": build_default_config("single_column"),
+        "config": build_default_config(
+            "single_column",
+            {"accent_color": "#111111", "font_family": "Georgia", "header_style": "centered"},
+        ),
     },
     {
         "name": "Modern",
@@ -100,10 +103,12 @@ SYSTEM_TEMPLATES: list[dict[str, Any]] = [
         ),
     },
     {
-        "name": "Two-Column Sidebar",
+        # base_template stays 'sidebar' so stored selections keep working; the
+        # design is now single-column with a navy header band (ATS-safe).
+        "name": "Navy Header",
         "base_template": "sidebar",
         "config": build_default_config(
-            "two_column",
+            "single_column",
             {"accent_color": "#1E3A5F"},
         ),
     },
@@ -112,7 +117,8 @@ SYSTEM_TEMPLATES: list[dict[str, Any]] = [
         "base_template": "executive",
         "config": build_default_config(
             "centered",
-            {"font_family": "Georgia", "accent_color": "#0F172A", "heading_font_size": 13},
+            {"font_family": "Georgia", "accent_color": "#0F172A", "heading_font_size": 13,
+             "header_style": "centered"},
         ),
     },
 ]

@@ -1,21 +1,35 @@
 """
 Resume Export Service
 =====================
-Generates downloadable PDF and DOCX versions of the user's resume,
-sourced from the normalised profile tables (same data the ATS preview
-renders). Falls back to ParsedResumeData for any section that has no
-DB rows yet (matching the frontend merge logic).
+Generates downloadable PDF (reportlab) and DOCX (python-docx) resumes.
 
-Libraries used:
-  PDF  — reportlab  (already installed)
-  DOCX — python-docx (already installed)
+Two guarantees:
+
+1. The download matches the on-screen preview.
+   * Data: `_ResumeData` uses the same sources and precedence as the
+     frontend `useResumeData` hook (user-frontend/.../resume-templates/
+     shared-data.ts): the resume pinned to the application (else the newest
+     parse) wins, DB profile tables fill gaps, and the per-application AI
+     customizations are layered on top.
+   * Design: each template family (classic / modern / sidebar / executive)
+     has its own `_Design` preset mirroring its preview component. The
+     resolved template's config can still rename/reorder/hide sections and
+     override styles.
+
+2. Every design is ATS-safe: one column, real selectable text in reading
+   order, standard section headings, no images, no text boxes. The only
+   table used in the PDF is a single-row title/date line (and the Modern
+   header's one-cell accent bar), both of which extract in order.
 """
 from __future__ import annotations
 
 import io
 import json
+import re
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from typing import Any
+from xml.sax.saxutils import escape as _xml_escape
 
 import structlog
 from fastapi import HTTPException
@@ -25,6 +39,7 @@ from app.models.models import (
     ApplicationCustomization,
     Certification,
     Education,
+    JobApplication,
     ParsedResumeData,
     Project,
     Skill,
@@ -32,55 +47,150 @@ from app.models.models import (
     UserProfile,
     WorkExperience,
 )
+from app.services.templates.defaults import (
+    ALLOWED_SECTION_KEYS,
+    DEFAULT_SECTIONS,
+    DEFAULT_STYLES,
+)
+from app.services.templates.resolver import ResolvedTemplate
 
 logger = structlog.get_logger(__name__)
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
-def _fmt_date(d: date | datetime | str | None) -> str:
-    if d is None:
+_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+           "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+
+def _parse_date(d: Any) -> date | None:
+    if d is None or d == "":
+        return None
+    if isinstance(d, datetime):
+        return d.date()
+    if isinstance(d, date):
+        return d
+    s = str(d).strip()
+    for candidate in (s, s[:10]):
+        for fmt in ("%Y-%m-%d", "%Y-%m", "%Y/%m", "%Y", "%b %Y", "%B %Y", "%m/%Y"):
+            try:
+                return datetime.strptime(candidate, fmt).date()
+            except ValueError:
+                continue
+    try:
+        return datetime.fromisoformat(s).date()
+    except ValueError:
+        return None
+
+
+def _fmt_date(d: Any) -> str:
+    """Mirror of the frontend fmtMonthYear: empty → 'Present', unparseable → as-is."""
+    if d is None or d == "":
         return "Present"
-    if isinstance(d, str):
-        try:
-            d = datetime.fromisoformat(d)
-        except ValueError:
-            return d
-    return d.strftime("%b %Y")
+    if isinstance(d, str) and d.strip().lower() in {"present", "current", "now"}:
+        return "Present"
+    parsed = _parse_date(d)
+    if parsed is None:
+        return str(d)
+    return f"{_MONTHS[parsed.month - 1]} {parsed.year}"
 
 
-def _bullets(description: str | None, max_bullets: int = 6) -> list[str]:
-    """Split a description text into bullet lines."""
+def _fmt_range(start: Any, end: Any) -> str:
+    s = _fmt_date(start) if start not in (None, "") else ""
+    e = _fmt_date(end)
+    if not s:
+        return e
+    return f"{s} – {e}"
+
+
+def _sort_key(item: dict) -> date:
+    return _parse_date(item.get("start_date")) or date.min
+
+
+_BULLET_PREFIX = re.compile(r"^[•*\-–]\s*")
+
+
+def _bullets(description: str | None, max_bullets: int = 5) -> list[str]:
+    """Mirror of the frontend parseBullets()."""
     if not description:
         return []
-    lines = [l.strip().lstrip("•–-").strip() for l in description.splitlines()]
+    lines = [_BULLET_PREFIX.sub("", l.strip()) for l in description.split("\n")]
     lines = [l for l in lines if l]
     if len(lines) > 1:
         return lines[:max_bullets]
-    # single paragraph — split on ". "
-    parts = [s.strip() for s in description.split(". ") if s.strip()]
+    parts = [p.strip() for p in re.split(r"(?<=\.\s)", description) if p.strip()]
     return parts[:max_bullets]
+
+
+def _truncate_summary(summary: str, max_chars: int) -> str:
+    """Mirror of the frontend truncateSummary()."""
+    if not summary:
+        return ""
+    cleaned = re.sub(r"\s+", " ", summary).strip()
+    if len(cleaned) <= max_chars:
+        return cleaned
+    cut = cleaned[:max_chars]
+    last_stop = max(cut.rfind(". "), cut.rfind("! "), cut.rfind("? "))
+    if last_stop > max_chars * 0.6:
+        return cut[: last_stop + 1].strip()
+    return (cut.strip() + "…").strip()
+
+
+def _first(*vals: Any) -> Any:
+    for v in vals:
+        if v not in (None, ""):
+            return v
+    return None
+
+
+def _prefer(primary: Any, fallback: Any) -> list:
+    if isinstance(primary, list) and primary:
+        return primary
+    if isinstance(fallback, list) and fallback:
+        return fallback
+    return []
+
+
+def _norm(v: Any) -> str:
+    return re.sub(r"\s+", " ", str(v or "")).lower().strip()
+
+
+def _x(text: Any) -> str:
+    """Escape user text for reportlab Paragraph mini-markup."""
+    return _xml_escape(str(text or ""))
 
 
 # ── data loader ────────────────────────────────────────────────────────────
 
 class _ResumeData:
-    """Loads all profile sections for a user, merging DB + parsed fallback.
-
-    When *app_id* is supplied the per-application AI customizations are also
-    applied (skills_add, experiences_update, projects_add) so the export
-    matches exactly what the user sees in the on-screen preview.
-    """
+    """All resume content for one export, merged exactly like the preview."""
 
     def __init__(self, db: Session, user_id: int, user_email: str, app_id: int | None = None):
         profile = db.query(UserProfile).filter_by(user_id=user_id).first()
-        parsed_row = (
-            db.query(ParsedResumeData)
-            .filter_by(user_id=user_id)
-            .filter(ParsedResumeData.deleted_at.is_(None))
-            .order_by(ParsedResumeData.created_at.desc())
-            .first()
-        )
+
+        app: JobApplication | None = None
+        if app_id is not None:
+            app = db.get(JobApplication, app_id)
+            if app is not None and app.user_id != user_id:
+                app = None
+
+        # Pinned parse for this application, else the newest one.
+        parsed_row = None
+        if app is not None and app.selected_resume_id:
+            parsed_row = (
+                db.query(ParsedResumeData)
+                .filter_by(id=app.selected_resume_id, user_id=user_id)
+                .filter(ParsedResumeData.deleted_at.is_(None))
+                .first()
+            )
+        if parsed_row is None:
+            parsed_row = (
+                db.query(ParsedResumeData)
+                .filter_by(user_id=user_id)
+                .filter(ParsedResumeData.deleted_at.is_(None))
+                .order_by(ParsedResumeData.created_at.desc())
+                .first()
+            )
         parsed: dict[str, Any] = {}
         if parsed_row and parsed_row.structured_json:
             try:
@@ -89,35 +199,22 @@ class _ResumeData:
             except (json.JSONDecodeError, TypeError):
                 parsed = {}
 
-        # Basic info
-        self.full_name: str = (
-            (profile.full_name if profile else None)
-            or parsed.get("full_name", "")
-            or ""
-        )
-        self.headline: str = (
-            (profile.headline if profile else None)
-            or parsed.get("headline", "")
-            or ""
-        )
-        self.summary: str = (
-            (profile.summary if profile else None)
-            or parsed.get("summary", "")
-            or ""
-        )
-        self.location: str = (
-            (profile.location if profile else None)
-            or parsed.get("location", "")
-            or ""
-        )
-        self.email: str = user_email
+        # Identity — uploaded resume wins, DB profile is fallback.
+        self.full_name: str = _first(parsed.get("full_name"), profile and profile.full_name) or ""
+        self.headline: str = _first(parsed.get("headline"), profile and profile.headline) or ""
+        self.summary: str = _first(parsed.get("summary"), profile and profile.summary) or ""
+        self.location: str = _first(parsed.get("location"), profile and profile.location) or ""
+        self.email: str = _first(parsed.get("email"), user_email) or ""
+        self.phone: str = _first(parsed.get("phone"), profile and profile.phone_number) or ""
+        self.linkedin: str = _first(parsed.get("linkedin_url"), parsed.get("linkedin")) or ""
+        self.website: str = _first(parsed.get("website_url"), parsed.get("website")) or ""
 
         # Per-application AI customizations (applied suggestions)
         customizations: dict[str, Any] = {}
-        if app_id is not None:
+        if app is not None:
             cust_row = (
                 db.query(ApplicationCustomization)
-                .filter_by(user_id=user_id, application_id=app_id)
+                .filter_by(user_id=user_id, application_id=app.id)
                 .first()
             )
             if cust_row and cust_row.customizations_json:
@@ -127,594 +224,706 @@ class _ResumeData:
                 except (json.JSONDecodeError, TypeError):
                     customizations = {}
 
-        # Skills — merge DB + parsed (same dedup logic as frontend)
-        db_skills = db.query(Skill).filter_by(user_id=user_id).all()
+        # JD keywords (same list the page passes to the preview)
+        self.jd_keywords: list[str] = []
+        if app is not None and app.jd_analysis_json:
+            try:
+                jd = app.jd_analysis_json
+                jd = json.loads(jd) if isinstance(jd, str) else jd
+                if isinstance(jd, dict):
+                    self.jd_keywords = [
+                        str(k).lower().strip()
+                        for k in (jd.get("keywords") or []) + (jd.get("required_skills") or [])
+                        if str(k).strip()
+                    ]
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        # Experiences — parsed wins; AI rewrites matched by id or role+company.
+        db_exps = [
+            {"id": e.id, "role": e.role, "company": e.company, "location": getattr(e, "location", None),
+             "start_date": e.start_date, "end_date": e.end_date, "description": e.description}
+            for e in db.query(WorkExperience).filter_by(user_id=user_id).all()
+        ]
+        overrides: dict[str, dict] = customizations.get("experiences_update") or {}
+        by_role_company = {
+            f"{_norm(o.get('role'))}::{_norm(o.get('company'))}": o
+            for o in overrides.values()
+            if isinstance(o, dict) and (o.get("role") or o.get("company"))
+        }
+        exps = []
+        for e in _prefer(parsed.get("work_experience"), db_exps):
+            if not isinstance(e, dict):
+                continue
+            ov = (overrides.get(str(e["id"])) if e.get("id") is not None else None) \
+                or by_role_company.get(f"{_norm(e.get('role'))}::{_norm(e.get('company'))}")
+            if ov and ov.get("description"):
+                e = {**e, "description": ov["description"]}
+            exps.append(e)
+        self.experiences = sorted(exps, key=_sort_key, reverse=True)
+
+        # Education — parsed wins; dedup by institution+degree; newest first.
+        db_edus = [
+            {"institution": e.institution, "degree": e.degree, "field_of_study": e.field_of_study,
+             "start_date": e.start_date, "end_date": e.end_date}
+            for e in db.query(Education).filter_by(user_id=user_id).all()
+        ]
         seen: set[str] = set()
+        edus = []
+        for e in _prefer(parsed.get("education"), db_edus):
+            if not isinstance(e, dict):
+                continue
+            k = f"{_norm(e.get('institution'))}::{_norm(e.get('degree'))}"
+            if k not in seen:
+                seen.add(k)
+                edus.append(e)
+        self.educations = sorted(edus, key=_sort_key, reverse=True)
+
+        # Skills — parsed wins, then accepted AI skills; JD matches first.
+        db_skills = [{"name": s.name, "level": s.level}
+                     for s in db.query(Skill).filter_by(user_id=user_id).all()]
+        seen = set()
         skills: list[dict] = []
-        for s in db_skills:
-            key = (s.name or "").lower().strip()
-            if key and key not in seen:
-                seen.add(key)
-                skills.append({"name": s.name, "level": s.level})
-        for s in parsed.get("skills", []):
-            item = {"name": s} if isinstance(s, str) else s
-            key = (item.get("name", "") or "").lower().strip()
-            if key and key not in seen:
-                seen.add(key)
-                skills.append(item)
-        # AI-suggested skills for this specific job application
-        for s in customizations.get("skills_add", []):
-            key = (s.get("name", "") or "").lower().strip()
-            if key and key not in seen:
-                seen.add(key)
-                skills.append({"name": s["name"], "level": s.get("level")})
-        self.skills = skills
+        for s in list(_prefer(parsed.get("skills"), db_skills)) + list(customizations.get("skills_add") or []):
+            item = {"name": s} if isinstance(s, str) else (s if isinstance(s, dict) else {})
+            k = _norm(item.get("name"))
+            if k and k not in seen:
+                seen.add(k)
+                skills.append({"name": item.get("name"), "level": item.get("level")})
+        hit = [s for s in skills if self.matches_jd(s["name"])]
+        rest = [s for s in skills if not self.matches_jd(s["name"])]
+        self.skills = hit + rest
 
-        # Experiences
-        db_exps = (
-            db.query(WorkExperience)
-            .filter_by(user_id=user_id)
-            .order_by(WorkExperience.start_date.desc())
-            .all()
-        )
-        exp_overrides: dict[str, dict] = customizations.get("experiences_update", {})
-        if db_exps:
-            self.experiences = [
-                {
-                    "role": e.role,
-                    "company": e.company,
-                    "start_date": e.start_date,
-                    "end_date": e.end_date,
-                    # Apply AI-suggested bullet overrides for this job if present
-                    "description": (
-                        exp_overrides.get(str(e.id), {}).get("description")
-                        or e.description
-                    ),
-                }
-                for e in db_exps
-            ]
-        else:
-            raw_exps = parsed.get("work_experience", [])
-            self.experiences = sorted(
-                raw_exps,
-                key=lambda x: x.get("start_date") or "",
-                reverse=True,
-            )
+        # Projects — parsed wins, then AI-added projects appended.
+        db_projs = [{"name": p.name, "description": p.description, "technologies": p.technologies}
+                    for p in db.query(Project).filter_by(user_id=user_id).all()]
+        seen = set()
+        projs = []
+        for p in _prefer(parsed.get("projects"), db_projs):
+            if not isinstance(p, dict):
+                continue
+            k = _norm(p.get("name"))
+            if k and k not in seen:
+                seen.add(k)
+                projs.append(p)
+        for p in customizations.get("projects_add") or []:
+            if isinstance(p, dict):
+                projs.append({"name": p.get("name"), "description": p.get("description"),
+                              "technologies": p.get("technologies")})
+        self.projects = projs
 
-        # Education — union merge: DB rows + parsed-resume (deduped by institution+degree)
-        db_edus = (
-            db.query(Education)
-            .filter_by(user_id=user_id)
-            .order_by(Education.start_date.desc())
-            .all()
-        )
-        seen_edu: set[str] = set()
-        educations: list[dict] = []
-        for e in db_edus:
-            key = f"{(e.institution or '').lower().strip()}::{(e.degree or '').lower().strip()}"
-            if key not in seen_edu:
-                seen_edu.add(key)
-                educations.append({
-                    "institution": e.institution,
-                    "degree": e.degree,
-                    "field_of_study": e.field_of_study,
-                    "start_date": e.start_date,
-                    "end_date": e.end_date,
-                })
-        for e in parsed.get("education", []):
-            key = f"{(e.get('institution', '') or '').lower().strip()}::{(e.get('degree', '') or '').lower().strip()}"
-            if key not in seen_edu:
-                seen_edu.add(key)
-                educations.append({
-                    "institution": e.get("institution", ""),
-                    "degree": e.get("degree", ""),
-                    "field_of_study": e.get("field_of_study", ""),
-                    "start_date": e.get("start_date"),
-                    "end_date": e.get("end_date"),
-                })
-        self.educations = educations
+        # Certifications — parsed wins.
+        db_certs = [{"name": c.name, "issuer": c.issuer, "issue_date": c.issue_date}
+                    for c in db.query(Certification).filter_by(user_id=user_id).all()]
+        seen = set()
+        certs = []
+        for c in _prefer(parsed.get("certifications"), db_certs):
+            if not isinstance(c, dict):
+                continue
+            k = _norm(c.get("name"))
+            if k and k not in seen:
+                seen.add(k)
+                certs.append(c)
+        self.certifications = certs
 
-        # Projects — union merge: DB rows + parsed-resume + AI-suggested
-        # (mirrors the frontend ATSResumeTemplate union-merge logic)
-        db_projs = db.query(Project).filter_by(user_id=user_id).all()
-        seen_proj: set[str] = set()
-        projects: list[dict] = []
-        for p in db_projs:
-            key = (p.name or "").lower().strip()
-            if key and key not in seen_proj:
-                seen_proj.add(key)
-                projects.append({
-                    "name": p.name,
-                    "description": p.description,
-                    "technologies": p.technologies,
-                })
-        for p in parsed.get("projects", []):
-            key = (p.get("name", "") or "").lower().strip()
-            if key and key not in seen_proj:
-                seen_proj.add(key)
-                projects.append({
-                    "name": p.get("name", ""),
-                    "description": p.get("description", ""),
-                    "technologies": p.get("technologies", ""),
-                })
-        # Append AI-suggested projects (gap-fix or job-specific extras)
-        for p in customizations.get("projects_add", []):
-            key = (p.get("name", "") or "").lower().strip()
-            if key and key not in seen_proj:
-                seen_proj.add(key)
-                projects.append({
-                    "name": p.get("name", ""),
-                    "description": p.get("description", ""),
-                    "technologies": p.get("technologies", ""),
-                })
-        self.projects = projects
+    def matches_jd(self, name: Any) -> bool:
+        """Mirror of the frontend isKeywordMatch()."""
+        n = _norm(name)
+        if not n:
+            return False
+        return any(k in n or (len(k) > 3 and n in k) for k in self.jd_keywords)
 
-        # Certifications — union merge: DB rows + parsed-resume
-        db_certs = db.query(Certification).filter_by(user_id=user_id).all()
-        seen_cert: set[str] = set()
-        certifications: list[dict] = []
-        for c in db_certs:
-            key = (c.name or "").lower().strip()
-            if key and key not in seen_cert:
-                seen_cert.add(key)
-                certifications.append({"name": c.name, "issuer": c.issuer, "issue_date": c.issue_date})
-        for c in parsed.get("certifications", []):
-            key = (c.get("name", "") or "").lower().strip()
-            if key and key not in seen_cert:
-                seen_cert.add(key)
-                certifications.append({
-                    "name": c.get("name", ""),
-                    "issuer": c.get("issuer", ""),
-                    "issue_date": c.get("issue_date"),
-                })
-        self.certifications = certifications
+    def contact_parts(self) -> list[str]:
+        return [p for p in (self.email, self.phone, self.location, self.linkedin, self.website) if p]
 
 
-# ── Template-driven renderers ──────────────────────────────────────────────
-#
-# Both the PDF and DOCX renderers consume the SAME ResolvedTemplate
-# (from ResumeTemplateResolver). The template's config_json decides:
-#   - which sections appear and in what order (config.sections)
-#   - typography (config.styles.font_family, body/heading sizes, line_height)
-#   - margins (config.styles.margin_*)
-#   - accent color and header alignment
-#   - layout family (single_column | two_column | centered)
-#
-# The old hardcoded "Classic ATS" defaults are gone — the classic look is
-# just the config a ResumeTemplate seeded with base_template='classic' carries.
+# ── designs ────────────────────────────────────────────────────────────────
 
-from app.services.templates.resolver import ResolvedTemplate
-
-
-# Section-key → renderer callable
-def _section_renderer_map_pdf(data, styles, template, story_add, S):
-    return {
-        "header":         lambda: _pdf_header(data, styles, template, story_add, S),
-        "summary":        lambda: _pdf_summary(data, styles, template, story_add, S),
-        "skills":         lambda: _pdf_skills(data, styles, template, story_add, S),
-        "experience":     lambda: _pdf_experience(data, styles, template, story_add, S),
-        "projects":       lambda: _pdf_projects(data, styles, template, story_add, S),
-        "education":      lambda: _pdf_education(data, styles, template, story_add, S),
-        "certifications": lambda: _pdf_certifications(data, styles, template, story_add, S),
-    }
-
-
-def _pdf_font_family(styles: dict) -> tuple[str, str, str]:
-    """Return (regular, bold, italic) reportlab font names for a config family."""
-    fam = (styles.get("font_family") or "").strip().lower()
-    if fam in ("times", "times new roman", "georgia", "serif"):
-        return "Times-Roman", "Times-Bold", "Times-Italic"
-    if fam in ("courier", "mono", "monospace"):
-        return "Courier", "Courier-Bold", "Courier-Oblique"
-    # Inter and any other sans → Helvetica (ReportLab core font)
-    return "Helvetica", "Helvetica-Bold", "Helvetica-Oblique"
+@dataclass(frozen=True)
+class _Design:
+    family: str
+    serif: bool
+    accent: str                    # headings / highlights
+    ink: str = "#0F172A"           # primary text
+    body: str = "#1E293B"
+    muted: str = "#64748B"
+    header_align: str = "left"     # left | centered
+    name_upper: bool = False
+    name_bold: bool = True
+    name_size: float = 22
+    headline_italic: bool = False
+    contact_sep: str = "  ·  "
+    header_band: bool = False      # Navy Header
+    header_bar: bool = False       # Modern left accent bar
+    header_rule: str | None = None # rule colour under the header
+    section_align: str = "left"
+    section_rule: str | None = None
+    section_rule_width: float = 0.75
+    role_company_sep: str = "  —  "
+    company_italic: bool = True
+    skills_centered: bool = False
+    body_size: float = 10
+    heading_size: float = 10.5
+    line_height: float = 1.35
+    section_spacing: float = 9
+    margins: tuple[float, float, float, float] = (40, 40, 46, 46)  # t, b, l, r
+    summary_max: int = 380
+    projects_max: int | None = None
+    skills_max: int | None = None
+    labels: dict[str, str] = field(default_factory=dict)
+    order: tuple[str, ...] = ("header", "summary", "skills", "experience",
+                              "projects", "education", "certifications")
 
 
-def _section_label(template: ResolvedTemplate, key: str, fallback: str) -> str:
-    for s in template.config.get("sections", []):
-        if s.get("key") == key:
-            lbl = s.get("label")
-            if isinstance(lbl, str) and lbl.strip():
-                return lbl
-    return fallback
+_DESIGNS: dict[str, _Design] = {
+    # Centred serif, black rules — template-classic.tsx
+    "classic": _Design(
+        family="classic", serif=True, accent="#111111", ink="#111111", body="#111111",
+        muted="#444444", header_align="centered", name_size=20, section_rule="#111111",
+        contact_sep="  |  ", company_italic=True, projects_max=3,
+        labels={"summary": "Summary", "skills": "Skills", "experience": "Experience",
+                "projects": "Projects", "education": "Education", "certifications": "Certifications"},
+    ),
+    # Sans, teal accent, left accent bar — template-modern.tsx
+    "modern": _Design(
+        family="modern", serif=False, accent="#0F766E", header_bar=True,
+        section_rule="#0F766E", section_rule_width=1.25, role_company_sep="  ·  ",
+        company_italic=False, projects_max=3,
+        labels={"summary": "Professional Summary", "skills": "Core Skills",
+                "experience": "Experience", "projects": "Selected Projects",
+                "education": "Education", "certifications": "Certifications"},
+    ),
+    # Navy band, single column — template-sidebar.tsx (Navy Header)
+    "sidebar": _Design(
+        family="sidebar", serif=False, accent="#1E3A5F", header_band=True,
+        contact_sep="  |  ", section_rule="#1E3A5F", company_italic=False,
+        summary_max=420, margins=(28, 40, 46, 46),
+        labels={"summary": "Summary", "skills": "Skills", "experience": "Experience",
+                "projects": "Projects", "education": "Education", "certifications": "Certifications"},
+    ),
+    # Centred serif, uppercase name, centred headings — template-executive.tsx
+    "executive": _Design(
+        family="executive", serif=True, accent="#111111", ink="#111111", muted="#475569",
+        header_align="centered", name_upper=True, name_bold=False, name_size=24,
+        headline_italic=True, contact_sep="  |  ", header_rule="#94A3B8",
+        section_align="center", section_rule="#94A3B8", section_rule_width=0.5,
+        skills_centered=True, projects_max=2, skills_max=18, margins=(46, 46, 52, 52),
+        labels={"summary": "Profile", "skills": "Areas of Expertise", "experience": "Experience",
+                "projects": "Key Projects", "education": "Education",
+                "certifications": "Certifications"},
+        order=("header", "summary", "experience", "skills", "projects",
+               "education", "certifications"),
+    ),
+}
+
+_SERIF_HINTS = ("georgia", "times", "garamond", "serif", "cambria", "book")
+_DEFAULT_LABELS = {s["key"]: s["label"] for s in DEFAULT_SECTIONS}
+_DEFAULT_ORDER = [s["key"] for s in DEFAULT_SECTIONS]
 
 
-def _enabled_sections_in_order(template: ResolvedTemplate) -> list[str]:
-    secs = [s for s in template.config.get("sections", []) if s.get("enabled")]
-    secs.sort(key=lambda s: s.get("order", 999))
-    return [s["key"] for s in secs]
+def _design_for(template: ResolvedTemplate) -> tuple[_Design, list[str], dict[str, str]]:
+    """
+    Family preset + the template config's user edits.
+
+    Returns (design, ordered enabled section keys, labels). A config value
+    only overrides the preset when it differs from the generic default, so
+    an untouched copy of a system template renders exactly like its preview.
+    """
+    base = _DESIGNS.get(template.base_template, _DESIGNS["classic"])
+    cfg = template.config or {}
+    st = cfg.get("styles") or {}
+
+    def changed(key: str) -> bool:
+        return key in st and st[key] != DEFAULT_STYLES.get(key)
+
+    d = base
+    if changed("font_family"):
+        d = replace(d, serif=any(h in str(st["font_family"]).lower() for h in _SERIF_HINTS))
+    if changed("accent_color"):
+        d = replace(d, accent=st["accent_color"],
+                    section_rule=st["accent_color"] if d.section_rule else None)
+    if changed("header_style"):
+        d = replace(d, header_align=st["header_style"])
+    if changed("body_font_size"):
+        d = replace(d, body_size=float(st["body_font_size"]))
+    if changed("heading_font_size"):
+        d = replace(d, heading_size=float(st["heading_font_size"]))
+    if changed("line_height"):
+        d = replace(d, line_height=float(st["line_height"]))
+    if changed("section_spacing"):
+        d = replace(d, section_spacing=float(st["section_spacing"]))
+    t, b, l, r = d.margins
+    d = replace(d, margins=(
+        float(st["margin_top"]) if changed("margin_top") else t,
+        float(st["margin_bottom"]) if changed("margin_bottom") else b,
+        float(st["margin_left"]) if changed("margin_left") else l,
+        float(st["margin_right"]) if changed("margin_right") else r,
+    ))
+
+    sections = [s for s in (cfg.get("sections") or []) if s.get("key") in ALLOWED_SECTION_KEYS]
+    if not sections:
+        sections = [dict(s) for s in DEFAULT_SECTIONS]
+    enabled = {s["key"] for s in sections if s.get("enabled")}
+    cfg_order = [s["key"] for s in sorted(sections, key=lambda s: s.get("order", 0))]
+    order = list(d.order) if cfg_order == _DEFAULT_ORDER else cfg_order
+    order = [k for k in order if k in enabled]
+    if "header" in enabled and "header" in order:
+        order.remove("header")
+        order.insert(0, "header")  # the header always leads
+
+    labels = dict(d.labels)
+    for s in sections:
+        lbl = (s.get("label") or "").strip()
+        if lbl and lbl != _DEFAULT_LABELS.get(s["key"]):
+            labels[s["key"]] = lbl
+    return d, order, labels
 
 
 # ── PDF ────────────────────────────────────────────────────────────────────
 
-def _build_pdf(data: "_ResumeData", template: ResolvedTemplate) -> bytes:
+def _build_pdf(data: _ResumeData, template: ResolvedTemplate) -> bytes:
     from reportlab.lib import colors
-    from reportlab.lib.enums import TA_LEFT, TA_RIGHT, TA_JUSTIFY, TA_CENTER
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
     from reportlab.lib.pagesizes import letter
-    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.styles import ParagraphStyle
     from reportlab.platypus import (
-        HRFlowable, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle,
+        HRFlowable, KeepTogether, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle,
     )
 
-    styles = template.config.get("styles", {})
-    regular, bold, italic = _pdf_font_family(styles)
-    accent = colors.HexColor(styles.get("accent_color") or "#1D4ED8")
-    dark   = colors.HexColor("#0F172A")
-    body_c = colors.HexColor("#1E293B")
-    mid    = colors.HexColor("#475569")
-    light  = colors.HexColor("#64748B")
+    d, order, labels = _design_for(template)
+    reg, bold, ital = (("Times-Roman", "Times-Bold", "Times-Italic") if d.serif
+                       else ("Helvetica", "Helvetica-Bold", "Helvetica-Oblique"))
+    C = colors.HexColor
+    accent, ink, body_c, muted = C(d.accent), C(d.ink), C(d.body), C(d.muted)
+    bs, hs, lh = d.body_size, d.heading_size, d.line_height
+    band = d.header_band
+    hdr_color = colors.white if band else ink
+    hdr_sub = C("#E2E8F0") if band else muted
+    h_align = TA_CENTER if d.header_align == "centered" else TA_LEFT
 
-    body_size    = float(styles.get("body_font_size", 10))
-    head_size    = float(styles.get("heading_font_size", 12))
-    lh_ratio     = float(styles.get("line_height", 1.35))
-    sec_spacing  = float(styles.get("section_spacing", 8))
-    m_t          = float(styles.get("margin_top", 40))
-    m_b          = float(styles.get("margin_bottom", 40))
-    m_l          = float(styles.get("margin_left", 46))
-    m_r          = float(styles.get("margin_right", 46))
-    header_align = styles.get("header_style", "left")
+    def S(name: str, **kw) -> ParagraphStyle:
+        kw.setdefault("fontName", reg)
+        kw.setdefault("fontSize", bs)
+        kw.setdefault("leading", kw["fontSize"] * lh)
+        kw.setdefault("textColor", body_c)
+        return ParagraphStyle(name, **kw)
 
-    PAGE_W, PAGE_H = letter
-    buf = io.BytesIO()
-    doc = SimpleDocTemplate(
-        buf, pagesize=letter,
-        leftMargin=m_l, rightMargin=m_r,
-        topMargin=m_t, bottomMargin=m_b,
-    )
-
-    _base = getSampleStyleSheet()["Normal"]
-
-    def S(name, **kw):
-        return ParagraphStyle(name, parent=_base, **kw)
-
-    style_pack = {
-        "name":     S("N", fontName=bold, fontSize=head_size * 1.8, leading=head_size * 2.2,
-                       textColor=dark, alignment=TA_CENTER if header_align == "centered" else TA_LEFT),
-        "headline": S("H", fontName=regular, fontSize=body_size + 1, leading=(body_size + 1) * lh_ratio,
-                       textColor=accent, alignment=TA_CENTER if header_align == "centered" else TA_LEFT),
-        "contact":  S("C", fontName=regular, fontSize=body_size - 1, leading=(body_size - 1) * lh_ratio,
-                       textColor=light, alignment=TA_CENTER if header_align == "centered" else TA_LEFT),
-        "sec":      S("Sec", fontName=bold, fontSize=head_size, leading=head_size * 1.2,
-                       textColor=accent, spaceBefore=sec_spacing, spaceAfter=2),
-        "body":     S("B", fontName=regular, fontSize=body_size, leading=body_size * lh_ratio,
-                       textColor=body_c, alignment=TA_JUSTIFY),
-        "bullet":   S("Bul", fontName=regular, fontSize=body_size, leading=body_size * lh_ratio,
-                       textColor=body_c, leftIndent=14, spaceAfter=1.5),
-        "role":     S("R", fontName=bold, fontSize=body_size + 0.5, leading=(body_size + 0.5) * lh_ratio,
-                       textColor=dark),
-        "company":  S("Co", fontName=italic, fontSize=body_size, leading=body_size * lh_ratio,
-                       textColor=accent),
-        "date":     S("D", fontName=regular, fontSize=body_size - 1, leading=(body_size - 1) * lh_ratio,
-                       textColor=mid, alignment=TA_RIGHT),
-        "sub":      S("Sub", fontName=italic, fontSize=body_size, leading=body_size * lh_ratio,
-                       textColor=mid),
-        "accent":   accent,
-        "rule":     colors.HexColor("#CBD5E1"),
+    st = {
+        "name": S("name", fontName=bold if d.name_bold else reg, fontSize=d.name_size,
+                  leading=d.name_size * 1.2, textColor=hdr_color, alignment=h_align),
+        "headline": S("headline", fontName=ital if d.headline_italic else (reg if d.serif else bold),
+                      fontSize=bs + 1, textColor=(hdr_sub if band else (accent if d.family == "modern" else muted)),
+                      alignment=h_align, spaceBefore=2),
+        "contact": S("contact", fontSize=bs - 0.5, textColor=hdr_sub, alignment=h_align, spaceBefore=3),
+        "sec": S("sec", fontName=bold, fontSize=hs, leading=hs * 1.25, textColor=accent,
+                 alignment=TA_CENTER if d.section_align == "center" else TA_LEFT,
+                 spaceBefore=d.section_spacing, spaceAfter=1),
+        "body": S("body"),
+        "center": S("center", alignment=TA_CENTER),
+        "bullet": S("bullet", leftIndent=12, bulletIndent=2, spaceAfter=1.2),
+        "role": S("role", fontName=bold, fontSize=bs + 0.5, textColor=ink),
+        "date": S("date", fontSize=bs - 1, textColor=muted, alignment=TA_RIGHT),
+        "sub": S("sub", fontName=ital if d.serif else reg, textColor=muted),
     }
+    company_tag = ("i",) if d.company_italic else ()
+    company_color = d.accent if d.family in ("modern", "sidebar") else d.ink
+
+    def company_markup(company: str) -> str:
+        txt = f"<font color='{company_color}'>{_x(company)}</font>"
+        for t in company_tag:
+            txt = f"<{t}>{txt}</{t}>"
+        return txt
 
     story: list = []
     add = story.append
 
-    def rule(color=None, thickness=1.0):
-        add(HRFlowable(width="100%", thickness=thickness,
-                       color=color or style_pack["accent"], spaceAfter=4))
+    def title_row(left_markup: str, right_text: str, style=st["role"]):
+        left = Paragraph(left_markup, style)
+        if not right_text:
+            add(left)
+            return
+        t = Table([[left, Paragraph(_x(right_text), st["date"])]], colWidths=["72%", "28%"])
+        t.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "BOTTOM"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+            ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+        ]))
+        add(t)
 
-    def section_head(label: str):
-        add(Paragraph(label.upper(), style_pack["sec"]))
-        rule()
+    def section_head(key: str):
+        label = labels.get(key, _DEFAULT_LABELS.get(key, key.title()))
+        add(Paragraph(_x(label.upper()), st["sec"]))
+        if d.section_rule:
+            add(HRFlowable(width="100%", thickness=d.section_rule_width,
+                           color=C(d.section_rule), spaceBefore=1, spaceAfter=4))
+        else:
+            add(Spacer(1, 3))
 
-    renderers = {
-        "header":         lambda: _pdf_header(data, style_pack, template, add, rule),
-        "summary":        lambda: _pdf_simple(data.summary, "summary", template, style_pack, add, section_head),
-        "skills":         lambda: _pdf_skills(data, style_pack, template, add, section_head),
-        "experience":     lambda: _pdf_experience(data, style_pack, template, add, section_head),
-        "projects":       lambda: _pdf_projects(data, style_pack, template, add, section_head),
-        "education":      lambda: _pdf_education(data, style_pack, template, add, section_head),
-        "certifications": lambda: _pdf_certifications(data, style_pack, template, add, section_head),
-    }
-
-    for key in _enabled_sections_in_order(template):
-        fn = renderers.get(key)
-        if fn:
-            fn()
-
-    doc.build(story)
-    return buf.getvalue()
-
-
-def _pdf_header(data, sp, template, add, rule):
-    from reportlab.platypus import Paragraph, Spacer
-    add(Paragraph(data.full_name or "Resume", sp["name"]))
+    # Header ---------------------------------------------------------------
+    header_flow: list = []
+    name = data.full_name or "Resume"
+    header_flow.append(Paragraph(_x(name.upper() if d.name_upper else name), st["name"]))
     if data.headline:
-        add(Paragraph(data.headline, sp["headline"]))
-    contact = "  ·  ".join([p for p in [data.email, data.location] if p])
+        header_flow.append(Paragraph(_x(data.headline), st["headline"]))
+    contact = data.contact_parts()
     if contact:
-        add(Paragraph(contact, sp["contact"]))
-    add(Spacer(1, 4))
+        header_flow.append(Paragraph(_x(d.contact_sep.join(contact)), st["contact"]))
 
-
-def _pdf_simple(text, key, template, sp, add, section_head):
-    from reportlab.platypus import Paragraph
-    if not text:
-        return
-    section_head(_section_label(template, key, "Professional Summary"))
-    add(Paragraph(text, sp["body"]))
-
-
-def _pdf_skills(data, sp, template, add, section_head):
-    from reportlab.platypus import Paragraph
-    if not data.skills:
-        return
-    section_head(_section_label(template, "skills", "Skills"))
-    names = [f"{s['name']} ({s['level']})" if s.get("level") else s["name"] for s in data.skills]
-    add(Paragraph("  ·  ".join(names), sp["body"]))
-
-
-def _pdf_experience(data, sp, template, add, section_head):
-    from reportlab.platypus import Paragraph, Spacer, Table, TableStyle
-    if not data.experiences:
-        return
-    section_head(_section_label(template, "experience", "Work Experience"))
-    for e in data.experiences:
-        role = e.get("role", "")
-        company = e.get("company", "")
-        start = _fmt_date(e.get("start_date"))
-        end = _fmt_date(e.get("end_date"))
-        left = Paragraph(f"<b>{role}</b>  —  <i>{company}</i>", sp["role"])
-        right = Paragraph(f"{start} – {end}", sp["date"])
-        t = Table([[left, right]], colWidths=["70%", "30%"])
-        t.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"),
-                                ("LEFTPADDING", (0, 0), (-1, -1), 0),
-                                ("RIGHTPADDING", (0, 0), (-1, -1), 0)]))
-        add(t)
-        for b in _bullets(e.get("description"), 6):
-            add(Paragraph(f"• {b}", sp["bullet"]))
-        add(Spacer(1, 3))
-
-
-def _pdf_projects(data, sp, template, add, section_head):
-    from reportlab.platypus import Paragraph, Spacer
-    if not data.projects:
-        return
-    section_head(_section_label(template, "projects", "Projects"))
-    for p in data.projects:
-        name = p.get("name", "")
-        tech = p.get("technologies", "")
-        desc = p.get("description", "")
-        line = f"<b>{name}</b>"
-        if tech:
-            line += f"  |  <font color='{sp['accent'].hexval()}'>{tech}</font>"
-        add(Paragraph(line, sp["role"]))
-        if desc:
-            add(Paragraph(desc[:400], sp["sub"]))
-        add(Spacer(1, 2))
-
-
-def _pdf_education(data, sp, template, add, section_head):
-    from reportlab.platypus import Paragraph, Table, TableStyle
-    if not data.educations:
-        return
-    section_head(_section_label(template, "education", "Education"))
-    for edu in data.educations:
-        inst = edu.get("institution", "")
-        degree = edu.get("degree", "")
-        field = edu.get("field_of_study", "")
-        start = _fmt_date(edu.get("start_date"))
-        end = _fmt_date(edu.get("end_date"))
-        line = ", ".join(filter(None, [degree, field]))
-        left = Paragraph(f"<b>{inst}</b>", sp["role"])
-        right = Paragraph(f"{start} – {end}", sp["date"])
-        t = Table([[left, right]], colWidths=["70%", "30%"])
-        t.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"),
-                                ("LEFTPADDING", (0, 0), (-1, -1), 0),
-                                ("RIGHTPADDING", (0, 0), (-1, -1), 0)]))
-        add(t)
-        if line:
-            add(Paragraph(line, sp["sub"]))
-
-
-def _pdf_certifications(data, sp, template, add, section_head):
-    from reportlab.platypus import Paragraph
-    if not data.certifications:
-        return
-    section_head(_section_label(template, "certifications", "Certifications"))
-    for c in data.certifications:
-        name = c.get("name", "")
-        issuer = c.get("issuer", "")
-        issued = _fmt_date(c.get("issue_date"))
-        parts = [f"<b>{name}</b>"]
-        if issuer:
-            parts.append(f"— {issuer}")
-        if c.get("issue_date"):
-            parts.append(f"({issued})")
-        add(Paragraph(" ".join(parts), sp["body"]))
-
-
-# ── DOCX ───────────────────────────────────────────────────────────────────
-
-def _build_docx(data: "_ResumeData", template: ResolvedTemplate) -> bytes:
-    from docx import Document
-    from docx.shared import Pt, RGBColor, Inches
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
-    from docx.oxml.ns import qn
-    from docx.oxml import OxmlElement
-
-    styles = template.config.get("styles", {})
-    body_size = float(styles.get("body_font_size", 10))
-    head_size = float(styles.get("heading_font_size", 12))
-    accent_hex = (styles.get("accent_color") or "#1D4ED8").lstrip("#")
-    header_align = styles.get("header_style", "left")
-    font_name = styles.get("font_family") or "Helvetica"
-    # python-docx is fine with any font string; Word will fall back locally.
-
-    ACCENT = RGBColor.from_string(accent_hex)
-    DARK   = RGBColor(0x0F, 0x17, 0x2A)
-    MID    = RGBColor(0x47, 0x55, 0x69)
-    LIGHT  = RGBColor(0x64, 0x74, 0x8B)
-
-    doc = Document()
-    section = doc.sections[0]
-    section.top_margin    = Inches(float(styles.get("margin_top",    40)) / 72)
-    section.bottom_margin = Inches(float(styles.get("margin_bottom", 40)) / 72)
-    section.left_margin   = Inches(float(styles.get("margin_left",   46)) / 72)
-    section.right_margin  = Inches(float(styles.get("margin_right",  46)) / 72)
-
-    def add_run(p, text, *, bold=False, italic=False, color=None, size_pt=None):
-        r = p.add_run(text)
-        r.font.name = font_name
-        r.bold = bold
-        r.italic = italic
-        if color is not None:
-            r.font.color.rgb = color
-        if size_pt is not None:
-            r.font.size = Pt(size_pt)
-        return r
-
-    def section_heading(label):
-        p = doc.add_paragraph()
-        p.paragraph_format.space_before = Pt(6)
-        p.paragraph_format.space_after = Pt(2)
-        add_run(p, label.upper(), bold=True, color=ACCENT, size_pt=head_size)
-        # thin bottom border
-        pPr = p._p.get_or_add_pPr()
-        pBdr = OxmlElement("w:pBdr")
-        bottom = OxmlElement("w:bottom")
-        bottom.set(qn("w:val"), "single")
-        bottom.set(qn("w:sz"), "4")
-        bottom.set(qn("w:space"), "1")
-        bottom.set(qn("w:color"), accent_hex)
-        pBdr.append(bottom)
-        pPr.append(pBdr)
-        return p
+    page_w, page_h = letter
+    m_t, m_b, m_l, m_r = d.margins
+    frame_w = page_w - m_l - m_r
+    band_h = 0.0
+    if band:
+        h = sum(f.wrap(frame_w, page_h)[1] + f.getSpaceBefore() for f in header_flow)
+        band_h = m_t + h + 16
 
     def render_header():
-        p = doc.add_paragraph()
-        if header_align == "centered":
-            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        add_run(p, data.full_name or "Resume", bold=True, color=DARK, size_pt=head_size * 1.8)
-        if data.headline:
-            hp = doc.add_paragraph()
-            if header_align == "centered":
-                hp.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            add_run(hp, data.headline, color=ACCENT, size_pt=body_size + 1)
-        contact_parts = [p for p in [data.email, data.location] if p]
-        if contact_parts:
-            cp = doc.add_paragraph()
-            if header_align == "centered":
-                cp.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            add_run(cp, "  ·  ".join(contact_parts), color=LIGHT, size_pt=body_size - 1)
+        if d.header_bar:
+            t = Table([[header_flow]], colWidths=[frame_w])
+            t.setStyle(TableStyle([
+                ("LINEBEFORE", (0, 0), (0, 0), 3.5, accent),
+                ("LEFTPADDING", (0, 0), (-1, -1), 10), ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                ("TOPPADDING", (0, 0), (-1, -1), 1), ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+            ]))
+            add(t)
+        else:
+            story.extend(header_flow)
+        if band:
+            add(Spacer(1, 18))
+        elif d.header_rule:
+            add(HRFlowable(width="100%", thickness=0.6, color=C(d.header_rule),
+                           spaceBefore=6, spaceAfter=2))
+        else:
+            add(Spacer(1, 4))
 
+    # Sections -------------------------------------------------------------
     def render_summary():
         if not data.summary:
             return
-        section_heading(_section_label(template, "summary", "Professional Summary"))
-        p = doc.add_paragraph(data.summary)
-        for r in p.runs:
-            r.font.size = Pt(body_size)
-            r.font.color.rgb = MID
-            r.font.name = font_name
+        section_head("summary")
+        add(Paragraph(_x(_truncate_summary(data.summary, d.summary_max)), st["body"]))
 
     def render_skills():
-        if not data.skills:
+        skills = data.skills[: d.skills_max] if d.skills_max else data.skills
+        if not skills:
             return
-        section_heading(_section_label(template, "skills", "Skills"))
-        names = [f"{s['name']} ({s['level']})" if s.get("level") else s["name"] for s in data.skills]
-        p = doc.add_paragraph("  ·  ".join(names))
-        for r in p.runs:
-            r.font.size = Pt(body_size)
-            r.font.color.rgb = MID
-            r.font.name = font_name
+        section_head("skills")
+        parts = [f"<b>{_x(s['name'])}</b>" if data.matches_jd(s["name"]) else _x(s["name"])
+                 for s in skills]
+        add(Paragraph("  ·  ".join(parts), st["center"] if d.skills_centered else st["body"]))
 
     def render_experience():
         if not data.experiences:
             return
-        section_heading(_section_label(template, "experience", "Work Experience"))
+        section_head("experience")
         for e in data.experiences:
-            role = e.get("role", "")
-            company = e.get("company", "")
-            start = _fmt_date(e.get("start_date"))
-            end = _fmt_date(e.get("end_date"))
-            row = doc.add_paragraph()
-            add_run(row, role, bold=True, color=DARK, size_pt=body_size + 0.5)
-            add_run(row, "  —  ", color=MID, size_pt=body_size)
-            add_run(row, company, italic=True, color=ACCENT, size_pt=body_size)
-            add_run(row, f"   {start} – {end}", color=LIGHT, size_pt=body_size - 1)
-            for b in _bullets(e.get("description"), 6):
-                bp = doc.add_paragraph(style="List Bullet")
-                bp.paragraph_format.left_indent = Inches(0.2)
-                r = bp.add_run(b)
-                r.font.size = Pt(body_size)
-                r.font.color.rgb = MID
-                r.font.name = font_name
+            role, company = e.get("role") or "", e.get("company") or ""
+            left = f"<b>{_x(role)}</b>"
+            if company:
+                left += f"{_x(d.role_company_sep)}{company_markup(company)}"
+            block: list = []
+            story_len = len(story)
+            title_row(left, _fmt_range(e.get("start_date"), e.get("end_date")))
+            for b in _bullets(e.get("description"), 5):
+                add(Paragraph(_x(b), st["bullet"], bulletText="•"))
+            add(Spacer(1, 4))
+            block = story[story_len:]
+            del story[story_len:]
+            add(KeepTogether(block[:3]))  # keep title with its first bullets
+            story.extend(block[3:])
 
     def render_projects():
-        if not data.projects:
+        projs = data.projects[: d.projects_max] if d.projects_max else data.projects
+        if not projs:
             return
-        section_heading(_section_label(template, "projects", "Projects"))
-        for proj in data.projects:
-            name = proj.get("name", "")
-            tech = proj.get("technologies", "")
-            desc = proj.get("description", "")
-            p = doc.add_paragraph()
-            add_run(p, name, bold=True, color=DARK, size_pt=body_size)
-            if tech:
-                add_run(p, f"  |  {tech}", color=ACCENT, size_pt=body_size - 1)
-            if desc:
-                dp = doc.add_paragraph(desc[:400])
-                for r in dp.runs:
-                    r.font.size = Pt(body_size)
-                    r.font.color.rgb = MID
-                    r.font.name = font_name
+        section_head("projects")
+        for p in projs:
+            line = f"<b>{_x(p.get('name'))}</b>"
+            if p.get("technologies"):
+                line += f"  |  <font color='{d.accent}'>{_x(p['technologies'])}</font>"
+            add(Paragraph(line, st["body"]))
+            if p.get("description"):
+                add(Paragraph(_x(p["description"]), st["body"]))
+            add(Spacer(1, 3))
 
     def render_education():
         if not data.educations:
             return
-        section_heading(_section_label(template, "education", "Education"))
-        for edu in data.educations:
-            inst = edu.get("institution", "")
-            degree = edu.get("degree", "")
-            field = edu.get("field_of_study", "")
-            start = _fmt_date(edu.get("start_date"))
-            end = _fmt_date(edu.get("end_date"))
-            line = ", ".join(filter(None, [degree, field]))
-            p = doc.add_paragraph()
-            add_run(p, inst, bold=True, color=DARK, size_pt=body_size + 0.5)
-            add_run(p, f"   {start} – {end}", color=LIGHT, size_pt=body_size - 1)
-            if line:
-                dp = doc.add_paragraph(line)
-                for r in dp.runs:
-                    r.font.size = Pt(body_size)
-                    r.font.color.rgb = MID
-                    r.font.name = font_name
+        section_head("education")
+        for e in data.educations:
+            title_row(f"<b>{_x(e.get('institution'))}</b>",
+                      _fmt_range(e.get("start_date"), e.get("end_date")))
+            deg = ", ".join(x for x in (e.get("degree"), e.get("field_of_study")) if x)
+            if deg:
+                add(Paragraph(_x(deg), st["sub"]))
+            add(Spacer(1, 3))
 
     def render_certifications():
         if not data.certifications:
             return
-        section_heading(_section_label(template, "certifications", "Certifications"))
+        section_head("certifications")
         for c in data.certifications:
-            name = c.get("name", "")
-            issuer = c.get("issuer", "")
-            issued = _fmt_date(c.get("issue_date"))
-            p = doc.add_paragraph()
-            add_run(p, name, bold=True, color=DARK, size_pt=body_size)
-            if issuer:
-                add_run(p, f"  —  {issuer}", color=MID, size_pt=body_size - 0.5)
+            line = f"<b>{_x(c.get('name'))}</b>"
+            if c.get("issuer"):
+                line += f" — {_x(c['issuer'])}"
             if c.get("issue_date"):
-                add_run(p, f"  ({issued})", color=LIGHT, size_pt=body_size - 1)
+                line += f" ({_x(_fmt_date(c['issue_date']))})"
+            add(Paragraph(line, st["body"]))
 
     renderers = {
-        "header":         render_header,
-        "summary":        render_summary,
-        "skills":         render_skills,
-        "experience":     render_experience,
-        "projects":       render_projects,
-        "education":      render_education,
-        "certifications": render_certifications,
+        "header": render_header, "summary": render_summary, "skills": render_skills,
+        "experience": render_experience, "projects": render_projects,
+        "education": render_education, "certifications": render_certifications,
     }
-    for key in _enabled_sections_in_order(template):
-        fn = renderers.get(key)
-        if fn:
-            fn()
+    for key in order:
+        renderers[key]()
+
+    def first_page(canvas, _doc):
+        canvas.setTitle(f"{data.full_name or 'Resume'} — Resume")
+        canvas.setAuthor(data.full_name or "")
+        if band:
+            canvas.saveState()
+            canvas.setFillColor(accent)
+            canvas.rect(0, page_h - band_h, page_w, band_h, stroke=0, fill=1)
+            canvas.restoreState()
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=letter, leftMargin=m_l, rightMargin=m_r,
+                            topMargin=m_t, bottomMargin=m_b,
+                            title=f"{data.full_name or 'Resume'} — Resume")
+    doc.build(story, onFirstPage=first_page)
+    return buf.getvalue()
+
+
+# ── DOCX ───────────────────────────────────────────────────────────────────
+
+def _build_docx(data: _ResumeData, template: ResolvedTemplate) -> bytes:
+    from docx import Document
+    from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_TAB_ALIGNMENT
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    from docx.shared import Inches, Pt, RGBColor
+
+    d, order, labels = _design_for(template)
+    font = "Georgia" if d.serif else "Calibri"
+    rgb = lambda h: RGBColor.from_string(h.lstrip("#").upper()[:6].rjust(6, "0"))  # noqa: E731
+    ACCENT, INK, BODY, MUTED = rgb(d.accent), rgb(d.ink), rgb(d.body), rgb(d.muted)
+    WHITE, BAND_SUB = RGBColor(0xFF, 0xFF, 0xFF), RGBColor(0xE2, 0xE8, 0xF0)
+    bs, hs = d.body_size + 0.5, d.heading_size + 0.5   # Word renders a touch smaller
+    centered = d.header_align == "centered"
+
+    doc = Document()
+    sec = doc.sections[0]
+    sec.page_width, sec.page_height = Inches(8.5), Inches(11)
+    m_t, m_b, m_l, m_r = d.margins
+    sec.top_margin, sec.bottom_margin = Inches(m_t / 72), Inches(m_b / 72)
+    sec.left_margin, sec.right_margin = Inches(m_l / 72), Inches(m_r / 72)
+    text_width = sec.page_width - sec.left_margin - sec.right_margin
+
+    normal = doc.styles["Normal"]
+    normal.font.name = font
+    normal.font.size = Pt(bs)
+    normal.element.rPr.rFonts.set(qn("w:eastAsia"), font)
+    normal.paragraph_format.space_after = Pt(0)
+    normal.paragraph_format.line_spacing = d.line_height * 0.9
+
+    doc.core_properties.title = f"{data.full_name or 'Resume'} — Resume"
+    doc.core_properties.author = data.full_name or ""
+
+    def run(p, text, *, bold=False, italic=False, color=None, size=None, spacing=None):
+        r = p.add_run(text)
+        r.bold, r.italic = bold, italic
+        if color is not None:
+            r.font.color.rgb = color
+        if size is not None:
+            r.font.size = Pt(size)
+        if spacing:
+            rpr = r._r.get_or_add_rPr()
+            sp = OxmlElement("w:spacing")
+            sp.set(qn("w:val"), str(int(spacing * 20)))
+            rpr.append(sp)
+        return r
+
+    def border(p, side: str, color: str, size_eighths: int, space: int = 1):
+        ppr = p._p.get_or_add_pPr()
+        bdr = ppr.find(qn("w:pBdr"))
+        if bdr is None:
+            bdr = OxmlElement("w:pBdr")
+            ppr.append(bdr)
+        el = OxmlElement(f"w:{side}")
+        el.set(qn("w:val"), "single")
+        el.set(qn("w:sz"), str(size_eighths))
+        el.set(qn("w:space"), str(space))
+        el.set(qn("w:color"), color.lstrip("#"))
+        bdr.append(el)
+
+    def shade(p, color: str):
+        ppr = p._p.get_or_add_pPr()
+        shd = OxmlElement("w:shd")
+        shd.set(qn("w:val"), "clear")
+        shd.set(qn("w:color"), "auto")
+        shd.set(qn("w:fill"), color.lstrip("#"))
+        ppr.append(shd)
+
+    def para(align=None, before=0, after=0, indent_left=None):
+        p = doc.add_paragraph()
+        pf = p.paragraph_format
+        pf.space_before, pf.space_after = Pt(before), Pt(after)
+        if align == "center":
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        if indent_left is not None:
+            pf.left_indent = indent_left
+        return p
+
+    def title_line(left_parts: list[tuple[str, dict]], right: str):
+        """Title on the left, dates right-aligned via a tab stop (no tables)."""
+        p = para(before=3)
+        p.paragraph_format.tab_stops.add_tab_stop(text_width, WD_TAB_ALIGNMENT.RIGHT)
+        p.paragraph_format.keep_with_next = True
+        for text, kw in left_parts:
+            run(p, text, **kw)
+        if right:
+            run(p, "\t" + right, color=MUTED, size=bs - 1)
+        return p
+
+    def section_head(key: str):
+        label = labels.get(key, _DEFAULT_LABELS.get(key, key.title()))
+        p = para(align="center" if d.section_align == "center" else None,
+                 before=d.section_spacing, after=3)
+        p.paragraph_format.keep_with_next = True
+        run(p, label.upper(), bold=True, color=ACCENT, size=hs,
+            spacing=1.5 if d.section_align == "center" else 0.6)
+        if d.section_rule:
+            border(p, "bottom", d.section_rule, max(2, int(d.section_rule_width * 6)))
+
+    # Header ---------------------------------------------------------------
+    def render_header():
+        band = d.header_band
+        align = "center" if centered else None
+        name = data.full_name or "Resume"
+        lines: list = []
+        p = para(align=align)
+        run(p, name.upper() if d.name_upper else name, bold=d.name_bold,
+            color=WHITE if band else INK, size=d.name_size,
+            spacing=2.5 if d.name_upper else None)
+        lines.append(p)
+        if data.headline:
+            p = para(align=align, before=2)
+            run(p, data.headline, italic=d.headline_italic, bold=not d.serif,
+                color=BAND_SUB if band else (ACCENT if d.family == "modern" else MUTED), size=bs + 1)
+            lines.append(p)
+        contact = data.contact_parts()
+        if contact:
+            p = para(align=align, before=3)
+            run(p, d.contact_sep.join(contact), color=BAND_SUB if band else MUTED, size=bs - 0.5)
+            lines.append(p)
+        if band:
+            for i, p in enumerate(lines):
+                shade(p, d.accent)
+                p.paragraph_format.left_indent = Inches(0.12)
+                p.paragraph_format.right_indent = Inches(0.12)
+            lines[0].paragraph_format.space_before = Pt(0)
+            # padding inside the band
+            for ln in (lines[0], lines[-1]):
+                border(ln, "top" if ln is lines[0] else "bottom", d.accent, 24, 6)
+            para(after=6)
+        elif d.header_bar:
+            for p in lines:
+                border(p, "left", d.accent, 24, 8)
+            para(after=4)
+        elif d.header_rule:
+            border(lines[-1], "bottom", d.header_rule, 4, 6)
+            para(after=2)
+        else:
+            para(after=2)
+
+    def render_summary():
+        if not data.summary:
+            return
+        section_head("summary")
+        p = para()
+        run(p, _truncate_summary(data.summary, d.summary_max), color=BODY)
+
+    def render_skills():
+        skills = data.skills[: d.skills_max] if d.skills_max else data.skills
+        if not skills:
+            return
+        section_head("skills")
+        p = para(align="center" if d.skills_centered else None)
+        for i, s in enumerate(skills):
+            run(p, s["name"], bold=data.matches_jd(s["name"]), color=BODY)
+            if i < len(skills) - 1:
+                run(p, "  ·  ", color=MUTED)
+
+    def render_experience():
+        if not data.experiences:
+            return
+        section_head("experience")
+        for e in data.experiences:
+            parts: list[tuple[str, dict]] = [(e.get("role") or "", {"bold": True, "color": INK})]
+            if e.get("company"):
+                parts.append((d.role_company_sep, {"color": MUTED}))
+                parts.append((e["company"], {
+                    "italic": d.company_italic,
+                    "color": ACCENT if d.family in ("modern", "sidebar") else INK,
+                }))
+            title_line(parts, _fmt_range(e.get("start_date"), e.get("end_date")))
+            for b in _bullets(e.get("description"), 5):
+                p = doc.add_paragraph(style="List Bullet")
+                p.paragraph_format.space_after = Pt(1)
+                run(p, b, color=BODY)
+            para(after=2)
+
+    def render_projects():
+        projs = data.projects[: d.projects_max] if d.projects_max else data.projects
+        if not projs:
+            return
+        section_head("projects")
+        for pr in projs:
+            p = para(before=2)
+            run(p, pr.get("name") or "", bold=True, color=INK)
+            if pr.get("technologies"):
+                run(p, f"  |  {pr['technologies']}", color=ACCENT, size=bs - 0.5)
+            if pr.get("description"):
+                q = para(after=2)
+                run(q, pr["description"], color=BODY)
+
+    def render_education():
+        if not data.educations:
+            return
+        section_head("education")
+        for e in data.educations:
+            title_line([(e.get("institution") or "", {"bold": True, "color": INK})],
+                       _fmt_range(e.get("start_date"), e.get("end_date")))
+            deg = ", ".join(x for x in (e.get("degree"), e.get("field_of_study")) if x)
+            if deg:
+                p = para(after=2)
+                run(p, deg, italic=d.serif, color=MUTED)
+
+    def render_certifications():
+        if not data.certifications:
+            return
+        section_head("certifications")
+        for c in data.certifications:
+            p = para(after=1)
+            run(p, c.get("name") or "", bold=True, color=INK)
+            if c.get("issuer"):
+                run(p, f" — {c['issuer']}", color=BODY)
+            if c.get("issue_date"):
+                run(p, f" ({_fmt_date(c['issue_date'])})", color=MUTED)
+
+    renderers = {
+        "header": render_header, "summary": render_summary, "skills": render_skills,
+        "experience": render_experience, "projects": render_projects,
+        "education": render_education, "certifications": render_certifications,
+    }
+    for key in order:
+        renderers[key]()
+
+    # python-docx starts with one empty paragraph — drop it.
+    first = doc.paragraphs[0]
+    if not first.text and first._p.getprevious() is None and len(doc.paragraphs) > 1:
+        first._p.getparent().remove(first._p)
 
     buf = io.BytesIO()
     doc.save(buf)
@@ -727,31 +936,30 @@ class ResumeExporter:
     """
     Export the user's resume as PDF or DOCX using a resolved template.
 
-    Callers MUST pass a ResolvedTemplate (from ResumeTemplateResolver).
-    The exporter no longer picks a default template internally — that was
-    the exact source of the bug where switching templates in the UI still
-    exported the classic layout.
+    Callers MUST pass a ResolvedTemplate (from ResumeTemplateResolver); its
+    base_template picks the design, its config applies the user's edits.
     """
+
     def __init__(self, db: Session, user: User, template: ResolvedTemplate,
                  app_id: int | None = None):
-        self.db       = db
-        self.user     = user
+        self.db = db
+        self.user = user
         self.template = template
-        self.app_id   = app_id
+        self.app_id = app_id
 
-    def _load(self) -> "_ResumeData":
+    def _load(self) -> _ResumeData:
         return _ResumeData(self.db, self.user.id, self.user.email, app_id=self.app_id)
 
     def as_pdf(self) -> bytes:
         try:
             return _build_pdf(self._load(), self.template)
         except Exception as exc:
-            logger.error("resume_pdf_error", error=str(exc))
+            logger.error("resume_pdf_error", error=str(exc), template=self.template.base_template)
             raise HTTPException(status_code=500, detail=f"PDF generation failed: {exc}")
 
     def as_docx(self) -> bytes:
         try:
             return _build_docx(self._load(), self.template)
         except Exception as exc:
-            logger.error("resume_docx_error", error=str(exc))
+            logger.error("resume_docx_error", error=str(exc), template=self.template.base_template)
             raise HTTPException(status_code=500, detail=f"DOCX generation failed: {exc}")

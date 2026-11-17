@@ -115,6 +115,11 @@ def _generate_doc_ephemeral(llm, doc_type: str, jd: str) -> str:
             "Since we do not have the candidate's profile, create a well-structured TEMPLATE resume "
             "with clear placeholders like [Your Name], [Your Email], [Company Name], etc. "
             "Use standard sections: CONTACT, PROFESSIONAL SUMMARY, SKILLS, WORK EXPERIENCE, EDUCATION. "
+            "Plain text only — no tables, columns or graphics. "
+            "Write every experience bullet in Laszlo Bock's XYZ shape — "
+            "'Accomplished [X] as measured by [Y], by doing [Z]' — as fill-in placeholders, e.g. "
+            "'• [Improved/Delivered outcome relevant to this JD] by [metric: %, $, time, users], "
+            "by [action using a JD skill or tool]'. Never fill in real-looking numbers. "
             "Mirror keywords from the JD naturally.",
             f"=== JOB DESCRIPTION ===\n{jd}\n\nGenerate a tailored resume template for this role.",
         ),

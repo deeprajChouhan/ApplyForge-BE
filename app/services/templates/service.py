@@ -48,8 +48,9 @@ class ResumeTemplateService:
             .order_by(ResumeTemplate.is_system.desc(), ResumeTemplate.id.asc())
             .all()
         )
-        # If DB seed is missing (fresh test DB), lazily seed system templates.
-        if not any(r.is_system for r in rows):
+        # Lazily seed system templates on a fresh DB, and refresh them when
+        # the code-side seed has changed (name/config of a system template).
+        if not any(r.is_system for r in rows) or self._system_templates_stale(rows):
             self._seed_system_templates()
             rows = (
                 self.db.query(ResumeTemplate)
@@ -197,6 +198,19 @@ class ResumeTemplateService:
             )
         return base_template
 
+    @staticmethod
+    def _system_templates_stale(rows) -> bool:
+        seeds = {t["base_template"]: t for t in SYSTEM_TEMPLATES}
+        for r in rows:
+            if not r.is_system:
+                continue
+            seed = seeds.get(r.base_template)
+            if seed is None:
+                continue
+            if r.name != seed["name"] or r.config_json != json.dumps(normalize_config(seed["config"])):
+                return True
+        return False
+
     def _seed_system_templates(self) -> None:
         """Lazily insert the four system templates on a fresh DB."""
         for seed in SYSTEM_TEMPLATES:
@@ -207,12 +221,18 @@ class ResumeTemplateService:
                         ResumeTemplate.deleted_at.is_(None))
                 .first()
             )
+            seed_config = json.dumps(normalize_config(seed["config"]))
             if existing is None:
                 self.db.add(ResumeTemplate(
                     user_id=None,
                     name=seed["name"],
                     base_template=seed["base_template"],
                     is_system=True,
-                    config_json=json.dumps(normalize_config(seed["config"])),
+                    config_json=seed_config,
                 ))
+            elif existing.name != seed["name"] or existing.config_json != seed_config:
+                # System templates are owned by code — keep existing rows in
+                # step with the seed (e.g. the sidebar → Navy Header change).
+                existing.name = seed["name"]
+                existing.config_json = seed_config
         self.db.commit()

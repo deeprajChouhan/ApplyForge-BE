@@ -147,6 +147,10 @@ All optional — the module runs with defaults:
   strips identity, `?role_id=` adds a fit-panel, `?template_id=` overrides
   the agency's default template; meters as `spec_sheet_exported`),
   `.../{cid}/convert`, `.../{cid}/role-matches`
+- `agencies/{id}/sourced` — Sourced stage between LinkedIn capture and the
+  pool: `score-preview` (fit vs role, stores nothing), save/list/detail/patch,
+  documents (CV text feeds the score), `rescore`, `promote` (→ pool, optional
+  role pipeline). Service: `services/sourcing.py`. See API_CONTRACT.md.
 - `agency/branding` (PATCH; owner-scoped update of `logo_url` /
   `primary_color` / `footer_text` / `spec_sheet_template_id`)
 - `agency/spec-sheet-templates` (owner-scoped CRUD: GET list, POST create,
@@ -177,8 +181,10 @@ The `extension-recruiter/` folder at the repo root is a Manifest V3 Chrome
 extension for the LinkedIn capture flow. It is separate from `extension/`,
 which is the shipped consumer-side job-clipper. The recruiter extension
 authenticates against `/api/v1/recruiter/auth/login`, keeps tokens in
-`chrome.storage.local`, and POSTs scraped `/in/*` payloads to the
-`capture-linkedin` endpoint above. See `extension-recruiter/README.md`.
+`chrome.storage.local`. Since v0.3.0 it shows a fit-score panel on every
+`/in/*` page (role picker → `sourced/score-preview`) and "Add to Sourced"
+POSTs to `sourced`; profiles reach the pool only via `sourced/{id}/promote`.
+See `extension-recruiter/README.md`.
 
 ---
 

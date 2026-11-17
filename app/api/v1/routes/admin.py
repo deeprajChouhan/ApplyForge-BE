@@ -9,6 +9,8 @@ Endpoints:
   GET  /admin/usage              — platform-wide usage stats
   POST /admin/users/{id}/activate   — re-enable a disabled user
   POST /admin/users/{id}/deactivate — disable a user
+  GET  /admin/crawled-jobs/cleanup/preview — count jobs older than N hours
+  POST /admin/crawled-jobs/cleanup         — delete jobs older than N hours
 """
 from datetime import datetime
 from typing import List, Optional
@@ -32,6 +34,9 @@ from app.schemas.admin import (
     AnalyticsOverview,
     AuditLogOut,
     CrawlerConfigOut,
+    CrawledJobsCleanupPreview,
+    CrawledJobsCleanupRequest,
+    CrawledJobsCleanupResult,
     FeatureFlagsOverview,
     FeatureFlagSummary,
     FeatureOverrideOut,
@@ -43,6 +48,8 @@ from app.schemas.admin import (
 )
 from app.schemas.plans import PlanCreate, PlanOut, PlanUpdate
 from app.schemas.support import AdminTicketUpdate, TicketListItem, TicketMessageCreate, TicketMessageOut, TicketOut
+from app.services.audit.service import AuditService
+from app.services.crawler.cleanup import CrawledJobsCleanupService
 from app.services.plans.service import PlanService
 from app.services.support.service import SupportService
 
@@ -620,6 +627,43 @@ def admin_list_crawler_configs(
         out.crawled_jobs_count = jobs_count
         configs.append(out)
     return configs
+
+
+@router.get("/crawled-jobs/cleanup/preview", response_model=CrawledJobsCleanupPreview)
+def admin_crawled_jobs_cleanup_preview(
+    older_than_hours: int = Query(default=24, ge=1, le=24 * 90),
+    _admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """How many crawled / discovered jobs are older than the cutoff, and how
+    many of those are protected (applied, saved or dismissed) and will be kept."""
+    return CrawledJobsCleanupService(db).preview(older_than_hours)
+
+
+@router.post("/crawled-jobs/cleanup", response_model=CrawledJobsCleanupResult)
+def admin_crawled_jobs_cleanup(
+    payload: CrawledJobsCleanupRequest,
+    request: Request,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Hard-delete crawled / discovered jobs older than ``older_than_hours``.
+    Jobs linked to an application, or saved / dismissed by a user, are kept."""
+    result = CrawledJobsCleanupService(db).purge(
+        older_than_hours=payload.older_than_hours,
+        include_discovered=payload.include_discovered,
+        include_user_crawled=payload.include_user_crawled,
+    )
+    AuditService(db).log(
+        action="admin.crawled_jobs.cleanup",
+        entity_type="crawled_jobs",
+        actor_user_id=admin.id,
+        actor_role=getattr(admin.role, "value", str(admin.role)),
+        after=result,
+        metadata=payload.model_dump(),
+        request=request,
+    )
+    return result
 
 
 # ── Plans Management ───────────────────────────────────────────────────────

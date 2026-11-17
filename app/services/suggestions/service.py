@@ -46,6 +46,8 @@ from app.models.models import (
 from app.schemas.suggestions import ApplySuggestionRequest, CustomizationOut, SuggestionOut, SuggestionsResponse
 from app.services.ai.factory import get_llm_provider
 
+from app.services.ai.resume_writing import XYZ_BULLET_RULES
+
 logger = structlog.get_logger(__name__)
 
 
@@ -184,19 +186,24 @@ Rules:
   Payload must be: { "name": "<skill name>", "level": "intermediate" }
   Set action="add", section="skills", target_id=null.
 
-- bullet_point suggestions: Pick 2-3 experience bullets that could be much stronger.
-  Rewrite the ENTIRE experience description with improved bullets (use action verbs, add
-  measurable impact where plausible). Use the experience [id] shown in the profile.
-  Payload must be: { "description": "<full improved description text>" }
+- bullet_point suggestions: Create ONE suggestion for EVERY work experience in the profile
+  (not just a few). Rewrite the ENTIRE experience description so every bullet follows the
+  XYZ formula below, one bullet per line, each line starting with "• ".
+  Use the experience [id] shown in the profile.
+  Payload must be: { "description": "<full rewritten description, bullets separated by newlines>" }
   Set action="update", section="experiences", target_id=<the [id] integer>.
+  In "reason", say which bullets still lack a real metric (if any) so the candidate can add
+  the true number themselves — e.g. "Bullets 2 and 3 have no metric in your data; add one if you have it."
 
 - gap suggestions: For each unsupported gap, suggest a concrete addition.
   If it is a skill: set section="skills", action="add", payload={"name":"...","level":"beginner"}.
   If it is experience/project based: set section="projects", action="add",
   payload={"name":"...","description":"...","technologies":"..."}.
 
-Return ONLY a valid JSON array. No markdown, no commentary. Maximum 8 suggestions total.
-"""
+Return ONLY a valid JSON array. No markdown, no commentary.
+At most 6 missing_skill/gap suggestions, plus one bullet_point suggestion per work experience.
+
+""" + XYZ_BULLET_RULES
 
     def _call_llm(
         self,
@@ -297,7 +304,19 @@ Return ONLY a valid JSON array. No markdown, no commentary. Maximum 8 suggestion
             and suggestion.section == "experiences"
             and suggestion.target_id is not None
         ):
-            data["experiences_update"][str(suggestion.target_id)] = suggestion.payload
+            payload = dict(suggestion.payload or {})
+            # Store role/company alongside the rewrite so renderers can match it
+            # to experiences that come from the parsed resume (which carry no
+            # DB id) as well as to WorkExperience rows.
+            exp_row = (
+                self.db.query(WorkExperience)
+                .filter_by(id=suggestion.target_id, user_id=self.user_id)
+                .first()
+            )
+            if exp_row is not None:
+                payload.setdefault("role", exp_row.role)
+                payload.setdefault("company", exp_row.company)
+            data["experiences_update"][str(suggestion.target_id)] = payload
 
         elif suggestion.action == "add" and suggestion.section == "projects":
             data["projects_add"].append(suggestion.payload)
