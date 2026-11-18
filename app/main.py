@@ -34,6 +34,13 @@ from app.recruiter.partner.middleware import PartnerApiMiddleware  # noqa: E402
 
 app.add_middleware(PartnerApiMiddleware)
 
+# Per-user API responses must never be stored by a CDN/proxy/browser cache.
+# Added last → outermost, so routes/middleware that set their own
+# Cache-Control (partner API, public assets) are left alone.
+from app.core.cache_headers import NoStoreApiMiddleware  # noqa: E402
+
+app.add_middleware(NoStoreApiMiddleware)
+
 
 @app.on_event("startup")
 def seed_and_promote_admin() -> None:

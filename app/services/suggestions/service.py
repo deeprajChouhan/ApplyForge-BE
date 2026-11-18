@@ -34,6 +34,7 @@ from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app.models.models import (
+    ParsedResumeData,
     Certification,
     Education,
     JobApplication,
@@ -73,7 +74,7 @@ class SuggestionService:
                 detail="Run JD Analysis first before generating suggestions.",
             )
 
-        profile_block = self._build_profile_block()
+        profile_block = self._build_profile_block(app)
         experiences = self._get_experiences()
         existing_skills = self._get_existing_skills()
 
@@ -85,6 +86,13 @@ class SuggestionService:
         )
 
         suggestions = self._hydrate(raw_suggestions, experiences)
+        logger.info(
+            "suggestion_result",
+            app_id=app_id,
+            user_id=self.user_id,
+            raw_count=len(raw_suggestions),
+            kept_count=len(suggestions),
+        )
         return SuggestionsResponse(application_id=app_id, suggestions=suggestions)
 
     # ── Private helpers ───────────────────────────────────────────────────
@@ -121,10 +129,34 @@ class SuggestionService:
             .all()
         )
 
-    def _build_profile_block(self) -> str:
+    # Cap on parsed-resume text sent as extra grounding (keeps the prompt cheap).
+    _RESUME_TEXT_CHARS = 6000
+
+    def _get_resume_text(self, app: JobApplication) -> str:
+        """
+        Raw text of the resume this application uses (selected_resume_id on Pro,
+        otherwise the latest parsed resume). Users whose profile lives mainly in
+        the parsed resume have few or no WorkExperience/Skill rows — without this
+        the LLM had nothing to ground suggestions in and returned nothing usable.
+        """
+        q = self.db.query(ParsedResumeData).filter(
+            ParsedResumeData.user_id == self.user_id,
+            ParsedResumeData.deleted_at.is_(None),
+        )
+        resume = None
+        if app.selected_resume_id:
+            resume = q.filter(ParsedResumeData.id == app.selected_resume_id).first()
+        if resume is None:
+            resume = q.order_by(ParsedResumeData.id.desc()).first()
+        if resume is None or not resume.raw_text:
+            return ""
+        return resume.raw_text.strip()[: self._RESUME_TEXT_CHARS]
+
+    def _build_profile_block(self, app: JobApplication) -> str:
         """
         Compact text representation of the user's profile for LLM context.
-        Includes: skills, experiences (with descriptions), projects.
+        Includes: skills, experiences (with descriptions), projects, plus the
+        application's parsed resume text as additional evidence.
         """
         lines: list[str] = []
 
@@ -156,6 +188,14 @@ class SuggestionService:
                 if p.description:
                     lines.append(f"      {p.description[:200]}")
 
+        resume_text = self._get_resume_text(app)
+        if resume_text:
+            lines.append(
+                "\nRESUME TEXT (the candidate's own resume — evidence only; "
+                "experiences listed here without an [id] cannot be targeted by bullet_point):"
+            )
+            lines.append(resume_text)
+
         return "\n".join(lines) or "No profile data found."
 
     # ── LLM call ─────────────────────────────────────────────────────────
@@ -186,8 +226,9 @@ Rules:
   Payload must be: { "name": "<skill name>", "level": "intermediate" }
   Set action="add", section="skills", target_id=null.
 
-- bullet_point suggestions: Create ONE suggestion for EVERY work experience in the profile
-  (not just a few). Rewrite the ENTIRE experience description so every bullet follows the
+- bullet_point suggestions: Create ONE suggestion for EVERY work experience listed under
+  WORK EXPERIENCE with an [id] (not just a few). Never invent an id; if there are no [id]
+  experiences, produce no bullet_point suggestions. Rewrite the ENTIRE experience description so every bullet follows the
   XYZ formula below, one bullet per line, each line starting with "• ".
   Use the experience [id] shown in the profile.
   Payload must be: { "description": "<full rewritten description, bullets separated by newlines>" }
@@ -195,12 +236,16 @@ Rules:
   In "reason", say which bullets still lack a real metric (if any) so the candidate can add
   the true number themselves — e.g. "Bullets 2 and 3 have no metric in your data; add one if you have it."
 
-- gap suggestions: For each unsupported gap, suggest a concrete addition.
+- gap suggestions: For each unsupported gap, suggest a concrete addition grounded in what the
+  CANDIDATE PROFILE or RESUME TEXT actually shows (surface real experience the resume
+  under-sells; do not invent employers, projects or credentials the candidate doesn't have).
   If it is a skill: set section="skills", action="add", payload={"name":"...","level":"beginner"}.
   If it is experience/project based: set section="projects", action="add",
   payload={"name":"...","description":"...","technologies":"..."}.
 
 Return ONLY a valid JSON array. No markdown, no commentary.
+If the JD analysis lists gaps or required skills that are missing from CURRENT SKILLS, the array
+must not be empty.
 At most 6 missing_skill/gap suggestions, plus one bullet_point suggestion per work experience.
 
 """ + XYZ_BULLET_RULES
@@ -242,19 +287,38 @@ At most 6 missing_skill/gap suggestions, plus one bullet_point suggestion per wo
                 raw = raw[4:]
             raw = raw.strip()
 
-        try:
-            suggestions = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            logger.error("suggestion_parse_error", raw=raw[:500], error=str(exc))
+        suggestions = self._parse_llm_json(raw)
+        if suggestions is None:
+            logger.error("suggestion_parse_error", raw=raw[:500])
             raise HTTPException(
                 status_code=502,
                 detail="Failed to parse AI response. Please try again.",
             )
-
-        if not isinstance(suggestions, list):
-            raise HTTPException(status_code=502, detail="Unexpected AI response shape.")
-
         return suggestions
+
+    @staticmethod
+    def _parse_llm_json(raw: str) -> list[dict] | None:
+        """
+        Accept a bare array, an object wrapping one ({"suggestions": [...]}),
+        or an array surrounded by stray prose. Returns None if nothing parses.
+        """
+        candidates = [raw]
+        start, end = raw.find("["), raw.rfind("]")
+        if 0 <= start < end:
+            candidates.append(raw[start : end + 1])
+
+        for text in candidates:
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(data, list):
+                return [d for d in data if isinstance(d, dict)]
+            if isinstance(data, dict):
+                for value in data.values():
+                    if isinstance(value, list):
+                        return [d for d in value if isinstance(d, dict)]
+        return None
 
     # ── Per-application customizations ───────────────────────────────────
 
@@ -406,12 +470,18 @@ At most 6 missing_skill/gap suggestions, plus one bullet_point suggestion per wo
                 if action not in ("add", "update"):
                     continue
 
-                target_id: int | None = item.get("target_id")
+                raw_target = item.get("target_id")
+                try:
+                    target_id: int | None = (
+                        int(raw_target) if raw_target not in (None, "", "null") else None
+                    )
+                except (TypeError, ValueError):
+                    target_id = None
                 target_label: str | None = item.get("target_label")
 
                 # Auto-generate target_label for experience updates; skip if id invalid
                 if action == "update" and section == "experiences" and target_id:
-                    exp = exp_map.get(int(target_id))
+                    exp = exp_map.get(target_id)
                     if exp:
                         target_label = target_label or f"{exp.role} @ {exp.company}"
                     else:
@@ -429,7 +499,7 @@ At most 6 missing_skill/gap suggestions, plus one bullet_point suggestion per wo
                 # ExperienceIn requires company + role — merge from the existing
                 # DB record so a description-only LLM payload passes validation.
                 if action == "update" and section == "experiences" and target_id:
-                    exp = exp_map.get(int(target_id))
+                    exp = exp_map.get(target_id)
                     if exp:
                         base: dict[str, Any] = {"company": exp.company, "role": exp.role}
                         if exp.start_date:
@@ -449,7 +519,7 @@ At most 6 missing_skill/gap suggestions, plus one bullet_point suggestion per wo
                         section=section,
                         action=action,
                         payload=payload,
-                        target_id=int(target_id) if target_id is not None else None,
+                        target_id=target_id,
                         target_label=target_label,
                     )
                 )
