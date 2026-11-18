@@ -5,6 +5,8 @@ from app.recruiter.api.admin_routes import router as admin_router
 from app.recruiter.api.agency_routes import router as agency_router
 from app.recruiter.api.auth_routes import router as auth_router
 from app.recruiter.api.billing_routes import router as billing_router
+from app.recruiter.api.enquiry_routes import admin_router as enquiry_admin_router
+from app.recruiter.api.enquiry_routes import public_router as enquiry_public_router
 from app.recruiter.api.ops_routes import router as ops_router
 from app.recruiter.api.sourcing_routes import router as sourcing_router
 from app.recruiter.partner.management import operator_router as integrations_operator_router
@@ -29,6 +31,9 @@ recruiter_router = APIRouter(prefix="/recruiter")
 # Auth (public login) + operator management (admin-guarded) + agency-admin (owner).
 recruiter_router.include_router(auth_router)
 recruiter_router.include_router(admin_router)
+# Website contact form (public) + operator enquiry inbox.
+recruiter_router.include_router(enquiry_public_router)
+recruiter_router.include_router(enquiry_admin_router)
 recruiter_router.include_router(agency_router)
 recruiter_router.include_router(billing_router)
 recruiter_router.include_router(integrations_owner_router)

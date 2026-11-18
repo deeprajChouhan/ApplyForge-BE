@@ -933,3 +933,31 @@ Covers both stores filled by background workers:
 |---|---|---|
 | GET | `/crawled-jobs/cleanup/preview?older_than_hours=24` | `1 ≤ hours ≤ 2160`. Returns `{older_than_hours, cutoff, discovered_jobs: {total, eligible, protected}, user_crawled_jobs: {total, eligible, protected}}`. `eligible` = will be deleted; `protected` = older than cutoff but kept. |
 | POST | `/crawled-jobs/cleanup` | Body `{older_than_hours=24, include_discovered=true, include_user_crawled=true}`. Hard delete in batches of 1000. Returns `{older_than_hours, cutoff, deleted_discovered_jobs, deleted_job_sources, deleted_user_crawled_jobs}`. Writes an `admin.crawled_jobs.cleanup` audit-log row. |
+
+---
+
+## RECRUITER — WEBSITE ENQUIRIES (2026-11-18)
+
+The recruiter website's **Contact us** page (`/contact`, recruiter-frontend) posts here; the operator triages them in
+**Admin → Management → Enquiries** (`/admin/enquiries`, user-frontend). Prospects aren't tenants yet, so rows have no
+`agency_id` and no FK — an operator-level inbox inside the `rec_*` data wall. Ids are public GUIDs like every recruiter route.
+
+### Public — no auth
+
+| Method | Path | Notes |
+|---|---|---|
+| POST | `/api/v1/recruiter/public/enquiries` | Body `{topic, full_name, email, company?, company_type?, team_size?, phone?, message, source_page?, website?}`. `topic` ∈ `sales\|demo\|api\|partnership\|other` (default `sales`); `company_type` ∈ `agency\|tech_company\|platform\|other`; `message` 10–5000 chars; email lower-cased; strings trimmed. `website` is a **honeypot**: if filled the request still answers `202` but nothing is stored. Rate limit **5 per IP per hour** (shared partner limiter; Redis when configured) → `429` + `Retry-After`. Success: `202 {ok: true}` — never echoes the record. The IP is used for limiting only and is **not stored**. |
+
+### Operator — consumer admin token (`require_admin`)
+
+Base: `/api/v1/recruiter/admin/enquiries`
+
+| Method | Path | Notes |
+|---|---|---|
+| GET | `?status=&topic=&search=&limit=100&offset=0` | Newest first. `search` matches name, email or company (case-insensitive). `limit` ≤ 500. Returns `EnquiryOut[]`: `{id, topic, status, full_name, email, company, company_type, team_size, phone, message, source_page, admin_notes, handled_at, created_at, updated_at}`. |
+| GET | `/summary` | `{total, new, by_status: {new, contacted, qualified, closed, spam}, by_topic}`. Drives the sidebar "new" badge (polled every 60 s). |
+| PATCH | `/{enquiry_id}` | Any of `status` (`new\|contacted\|qualified\|closed\|spam`), `admin_notes` (≤5000; blank → null). The first move off `new` stamps `handled_at`. `404` unknown id. Non-optimistic in the UI. |
+| DELETE | `/{enquiry_id}` | Hard delete — spam or an erasure request from the sender. `204`; `404` if already gone. |
+
+Storage: `rec_enquiries` (Alembic `0038_recruiter_enquiries`; also created at boot via `RECRUITER_TABLES`).
+Retention: no automatic purge yet — delete closed/spam enquiries periodically, or add a retention job before launch.

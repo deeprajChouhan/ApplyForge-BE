@@ -1296,6 +1296,32 @@ class SourcedDocument(Base):
     sourced: Mapped["SourcedProfile"] = relationship(back_populates="documents")
 
 
+class Enquiry(Base, RecTimestampMixin):
+    """
+    A sales / API enquiry submitted from the public recruiter website's
+    contact form. Prospects are not agencies or users yet, so there is no
+    agency_id and no FK anywhere — this is an operator-level inbox that stays
+    inside the rec_* data wall. Triage happens in the operator admin.
+    """
+    __tablename__ = "rec_enquiries"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    topic: Mapped[str] = mapped_column(String(20), default="sales", nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(20), default="new", nullable=False, index=True)
+
+    full_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    email: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    company: Mapped[str | None] = mapped_column(String(200))
+    company_type: Mapped[str | None] = mapped_column(String(30))
+    team_size: Mapped[str | None] = mapped_column(String(30))
+    phone: Mapped[str | None] = mapped_column(String(60))
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    source_page: Mapped[str | None] = mapped_column(String(300))
+
+    admin_notes: Mapped[str | None] = mapped_column(Text)
+    handled_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
 # All recruiter tables — used to create just these on startup without touching
 # the consumer schema.
 RECRUITER_TABLES = [
@@ -1344,4 +1370,6 @@ RECRUITER_TABLES = [
     # Per-recruiter role visibility
     RecruiterRoleRestriction.__table__,
     RecruiterRoleGrant.__table__,
+    # Public website enquiries (operator inbox)
+    Enquiry.__table__,
 ]

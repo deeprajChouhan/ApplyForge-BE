@@ -1841,3 +1841,66 @@ class SourcedPromoteResult(BaseModel):
     created: bool                  # False when the person was already in the pool
     application_id: int | None = None
     documents_moved: int
+
+
+
+# ── Website enquiries (public contact form → operator inbox) ──────────────
+EnquiryTopic = Literal["sales", "demo", "api", "partnership", "other"]
+EnquiryCompanyType = Literal["agency", "tech_company", "platform", "other"]
+EnquiryStatus = Literal["new", "contacted", "qualified", "closed", "spam"]
+
+
+class EnquiryCreate(BaseModel):
+    topic: EnquiryTopic = "sales"
+    full_name: str = Field(min_length=1, max_length=200)
+    email: EmailStr
+    company: str | None = Field(default=None, max_length=200)
+    company_type: EnquiryCompanyType | None = None
+    team_size: str | None = Field(default=None, max_length=30)
+    phone: str | None = Field(default=None, max_length=60)
+    message: str = Field(min_length=10, max_length=5000)
+    source_page: str | None = Field(default=None, max_length=300)
+    # Honeypot: real visitors never see or fill this field.
+    website: str | None = Field(default=None, max_length=300)
+
+    @field_validator("full_name", "message", "company", "phone", "team_size", "source_page", mode="before")
+    @classmethod
+    def _strip(cls, v):
+        if isinstance(v, str):
+            v = v.strip()
+            return v or None
+        return v
+
+
+class EnquiryAccepted(BaseModel):
+    ok: bool = True
+
+
+class EnquiryOut(ORMModel):
+    id: int
+    topic: str
+    status: str
+    full_name: str
+    email: str
+    company: str | None
+    company_type: str | None
+    team_size: str | None
+    phone: str | None
+    message: str
+    source_page: str | None
+    admin_notes: str | None
+    handled_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class EnquiryUpdate(BaseModel):
+    status: EnquiryStatus | None = None
+    admin_notes: str | None = Field(default=None, max_length=5000)
+
+
+class EnquirySummaryOut(BaseModel):
+    total: int
+    new: int
+    by_status: dict[str, int]
+    by_topic: dict[str, int]
