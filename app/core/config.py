@@ -118,7 +118,44 @@ class Settings(BaseSettings):
     # right that we trust). 1 = Container Apps ingress; 0 = no proxy.
     partner_trusted_proxy_hops: int = 1
 
+    # ── Email (Resend) ──
+    # EMAIL_PROVIDER=resend sends for real; "console" logs only (dev/tests).
+    email_provider: str = "console"
+    resend_api_key: SecretStr | None = None
+    resend_webhook_secret: SecretStr | None = None
+    resend_api_base: str = "https://api.resend.com"
+    email_domain: str = "applyforge.co.uk"
+    email_from_consumer: str = "ApplyForge <no-reply@applyforge.co.uk>"
+    email_from_recruiter: str = "ApplyForge Recruiter <no-reply@applyforge.co.uk>"
+    # Local part for mail sent on an agency's behalf: "<Agency> via ApplyForge <notifications@…>"
+    email_external_from_local: str = "notifications"
+    email_reply_to: str = "support@applyforge.co.uk"
+    # Operator mailboxes shown in Admin → Mail (comma-separated). Anything else
+    # @email_domain that Resend receives lands in info@.
+    email_mailboxes: str = "support@applyforge.co.uk,info@applyforge.co.uk"
+    email_signature_support: str = "ApplyForge Support\nsupport@applyforge.co.uk"
+    email_signature_info: str = "ApplyForge\ninfo@applyforge.co.uk"
+    # "sync" (tests) | "inline" (thread pool, dev) | "celery" (prod worker)
+    email_jobs_backend: str = "inline"
+    # Max lifecycle (tips/nudge) emails per person per 7 days. 0 = no cap.
+    email_lifecycle_weekly_cap: int = 2
+    # Footer legal line (registered name · address · company number). Leave blank
+    # until the company is registered — the footer simply omits it.
+    email_company_legal: str = ""
+    # Public URL of this API, for RFC 8058 one-click unsubscribe. Optional.
+    api_public_url: str | None = None
+    # Public base URL of the consumer app (links in candidate emails).
+    consumer_app_url: str = "https://applyforge.co.uk"
+
     model_config = SettingsConfigDict(env_file=str(_ENV_FILE), extra="ignore")
+
+    @property
+    def resend_api_key_value(self) -> str:
+        return self.resend_api_key.get_secret_value() if self.resend_api_key else ""
+
+    @property
+    def resend_webhook_secret_value(self) -> str:
+        return self.resend_webhook_secret.get_secret_value() if self.resend_webhook_secret else ""
 
     @property
     def stripe_secret_key_value(self) -> str:

@@ -20,44 +20,8 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 F = TypeVar("F", bound=Callable[..., Any])
 
-# Pricing table (USD per 1000 tokens). Most-specific keys must come first
-# in this dict so the lookup below picks gpt-4o-mini before gpt-4o.
-OPENAI_PRICING: dict[str, dict[str, float]] = {
-    "gpt-4o-mini":                   {"prompt": 0.00015,  "completion": 0.0006},
-    "gpt-4o":                        {"prompt": 0.005,    "completion": 0.015},
-    "gpt-4-turbo":                   {"prompt": 0.01,     "completion": 0.03},
-    "gpt-4":                         {"prompt": 0.03,     "completion": 0.06},
-    "gpt-3.5-turbo-instruct":        {"prompt": 0.0015,   "completion": 0.002},
-    "gpt-3.5-turbo":                 {"prompt": 0.0005,   "completion": 0.0015},
-    "text-embedding-3-small":        {"prompt": 0.00002,  "completion": 0.0},
-    "text-embedding-3-large":        {"prompt": 0.00013,  "completion": 0.0},
-    "text-embedding-ada-002":        {"prompt": 0.0001,   "completion": 0.0},
-    "claude-3-5-sonnet-20241022":    {"prompt": 0.003,    "completion": 0.015},
-    "claude-3-haiku-20240307":       {"prompt": 0.00025,  "completion": 0.00125},
-    "claude-3-opus-20240229":        {"prompt": 0.015,    "completion": 0.075},
-}
-_DEFAULT_PRICING: dict[str, float] = {"prompt": 0.002, "completion": 0.002}
-
-
-def estimate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
-    """
-    Estimate cost in USD for a single LLM call.
-    Matches the longest key first so 'gpt-4o-mini' wins over 'gpt-4o'.
-    """
-    model_lower = model.lower()
-    pricing = _DEFAULT_PRICING
-    best_len = 0
-    for key in sorted(OPENAI_PRICING, key=len, reverse=True):
-        if key in model_lower or model_lower.startswith(key):
-            if len(key) > best_len:
-                pricing = OPENAI_PRICING[key]
-                best_len = len(key)
-                break
-    return round(
-        (prompt_tokens / 1000) * pricing["prompt"]
-        + (completion_tokens / 1000) * pricing["completion"],
-        8,
-    )
+# Pricing lives in app.core.llm_pricing (shared with the admin cost views).
+from app.core.llm_pricing import OPENAI_PRICING, _DEFAULT_PRICING, estimate_cost  # noqa: E402,F401
 
 
 def estimate_tokens(text: str) -> int:

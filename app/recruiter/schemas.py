@@ -86,6 +86,7 @@ class BillingSummaryOut(BaseModel):
     locked: int
     active_subscriptions: int
     seats_used: int
+    trials_ending_soon: int = 0         # trial ends within the next 7 days
 
 
 # ── Self-serve onboarding (Phase 5.5) ─────────────────────────────────────

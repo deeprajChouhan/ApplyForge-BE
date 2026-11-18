@@ -1,3 +1,4 @@
+import uuid
 from datetime import datetime, timedelta, timezone
 from jose import jwt
 from passlib.context import CryptContext
@@ -22,5 +23,8 @@ def create_token(subject: str, token_type: str, expires_delta: timedelta) -> str
         "type": token_type,
         "iat": int(now.timestamp()),
         "exp": int((now + expires_delta).timestamp()),
+        # Unique per token: two logins in the same second otherwise produce the
+        # same refresh token and trip the refresh_tokens.token_hash unique index.
+        "jti": uuid.uuid4().hex,
     }
     return jwt.encode(payload, settings.secret_key, algorithm=settings.jwt_algorithm)

@@ -132,6 +132,28 @@ def start_scheduler() -> None:
     except Exception as exc:  # never block crawler scheduling
         logger.warning("partner_scheduler_jobs_failed error=%s", exc)
 
+    # Email jobs (when not on Celery): sweep due/delayed sends, automations, digests.
+    try:
+        from app.core.config import settings as _s
+        from apscheduler.triggers.interval import IntervalTrigger as _Interval
+
+        if (_s.email_jobs_backend or "inline").lower() != "celery":
+            from app.services.email import jobs as _email_jobs
+
+            _scheduler.add_job(_email_jobs.sweep, trigger=_Interval(seconds=60), id="email_sweep",
+                               name="Email — sweep due sends (every 60s)", replace_existing=True,
+                               max_instances=1, coalesce=True)
+            _scheduler.add_job(_email_jobs.daily_rules, trigger=CronTrigger(hour=9, minute=0, timezone="Europe/London"),
+                               id="email_daily_rules", name="Email — daily automations (09:00 UK)", replace_existing=True)
+            _scheduler.add_job(_email_jobs.daily_briefs, trigger=CronTrigger(day_of_week="mon-fri", hour=7, minute=30, timezone="Europe/London"),
+                               id="email_daily_briefs", name="Email — recruiter daily brief (07:30 UK)", replace_existing=True)
+            _scheduler.add_job(_email_jobs.weekly_digests, trigger=CronTrigger(day_of_week="mon", hour=8, minute=0, timezone="Europe/London"),
+                               id="email_weekly_digests", name="Email — candidate weekly digest (Mon 08:00 UK)", replace_existing=True)
+            _scheduler.add_job(_email_jobs.purge_webhook_events, trigger=CronTrigger(hour=3, minute=40, timezone="UTC"),
+                               id="email_webhook_purge", name="Email — purge webhook ids (03:40 UTC)", replace_existing=True)
+    except Exception as exc:  # never block crawler scheduling
+        logger.warning("email_scheduler_jobs_failed error=%s", exc)
+
     _scheduler.start()
     logger.info(
         "scheduler_started jobs=%s",

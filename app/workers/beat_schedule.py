@@ -26,5 +26,12 @@ BEAT_SCHEDULE = {
     # ── Recruiter Partner API ─────────────────────────────────────────────
     # Sweep due webhook retries every minute; purge expired logs nightly.
     "partner-webhook-retries": {"task": "app.recruiter.partner.tasks.deliver_webhooks", "schedule": crontab(minute="*"), "args": []},
+    # ── Email (EMAIL_JOBS_BACKEND=celery) ─────────────────────────────────
+    # UTC times; 07:30/09:00 UK ≈ 07:30/09:00 UTC in winter, 06:30/08:00 UTC in summer.
+    "email-sweep": {"task": "app.services.email.tasks.sweep", "schedule": crontab(minute="*"), "args": []},
+    "email-daily-rules": {"task": "app.services.email.tasks.daily_rules", "schedule": crontab(minute=0, hour=9), "args": []},
+    "email-daily-briefs": {"task": "app.services.email.tasks.daily_briefs", "schedule": crontab(minute=30, hour=7, day_of_week="1-5"), "args": []},
+    "email-weekly-digests": {"task": "app.services.email.tasks.weekly_digests", "schedule": crontab(minute=0, hour=8, day_of_week=1), "args": []},
+    "email-webhook-purge": {"task": "app.services.email.tasks.purge_webhook_events", "schedule": crontab(minute=40, hour=3), "args": []},
     "partner-log-retention": {"task": "app.recruiter.partner.tasks.purge_old_logs", "schedule": crontab(minute=17, hour="3"), "args": []},
 }

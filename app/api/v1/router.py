@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from app.api.v1.routes import admin, applications, auth, chat, documents, ephemeral, knowledge, profile, utils
+from app.api.v1.routes import admin, admin_insights, applications, auth, chat, documents, ephemeral, knowledge, profile, utils
 from app.api.v1.routes import evaluation
 from app.api.v1.routes import crawler
 from app.api.v1.routes import files
@@ -15,6 +15,8 @@ from app.api.v1.routes import kits
 from app.api.v1.routes import auto_apply
 from app.api.v1.routes import application_actions
 from app.api.v1.routes import resume_templates
+from app.api.v1.routes import email as email_routes
+from app.api.v1.routes import email_admin
 from app.recruiter.api.router import recruiter_router
 
 api_router = APIRouter()
@@ -25,6 +27,7 @@ api_router.include_router(applications.router)
 api_router.include_router(chat.router)
 api_router.include_router(documents.router)
 api_router.include_router(admin.router)
+api_router.include_router(admin_insights.router)
 api_router.include_router(ephemeral.router)
 api_router.include_router(utils.router)
 api_router.include_router(evaluation.router)
@@ -42,4 +45,6 @@ api_router.include_router(kits.router)
 api_router.include_router(auto_apply.router)
 api_router.include_router(application_actions.router)
 api_router.include_router(resume_templates.router)
+api_router.include_router(email_routes.router)
+api_router.include_router(email_admin.router)
 api_router.include_router(recruiter_router)

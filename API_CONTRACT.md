@@ -961,3 +961,184 @@ Base: `/api/v1/recruiter/admin/enquiries`
 
 Storage: `rec_enquiries` (Alembic `0038_recruiter_enquiries`; also created at boot via `RECRUITER_TABLES`).
 Retention: no automatic purge yet — delete closed/spam enquiries periodically, or add a retention job before launch.
+
+---
+
+## ADMIN — operator console (2026-11-18)
+
+All endpoints require an admin JWT (`require_admin`); non-admins get `403`. Prefix `/api/v1`.
+Times are naive UTC ISO strings without a zone (frontend parses them with `parseApiDate`).
+
+### Pagination totals
+`GET /admin/users`, `GET /admin/events`, `GET /admin/audit-logs` return the **total row count before
+pagination** in the `X-Total-Count` response header (exposed via CORS `expose_headers`). Body shape is
+unchanged (a plain list).
+
+### `GET /admin/users`
+Query: `page` (≥1), `page_size` (1–100, default 20), `search` (email, full name, or `#id` / `id`),
+`plan` (`free|pro|enterprise`), `role` (`admin|user`), `status` (`active|disabled`),
+`sort` (`newest` default, `oldest`, `email`, `tokens` = this month's tokens desc, `last_seen`).
+Each item (`AdminUserOut`) gains two fields:
+```json
+{ "full_name": "Ada Lovelace", "last_seen_at": "2026-11-18T09:12:00" }
+```
+`last_seen_at` = latest refresh-token issue (login or refresh), or `null`.
+
+### Admin mutations are audited
+Every admin write now appends an `audit_logs` row (`before`/`after` hold only changed keys, `extra_metadata`
+carries a human label such as the email). Actions: `admin.user.update`, `admin.user.feature_toggle`,
+`admin.user.activate`, `admin.user.deactivate`, `admin.user.delete`, `admin.feature.bulk_set`,
+`admin.quality.spot_check`, `admin.agency.create`, `admin.agency.plan_update`, `admin.agency.approve`,
+`admin.agency.status`, `admin.recruiter.create`, `admin.recruiter.update`, `admin.recruiter.reset_password`
+(password never logged), `admin.recruiter.delete`. No-op changes are not logged. Recruiter entities are
+referenced by plain integer id (`entity_type` `rec_agency` / `rec_recruiter`, no FK — data wall intact).
+
+Guards: an admin cannot remove their own admin role or deactivate their own account → `400`.
+
+### `GET /admin/events/facets` · `GET /admin/audit-logs/facets`
+```json
+{ "event_names": ["page_view", "..."], "entity_types": ["application"] }
+{ "actions": ["admin.user.update", "..."], "entity_types": ["user", "rec_agency"] }
+```
+
+### `GET /admin/overview`
+Month-to-date KPIs compared with the **same point last month**, a 30-day daily trend, and consumer
+"needs attention" items (recruiter items come from `/recruiter/admin/billing/summary` and the enquiries
+summary; the UI merges them).
+```json
+{
+  "generated_at": "...",
+  "kpis": {
+    "users_total": 39, "paid_users": 15,
+    "signups": {"current": 12, "previous": 7}, "active_users": {...}, "tokens": {...},
+    "ai_calls": {...}, "cost_usd": {"current": 2.0, "previous": 0.6},
+    "comparison_note": "Month to date vs the same point last month (18 Oct)"
+  },
+  "trend": [{"date": "2026-10-20", "signups": 1, "active_users": 9, "tokens": 120000}],
+  "attention": {
+    "tickets_awaiting_reply": {"count": 3, "urgent": 1, "items": [{"ticket_id": 4, "subject": "...", "priority": "high", "waiting_since": "...", "email": "..."}]},
+    "users_near_budget": {"count": 5, "over_budget": 2, "items": [{"user_id": 3, "email": "...", "plan": "free", "tokens_used": 52000, "budget": 50000, "pct": 104}]},
+    "past_due_subscriptions": {"count": 2, "items": [{"user_id": 4, "email": "...", "plan": "pro"}]},
+    "low_confidence_parses": {"count": 2, "threshold": 0.6, "items": [{"user_id": 7, "email": "...", "confidence": 0.45, "parsed_at": "..."}]}
+  }
+}
+```
+"Awaiting reply" = open/in-progress ticket whose latest message is not from an admin.
+"Near budget" = this month's ledger tokens ≥ 80% of `token_budget_monthly`.
+
+### `GET /admin/costs?month=YYYY-MM`
+Estimated LLM spend priced from `usage_events` (model + tokens per call) using `app/core/llm_pricing.py`.
+```json
+{
+  "month": "2026-11", "is_current_month": true,
+  "total": {"tokens": 4095014, "tokens_in": 3100000, "tokens_out": 995014, "calls": 817, "cost_usd": 2.0},
+  "previous_month_total_usd": 1.77, "projected_month_end_usd": 3.43,
+  "active_users": 37, "cost_per_active_user_usd": 0.0541,
+  "unpriced_models": [],
+  "by_model":   [{"model": "gpt-4o-mini", "tokens": 0, "tokens_in": 0, "tokens_out": 0, "calls": 0, "cost_usd": 0}],
+  "by_feature": [{"feature": "jd_analyze", "...": "same totals"}],
+  "top_users":  [{"user_id": 3, "email": "...", "...": "same totals"}],
+  "by_day":     [{"date": "2026-11-01", "...": "same totals"}]
+}
+```
+`unpriced_models` lists models charged at the default rate — add them to the price table.
+Invalid month → `422`. `projected_month_end_usd` is `null` for past months.
+
+### `GET /admin/quality?days=30`
+```json
+{
+  "window_days": 30,
+  "hallucination": {
+    "evaluated_docs": 40, "flagged_docs": 16, "flag_rate": 0.4, "avg_flags_per_doc": 0.45, "min_confidence": 0.6,
+    "by_doc_type": [{"doc_type": "cover_letter", "evaluated": 20, "flagged": 9}],
+    "by_claim_type": [{"claim_type": "years_experience", "count": 14}],
+    "recent_flagged": [{"application_id": 7, "user_id": 8, "email": "...", "doc_type": "cover_letter", "flag_count": 1, "evaluated_at": "...",
+                        "flags": [{"claim": "12+ years", "claim_type": "years_experience", "reason": "...", "confidence": 0.8}]}],
+    "last_checked_at": "..."
+  },
+  "generation": {"documents_generated": 40, "evaluation_coverage": 1.0},
+  "parsing": {"parses": 20, "avg_confidence": 0.839, "low_confidence": 2, "threshold": 0.6},
+  "outcomes": {"interview": 3}
+}
+```
+
+### `POST /admin/quality/spot-check`
+Body `{ "sample_size": 50, "days": 30 }` (1–200, 1–365). Runs the regex `HallucinationChecker`
+(no LLM call) over the latest version of each recent generated document, grounded against the user's parsed
+resume + profile, and upserts `application_evaluations` (hallucination fields only). Does not touch the
+generation flow.
+```json
+{ "checked": 40, "flagged": 16, "skipped_no_grounding": 0, "flag_rate": 0.4, "window_days": 30 }
+```
+
+### `GET /admin/feature-flags`
+New query params: `search` (user email), `enabled` (bool). Response gains:
+`summary[].enabled_by_plan` (`{"free": 12, "pro": 30}`), `plan_users` (`{"free": 40, ...}`),
+`overrides_total` (rows matching the filters; `overrides` is still capped at 200).
+
+### `POST /admin/feature-flags/bulk`
+Body: `{ "feature": "chat", "enabled": true, "plan": "free", "user_ids": null, "dry_run": true }` —
+`plan` and/or `user_ids` (≤1000) required (`400` otherwise). Idempotent; only rows that change are written.
+```json
+{ "feature": "chat", "enabled": true, "matched_users": 40, "changed": 28, "dry_run": true }
+```
+
+### `GET /recruiter/admin/billing/summary`
+Gains `trials_ending_soon` — agencies (not suspended) whose `trial_ends_at` is within the next 7 days.
+
+---
+
+## EMAIL — Resend: transactional, automations, operator mailbox (2026-11-18)
+
+Transport: `EmailProvider` (Resend in prod, console in dev — `EMAIL_PROVIDER`). Every email is written to an
+outbox row in the same transaction as the change that caused it and sent after commit
+(`EMAIL_JOBS_BACKEND` = sync | inline | celery). Consumer rows: `email_messages` (user_id, cascade).
+Recruiter rows: `rec_email_messages` (agency_id, cascade). Operator tables `ops_*` have no FKs into either product.
+
+Categories: `transactional` (always sent) · `notification` · `digest` · `lifecycle` (soft opt-in, weekly cap,
+unsubscribe link + RFC 8058 headers when `API_PUBLIC_URL` is set).
+
+### Public / user
+| Method | Path | Auth | Notes |
+|---|---|---|---|
+| POST | `/webhooks/resend` | svix signature (`RESEND_WEBHOOK_SECRET`) | delivery events → send log + suppression; `email.received` → mailbox. De-duplicated by `svix-id`. 401 on bad signature. |
+| GET/PUT | `/email/preferences` | consumer | `{notifications, digests, product_updates}` — all default `true` |
+| GET | `/email/unsubscribe/info?token=` | none | `{scope, category, label}` |
+| POST | `/email/unsubscribe?token=` | none | turns off that category for that person (consumer or recruiter token) |
+| POST | `/auth/forgot-password` | none | `{email}` → always 200 (no enumeration); emails a 60-min single-use link |
+| POST | `/auth/reset-password` | none | `{token, password≥8}` → 200, revokes refresh tokens; 400 if expired/used |
+| POST | `/recruiter/auth/forgot-password` | none | same, recruiter seats |
+| POST | `/recruiter/auth/reset-password` | none | same |
+| GET/PUT | `/recruiter/me/email-preferences` | recruiter | `{notifications, digests, product_updates, muted_kinds[], available_kinds[]}` |
+
+### Admin (`/admin/email`, admin only)
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/overview?days=7` | counts by status per product, suppressions, live rules, unread mail, provider, webhook configured |
+| GET | `/messages?scope=all|consumer|recruiter&status&template_key&search&page&page_size` | merged in Python from the two logs (never joined) |
+| GET | `/messages/{scope}/{id}` | includes rendered `html` / `text` |
+| POST | `/messages/{scope}/{id}/retry` | failed / cancelled / bounced only; 400 if address suppressed |
+| GET | `/templates` · `/templates/{key}` | system templates (code) merged with admin overrides |
+| PUT | `/templates/{key}` | override copy (validated sandboxed Jinja; 422 on syntax error) |
+| POST | `/templates` | custom template `{key, product, category, name, subject, body, …}` |
+| DELETE | `/templates/{key}` | reset a system template / delete a custom one (409 if an automation uses it) |
+| POST | `/templates/preview` | render with sample data |
+| POST | `/templates/{key}/test` | send a `[TEST]` copy to `to` or the admin |
+| GET | `/events` | trigger catalogue: events + fields, facts per scope, recipients, operators, blocks |
+| GET/POST | `/rules` · PATCH/DELETE `/rules/{id}` | automations: `{name, scope, event_key, conditions, template_key, recipient, fixed_to, delay_minutes, cancel_if, cooldown_days, once_per_subject, is_active}` |
+| POST | `/rules/{id}/dry-run` | daily triggers only → `{count, sample[]}` |
+| GET | `/rules/{id}/stats` | sends by status |
+| GET/POST | `/suppressions` · DELETE `/suppressions/{id}` | |
+| GET | `/mailbox/summary` | `{support: {address, unread, open}, info: {…}}` |
+| GET | `/mailbox/threads?mailbox&status=inbox|all|open|waiting|closed|spam|archived&starred&search&page` | |
+| GET/PATCH | `/mailbox/threads/{id}` | GET marks read; PATCH `{status, starred, unread, labels, mailbox}` (spam ⇒ sender suppressed) |
+| POST | `/mailbox/threads/{id}/reply` | `{body, cc[], close}` — sent from that mailbox with In-Reply-To/References; mirrored into the linked help-desk ticket |
+| POST | `/mailbox/compose` | `{mailbox, to, subject, body, cc[]}` |
+| GET | `/mailbox/lookup?email=` | sender context: consumer user + recruiter seat (two separate lookups) |
+| GET | `/mailbox/messages/{id}/attachments/{idx}` | download stored attachment |
+| GET/POST | `/mailbox/canned` · DELETE `/mailbox/canned/{id}` | saved replies |
+
+Trigger keys — consumer: `user.registered`, `user.password_changed`, `resume.parsed`, `application.created`,
+`application.status_changed`, `document.generated`, `support.ticket_created`, `schedule.daily`.
+Recruiter: `rec.agency.created`, `rec.agency.status_changed`, `rec.invite.created`, `rec.invite.accepted`,
+`rec.password_changed`, `rec.notification.created`, `rec.schedule.daily`.

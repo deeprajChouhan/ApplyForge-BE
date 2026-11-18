@@ -55,12 +55,14 @@ class UserUsageSummary(BaseModel):
 class AdminUserOut(BaseModel):
     id: int
     email: EmailStr
+    full_name: Optional[str] = None
     role: UserRole
     plan: PlanTier
     subscription_status: SubscriptionStatus
     token_budget_monthly: int
     is_active: bool
     created_at: datetime
+    last_seen_at: Optional[datetime] = None
     features: List[str] = []
     usage_current_month: Optional[UserUsageSummary] = None
 
@@ -176,6 +178,8 @@ class FeatureFlagSummary(BaseModel):
     feature: str
     enabled_count: int
     disabled_count: int
+    # Users with the feature enabled, per plan (plan -> count)
+    enabled_by_plan: dict = {}
 
 
 class FeatureOverrideOut(BaseModel):
@@ -191,6 +195,26 @@ class FeatureOverrideOut(BaseModel):
 class FeatureFlagsOverview(BaseModel):
     summary: List[FeatureFlagSummary]
     overrides: List[FeatureOverrideOut]
+    # Total users per plan, so coverage can be shown as "12 / 40"
+    plan_users: dict = {}
+    overrides_total: int = 0
+
+
+class FeatureBulkRequest(BaseModel):
+    """Enable/disable one feature for every user on a plan, or for listed users."""
+    feature: FeatureFlag
+    enabled: bool
+    plan: Optional[PlanTier] = None
+    user_ids: Optional[List[int]] = Field(default=None, max_length=1000)
+    dry_run: bool = False
+
+
+class FeatureBulkResult(BaseModel):
+    feature: str
+    enabled: bool
+    matched_users: int
+    changed: int
+    dry_run: bool
 
 
 # ── Crawler Configs ──────────────────────────────────────────────────────────

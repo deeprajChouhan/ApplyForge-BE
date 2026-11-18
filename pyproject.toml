@@ -30,6 +30,8 @@ dependencies = [
   "redis>=5.0",
   "aiolimiter>=1.1",
   "httpx>=0.27",
+  # Email templates (sandboxed Jinja; markupsafe comes with it)
+  "jinja2>=3.1",
   "selectolax>=0.3.21",
   # Phase 4: browser-automation fallback submitter (Ashby/Workday/etc.)
   "playwright>=1.47",

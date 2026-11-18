@@ -24,6 +24,8 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    # Paginated admin lists return their total row count in this header.
+    expose_headers=["X-Total-Count"],
 )
 
 # Partner API: per-key CORS (no credentials), security headers, request log.

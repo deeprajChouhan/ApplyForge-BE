@@ -1324,6 +1324,63 @@ class Enquiry(Base, RecTimestampMixin):
 
 # All recruiter tables — used to create just these on startup without touching
 # the consumer schema.
+
+# ── Email (Resend) — recruiter outbox + preferences ─────────────────────────
+# Mirrors app/models/email.py on the recruiter side of the data wall. Rows for
+# external recipients (candidates, clients) have recruiter_id NULL and
+# is_external=True; they are still owned by (and cascade with) the agency.
+from sqlalchemy.dialects.mysql import LONGTEXT  # noqa: E402
+
+
+class RecEmailMessage(Base):
+    __tablename__ = "rec_email_messages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    agency_id: Mapped[int] = mapped_column(ForeignKey("rec_agencies.id", ondelete="CASCADE"), index=True)
+    recruiter_id: Mapped[int | None] = mapped_column(
+        ForeignKey("rec_recruiters.id", ondelete="SET NULL"), index=True
+    )
+    is_external: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0", nullable=False)
+    to_email: Mapped[str] = mapped_column(String(320), nullable=False)
+    reply_to: Mapped[str | None] = mapped_column(String(320))
+    template_key: Mapped[str] = mapped_column(String(80), index=True, nullable=False)
+    category: Mapped[str] = mapped_column(String(20), nullable=False)
+    subject: Mapped[str] = mapped_column(String(300), default="")
+    html: Mapped[str | None] = mapped_column(Text().with_variant(LONGTEXT(), "mysql"))
+    text: Mapped[str | None] = mapped_column(Text().with_variant(LONGTEXT(), "mysql"))
+    context: Mapped[dict | None] = mapped_column(JSON)
+    status: Mapped[str] = mapped_column(String(20), default="queued", index=True)
+    event_key: Mapped[str | None] = mapped_column(String(80), index=True)
+    rule_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(200), unique=True, nullable=False)
+    provider_message_id: Mapped[str | None] = mapped_column(String(100), index=True)
+    error: Mapped[str | None] = mapped_column(Text)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    send_after: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime)
+    opened_at: Mapped[datetime | None] = mapped_column(DateTime)
+    clicked_at: Mapped[datetime | None] = mapped_column(DateTime)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class RecEmailPreference(Base):
+    __tablename__ = "rec_email_preferences"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    agency_id: Mapped[int] = mapped_column(ForeignKey("rec_agencies.id", ondelete="CASCADE"), index=True)
+    recruiter_id: Mapped[int] = mapped_column(
+        ForeignKey("rec_recruiters.id", ondelete="CASCADE"), unique=True, index=True
+    )
+    notifications: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    digests: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    product_updates: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # Per-NotificationKind opt-outs, e.g. ["stale_pipeline"]
+    muted_kinds: Mapped[list | None] = mapped_column(JSON)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 RECRUITER_TABLES = [
     Agency.__table__,
     Recruiter.__table__,
@@ -1372,4 +1429,7 @@ RECRUITER_TABLES = [
     RecruiterRoleGrant.__table__,
     # Public website enquiries (operator inbox)
     Enquiry.__table__,
+    # Email (Resend)
+    RecEmailMessage.__table__,
+    RecEmailPreference.__table__,
 ]

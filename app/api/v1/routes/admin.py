@@ -7,25 +7,27 @@ Endpoints:
   PATCH /admin/users/{id}        — update role/plan/budget/status
   POST /admin/users/{id}/features — grant or revoke a feature
   GET  /admin/usage              — platform-wide usage stats
+  (overview / costs / quality / spot-check live in admin_insights.py)
   POST /admin/users/{id}/activate   — re-enable a disabled user
   POST /admin/users/{id}/deactivate — disable a user
   GET  /admin/crawled-jobs/cleanup/preview — count jobs older than N hours
   POST /admin/crawled-jobs/cleanup         — delete jobs older than N hours
 """
+from collections import defaultdict
 from datetime import datetime
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from sqlalchemy import func
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
 from app.api.deps import require_admin
 from app.db.session import get_db
-from app.models.enums import FeatureFlag, PlanTier
+from app.models.enums import FeatureFlag, PlanTier, UserRole
 from app.models.models import (
     PLAN_DEFAULT_FEATURES, PLAN_TOKEN_BUDGETS,
     AuditLog, CrawledJob, CrawlerConfig, InterviewSession, JobApplication, ProductEvent,
-    SupportTicket, UsageEvent, UsageLedger, User, UserFeature, UserProfile,
+    RefreshToken, SupportTicket, SupportTicketMessage, UsageEvent, UsageLedger, User, UserFeature, UserProfile,
 )
 from app.schemas.admin import (
     AdminUserDetailOut,
@@ -37,6 +39,8 @@ from app.schemas.admin import (
     CrawledJobsCleanupPreview,
     CrawledJobsCleanupRequest,
     CrawledJobsCleanupResult,
+    FeatureBulkRequest,
+    FeatureBulkResult,
     FeatureFlagsOverview,
     FeatureFlagSummary,
     FeatureOverrideOut,
@@ -48,6 +52,7 @@ from app.schemas.admin import (
 )
 from app.schemas.plans import PlanCreate, PlanOut, PlanUpdate
 from app.schemas.support import AdminTicketUpdate, TicketListItem, TicketMessageCreate, TicketMessageOut, TicketOut
+from app.services.admin.audit import diff, log_admin_action
 from app.services.audit.service import AuditService
 from app.services.crawler.cleanup import CrawledJobsCleanupService
 from app.services.plans.service import PlanService
@@ -60,56 +65,159 @@ def _current_month() -> str:
     return datetime.utcnow().strftime("%Y-%m")
 
 
-def _build_admin_user(user: User, db: Session, include_usage: bool = True) -> AdminUserOut:
-    """Serialize a User to AdminUserOut with features and optional usage summary."""
-    features = [
-        f.feature.value
-        for f in db.query(UserFeature).filter_by(user_id=user.id, enabled=True).all()
-    ]
-    usage = None
+def _month_bounds(month_str: str) -> tuple[datetime, datetime]:
+    """[start, end) datetimes for a YYYY-MM string — portable across MySQL/SQLite."""
+    year, month = (int(x) for x in month_str.split("-"))
+    start = datetime(year, month, 1)
+    end = datetime(year + (month == 12), 1 if month == 12 else month + 1, 1)
+    return start, end
+
+
+def _build_admin_users(users: List[User], db: Session, include_usage: bool = True) -> List[AdminUserOut]:
+    """Serialize many users with a fixed number of queries (no N+1)."""
+    if not users:
+        return []
+    ids = [u.id for u in users]
+    month = _current_month()
+
+    features: dict[int, list[str]] = defaultdict(list)
+    for uid, feat in (
+        db.query(UserFeature.user_id, UserFeature.feature)
+        .filter(UserFeature.user_id.in_(ids), UserFeature.enabled.is_(True))
+        .all()
+    ):
+        features[uid].append(feat.value)
+
+    ledgers: dict[int, UsageLedger] = {}
     if include_usage:
-        month = _current_month()
-        ledger = db.query(UsageLedger).filter_by(user_id=user.id, month_year=month).first()
-        if ledger:
-            usage = UserUsageSummary(
-                month_year=ledger.month_year,
-                tokens_used=ledger.tokens_used,
-                api_calls=ledger.api_calls,
-            )
-    return AdminUserOut(
-        id=user.id,
-        email=user.email,
-        role=user.role,
-        plan=user.plan,
-        subscription_status=user.subscription_status,
-        token_budget_monthly=user.token_budget_monthly,
-        is_active=user.is_active,
-        created_at=user.created_at,
-        features=features,
-        usage_current_month=usage,
+        ledgers = {
+            row.user_id: row
+            for row in db.query(UsageLedger)
+            .filter(UsageLedger.user_id.in_(ids), UsageLedger.month_year == month)
+            .all()
+        }
+
+    # "Last seen" = most recent token issue (login or refresh). Refresh runs
+    # every ~30 min of active use, so this tracks real activity closely.
+    last_seen = dict(
+        db.query(RefreshToken.user_id, func.max(RefreshToken.created_at))
+        .filter(RefreshToken.user_id.in_(ids))
+        .group_by(RefreshToken.user_id)
+        .all()
     )
+    names = dict(
+        db.query(UserProfile.user_id, UserProfile.full_name)
+        .filter(UserProfile.user_id.in_(ids))
+        .all()
+    )
+
+    out: List[AdminUserOut] = []
+    for user in users:
+        ledger = ledgers.get(user.id)
+        usage = (
+            UserUsageSummary(month_year=ledger.month_year, tokens_used=ledger.tokens_used, api_calls=ledger.api_calls)
+            if ledger
+            else None
+        )
+        out.append(
+            AdminUserOut(
+                id=user.id,
+                email=user.email,
+                full_name=names.get(user.id),
+                role=user.role,
+                plan=user.plan,
+                subscription_status=user.subscription_status,
+                token_budget_monthly=user.token_budget_monthly,
+                is_active=user.is_active,
+                created_at=user.created_at,
+                last_seen_at=last_seen.get(user.id),
+                features=sorted(features.get(user.id, [])),
+                usage_current_month=usage,
+            )
+        )
+    return out
+
+
+def _build_admin_user(user: User, db: Session, include_usage: bool = True) -> AdminUserOut:
+    return _build_admin_users([user], db, include_usage=include_usage)[0]
+
+
+def _user_snapshot(user: User) -> dict:
+    return {
+        "role": getattr(user.role, "value", user.role),
+        "plan": getattr(user.plan, "value", user.plan),
+        "token_budget_monthly": user.token_budget_monthly,
+        "subscription_status": getattr(user.subscription_status, "value", user.subscription_status),
+        "is_active": user.is_active,
+    }
 
 
 # ── User Management ────────────────────────────────────────────────────────
 
+USER_SORTS = ("newest", "oldest", "email", "tokens", "last_seen")
+
+
 @router.get("/users", response_model=List[AdminUserOut])
 def list_users(
+    response: Response,
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
-    search: Optional[str] = Query(default=None),
+    search: Optional[str] = Query(default=None, description="Matches email, full name, or exact user id"),
     plan: Optional[PlanTier] = Query(default=None),
+    role: Optional[UserRole] = Query(default=None),
+    status_filter: Optional[str] = Query(default=None, alias="status", pattern="^(active|disabled)$"),
+    sort: str = Query(default="newest", pattern="^(newest|oldest|email|tokens|last_seen)$"),
     _admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    """List all users with pagination, search, and plan filter."""
+    """List users with pagination, search, filters and sorting.
+
+    The total row count (before pagination) is returned in the ``X-Total-Count``
+    response header so the body shape stays a plain list.
+    """
+    month = _current_month()
     q = db.query(User)
-    if search:
-        q = q.filter(User.email.ilike(f"%{search}%"))
+    if search and search.strip():
+        term = search.strip()
+        like = f"%{term}%"
+        conds = [User.email.ilike(like), UserProfile.full_name.ilike(like)]
+        if term.lstrip("#").isdigit():
+            conds.append(User.id == int(term.lstrip("#")))
+        q = q.outerjoin(UserProfile, UserProfile.user_id == User.id).filter(or_(*conds))
     if plan:
-        q = q.filter_by(plan=plan)
+        q = q.filter(User.plan == plan)
+    if role:
+        q = q.filter(User.role == role)
+    if status_filter == "active":
+        q = q.filter(User.is_active.is_(True))
+    elif status_filter == "disabled":
+        q = q.filter(User.is_active.is_(False))
+
     total = q.count()
-    users = q.order_by(User.created_at.desc()).offset((page - 1) * page_size).limit(page_size).all()
-    return [_build_admin_user(u, db, include_usage=True) for u in users]
+
+    if sort == "oldest":
+        q = q.order_by(User.created_at.asc(), User.id.asc())
+    elif sort == "email":
+        q = q.order_by(User.email.asc())
+    elif sort == "tokens":
+        q = q.outerjoin(
+            UsageLedger, and_(UsageLedger.user_id == User.id, UsageLedger.month_year == month)
+        ).order_by(func.coalesce(UsageLedger.tokens_used, 0).desc(), User.id.desc())
+    elif sort == "last_seen":
+        seen = (
+            db.query(RefreshToken.user_id.label("uid"), func.max(RefreshToken.created_at).label("seen"))
+            .group_by(RefreshToken.user_id)
+            .subquery()
+        )
+        q = q.outerjoin(seen, seen.c.uid == User.id).order_by(
+            func.coalesce(seen.c.seen, datetime(1970, 1, 1)).desc(), User.id.desc()
+        )
+    else:
+        q = q.order_by(User.created_at.desc(), User.id.desc())
+
+    users = q.offset((page - 1) * page_size).limit(page_size).all()
+    response.headers["X-Total-Count"] = str(total)
+    return _build_admin_users(users, db, include_usage=True)
 
 
 @router.get("/users/{user_id}", response_model=AdminUserOut)
@@ -204,13 +312,22 @@ def get_user_detail(
 def update_user(
     user_id: int,
     payload: AdminUserUpdate,
-    _admin: User = Depends(require_admin),
+    request: Request,
+    admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     """Update a user's role, plan, token budget, subscription status, or active flag."""
     user = db.get(User, user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    if user.id == admin.id:
+        if payload.role is not None and payload.role != UserRole.admin:
+            raise HTTPException(status_code=400, detail="You can't remove your own admin role")
+        if payload.is_active is False:
+            raise HTTPException(status_code=400, detail="You can't deactivate your own account")
+
+    before = _user_snapshot(user)
+    granted: list[str] = []
 
     if payload.role is not None:
         user.role = payload.role
@@ -225,8 +342,10 @@ def update_user(
             existing = db.query(UserFeature).filter_by(user_id=user.id, feature=feature).first()
             if not existing:
                 db.add(UserFeature(user_id=user.id, feature=feature, enabled=True))
+                granted.append(feature.value)
             elif not existing.enabled:
                 existing.enabled = True
+                granted.append(feature.value)
     if payload.token_budget_monthly is not None:
         user.token_budget_monthly = payload.token_budget_monthly
     if payload.subscription_status is not None:
@@ -236,6 +355,15 @@ def update_user(
 
     db.commit()
     db.refresh(user)
+
+    b, a = diff(before, _user_snapshot(user))
+    if b or a or granted:
+        log_admin_action(
+            db, admin, "admin.user.update", "user", user.id,
+            before=b, after=a,
+            metadata={"email": user.email, **({"features_granted": granted} if granted else {})},
+            request=request,
+        )
     return _build_admin_user(user, db)
 
 
@@ -243,7 +371,8 @@ def update_user(
 def toggle_feature(
     user_id: int,
     payload: FeatureToggleRequest,
-    _admin: User = Depends(require_admin),
+    request: Request,
+    admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     """Enable or disable a specific feature for a user."""
@@ -252,18 +381,28 @@ def toggle_feature(
         raise HTTPException(status_code=404, detail="User not found")
 
     existing = db.query(UserFeature).filter_by(user_id=user_id, feature=payload.feature).first()
+    previous = existing.enabled if existing else None
     if existing:
         existing.enabled = payload.enabled
     else:
         db.add(UserFeature(user_id=user_id, feature=payload.feature, enabled=payload.enabled))
     db.commit()
+    if previous != payload.enabled:
+        log_admin_action(
+            db, admin, "admin.user.feature_toggle", "user", user.id,
+            before={"feature": payload.feature.value, "enabled": previous},
+            after={"feature": payload.feature.value, "enabled": payload.enabled},
+            metadata={"email": user.email},
+            request=request,
+        )
     return _build_admin_user(user, db)
 
 
 @router.delete("/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_user(
     user_id: int,
-    _admin: User = Depends(require_admin),
+    request: Request,
+    admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     """Permanently delete a user and all associated data."""
@@ -272,36 +411,48 @@ def delete_user(
         raise HTTPException(status_code=404, detail="User not found")
     if user.role.value == "admin":
         raise HTTPException(status_code=400, detail="Cannot delete an admin account")
+    snapshot = {"email": user.email, **_user_snapshot(user)}
     db.delete(user)
     db.commit()
+    log_admin_action(db, admin, "admin.user.delete", "user", user_id, before=snapshot, request=request)
+
+
+def _set_active(user_id: int, active: bool, request: Request, admin: User, db: Session) -> dict:
+    user = db.get(User, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if not active and user.id == admin.id:
+        raise HTTPException(status_code=400, detail="You can't deactivate your own account")
+    was = user.is_active
+    user.is_active = active
+    db.commit()
+    if was != active:
+        log_admin_action(
+            db, admin, "admin.user.activate" if active else "admin.user.deactivate", "user", user.id,
+            before={"is_active": was}, after={"is_active": active},
+            metadata={"email": user.email}, request=request,
+        )
+    return {"message": "User activated" if active else "User deactivated"}
 
 
 @router.post("/users/{user_id}/activate", status_code=status.HTTP_200_OK)
 def activate_user(
     user_id: int,
-    _admin: User = Depends(require_admin),
+    request: Request,
+    admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    user = db.get(User, user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    user.is_active = True
-    db.commit()
-    return {"message": "User activated"}
+    return _set_active(user_id, True, request, admin, db)
 
 
 @router.post("/users/{user_id}/deactivate", status_code=status.HTTP_200_OK)
 def deactivate_user(
     user_id: int,
-    _admin: User = Depends(require_admin),
+    request: Request,
+    admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    user = db.get(User, user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    user.is_active = False
-    db.commit()
-    return {"message": "User deactivated"}
+    return _set_active(user_id, False, request, admin, db)
 
 
 # ── Platform Usage Stats ───────────────────────────────────────────────────
@@ -317,8 +468,10 @@ def platform_usage(
 
     total_users = db.query(func.count(User.id)).scalar()
 
-    month_start = datetime.utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    new_users_this_month = db.query(func.count(User.id)).filter(User.created_at >= month_start).scalar() or 0
+    m_start, m_end = _month_bounds(month_str)
+    new_users_this_month = (
+        db.query(func.count(User.id)).filter(User.created_at >= m_start, User.created_at < m_end).scalar() or 0
+    )
 
     plan_count_rows = db.query(User.plan, func.count(User.id)).group_by(User.plan).all()
     plan_counts = {p.value: c for p, c in plan_count_rows}
@@ -359,7 +512,7 @@ def platform_usage(
             UsageEvent.feature,
             func.coalesce(func.sum(UsageEvent.tokens_in + UsageEvent.tokens_out), 0).label("tokens"),
         )
-        .filter(func.date_format(UsageEvent.created_at, "%Y-%m") == month_str)
+        .filter(UsageEvent.created_at >= _month_bounds(month_str)[0], UsageEvent.created_at < _month_bounds(month_str)[1])
         .group_by(UsageEvent.feature)
         .all()
     )
@@ -478,6 +631,7 @@ def admin_analytics_overview(
 
 @router.get("/events", response_model=List[ProductEventOut])
 def admin_list_events(
+    response: Response,
     event_name: Optional[str] = Query(default=None),
     user_id: Optional[int] = Query(default=None),
     entity_type: Optional[str] = Query(default=None),
@@ -501,6 +655,7 @@ def admin_list_events(
     if end_date:
         q = q.filter(ProductEvent.created_at <= end_date)
 
+    response.headers["X-Total-Count"] = str(q.count())
     rows = q.order_by(ProductEvent.created_at.desc()).offset((page - 1) * page_size).limit(page_size).all()
 
     user_ids = {r.user_id for r in rows if r.user_id is not None}
@@ -517,10 +672,27 @@ def admin_list_events(
     return results
 
 
+@router.get("/events/facets")
+def admin_event_facets(_admin: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict:
+    """Distinct event names and entity types, for filter dropdowns."""
+    names = [r[0] for r in db.query(ProductEvent.event_name).distinct().order_by(ProductEvent.event_name).all() if r[0]]
+    entities = [r[0] for r in db.query(ProductEvent.entity_type).distinct().order_by(ProductEvent.entity_type).all() if r[0]]
+    return {"event_names": names, "entity_types": entities}
+
+
+@router.get("/audit-logs/facets")
+def admin_audit_facets(_admin: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict:
+    """Distinct actions and entity types, for filter dropdowns."""
+    actions = [r[0] for r in db.query(AuditLog.action).distinct().order_by(AuditLog.action).all() if r[0]]
+    entities = [r[0] for r in db.query(AuditLog.entity_type).distinct().order_by(AuditLog.entity_type).all() if r[0]]
+    return {"actions": actions, "entity_types": entities}
+
+
 # ── Audit Logs ───────────────────────────────────────────────────────────────
 
 @router.get("/audit-logs", response_model=List[AuditLogOut])
 def admin_list_audit_logs(
+    response: Response,
     actor_user_id: Optional[int] = Query(default=None),
     action: Optional[str] = Query(default=None),
     entity_type: Optional[str] = Query(default=None),
@@ -547,6 +719,7 @@ def admin_list_audit_logs(
     if end_date:
         q = q.filter(AuditLog.created_at <= end_date)
 
+    response.headers["X-Total-Count"] = str(q.count())
     rows = q.order_by(AuditLog.created_at.desc()).offset((page - 1) * page_size).limit(page_size).all()
 
     actor_ids = {r.actor_user_id for r in rows if r.actor_user_id is not None}
@@ -568,6 +741,8 @@ def admin_list_audit_logs(
 @router.get("/feature-flags", response_model=FeatureFlagsOverview)
 def admin_feature_flags(
     feature: Optional[str] = Query(default=None),
+    search: Optional[str] = Query(default=None, description="Filter overrides by user email"),
+    enabled: Optional[bool] = Query(default=None),
     _admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
@@ -583,18 +758,35 @@ def admin_feature_flags(
         bucket = counts.setdefault(key, {"enabled": 0, "disabled": 0})
         bucket["enabled" if enabled else "disabled"] += cnt
 
+    by_plan: dict = defaultdict(dict)
+    for feat, plan_, cnt in (
+        db.query(UserFeature.feature, User.plan, func.count(UserFeature.id))
+        .join(User, User.id == UserFeature.user_id)
+        .filter(UserFeature.enabled.is_(True))
+        .group_by(UserFeature.feature, User.plan)
+        .all()
+    ):
+        by_plan[feat.value][plan_.value] = cnt
+
     summary = [
         FeatureFlagSummary(
             feature=f.value,
             enabled_count=counts.get(f.value, {}).get("enabled", 0),
             disabled_count=counts.get(f.value, {}).get("disabled", 0),
+            enabled_by_plan=by_plan.get(f.value, {}),
         )
         for f in FeatureFlag
     ]
+    plan_users = {p.value: c for p, c in db.query(User.plan, func.count(User.id)).group_by(User.plan).all()}
 
     q = db.query(UserFeature, User.email).join(User, User.id == UserFeature.user_id)
     if feature:
         q = q.filter(UserFeature.feature == feature)
+    if search and search.strip():
+        q = q.filter(User.email.ilike(f"%{search.strip()}%"))
+    if enabled is not None:
+        q = q.filter(UserFeature.enabled.is_(enabled))
+    overrides_total = q.count()
     rows = q.order_by(UserFeature.id.desc()).limit(200).all()
 
     overrides = [
@@ -602,7 +794,64 @@ def admin_feature_flags(
         for uf, email in rows
     ]
 
-    return FeatureFlagsOverview(summary=summary, overrides=overrides)
+    return FeatureFlagsOverview(summary=summary, overrides=overrides, plan_users=plan_users, overrides_total=overrides_total)
+
+
+@router.post("/feature-flags/bulk", response_model=FeatureBulkResult)
+def admin_feature_flags_bulk(
+    payload: FeatureBulkRequest,
+    request: Request,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Set one feature on/off for every user on a plan (or a list of user ids).
+
+    Use ``dry_run: true`` first to see how many users would change.
+    """
+    if payload.plan is None and not payload.user_ids:
+        raise HTTPException(status_code=400, detail="Choose a plan or provide user_ids")
+
+    uq = db.query(User.id)
+    if payload.plan is not None:
+        uq = uq.filter(User.plan == payload.plan)
+    if payload.user_ids:
+        uq = uq.filter(User.id.in_(payload.user_ids))
+    user_ids = [uid for (uid,) in uq.all()]
+
+    existing = {
+        uf.user_id: uf
+        for uf in db.query(UserFeature)
+        .filter(UserFeature.feature == payload.feature, UserFeature.user_id.in_(user_ids))
+        .all()
+    } if user_ids else {}
+    to_change = [uid for uid in user_ids if (existing[uid].enabled if uid in existing else None) != payload.enabled]
+
+    if not payload.dry_run and to_change:
+        for uid in to_change:
+            if uid in existing:
+                existing[uid].enabled = payload.enabled
+            else:
+                db.add(UserFeature(user_id=uid, feature=payload.feature, enabled=payload.enabled))
+        db.commit()
+        log_admin_action(
+            db, admin, "admin.feature.bulk_set", "feature", None,
+            after={"feature": payload.feature.value, "enabled": payload.enabled},
+            metadata={
+                "plan": payload.plan.value if payload.plan else None,
+                "user_ids": payload.user_ids[:50] if payload.user_ids else None,
+                "matched_users": len(user_ids),
+                "changed": len(to_change),
+            },
+            request=request,
+        )
+
+    return FeatureBulkResult(
+        feature=payload.feature.value,
+        enabled=payload.enabled,
+        matched_users=len(user_ids),
+        changed=len(to_change),
+        dry_run=payload.dry_run,
+    )
 
 
 # ── Crawler Configs ────────────────────────────────────────────────────────────
@@ -760,6 +1009,14 @@ def admin_list_tickets(
         category=category,
         assigned_admin_id=assigned_admin_id,
     )
+    counts: dict[int, int] = {}
+    if tickets:
+        counts = dict(
+            db.query(SupportTicketMessage.ticket_id, func.count(SupportTicketMessage.id))
+            .filter(SupportTicketMessage.ticket_id.in_([t.id for t in tickets]), SupportTicketMessage.deleted_at.is_(None))
+            .group_by(SupportTicketMessage.ticket_id)
+            .all()
+        )
     return [
         TicketListItem(
             id=t.id,
@@ -769,7 +1026,7 @@ def admin_list_tickets(
             priority=t.priority,
             status=t.status,
             assigned_admin_id=t.assigned_admin_id,
-            message_count=len(service.get_messages(t.id)),
+            message_count=counts.get(t.id, 0),
             created_at=t.created_at,
             updated_at=t.updated_at,
             deleted_at=t.deleted_at,

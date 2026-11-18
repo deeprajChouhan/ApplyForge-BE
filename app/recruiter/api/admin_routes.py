@@ -8,7 +8,9 @@ rec_recruiters.
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from datetime import datetime, timedelta
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -33,6 +35,7 @@ from app.recruiter.schemas import (
 )
 from app.recruiter.services import access as access_service
 from app.recruiter.services import usage as usage_service
+from app.services.admin.audit import diff, log_admin_action
 
 
 def effective_seat_limit(agency: Agency) -> int | None:
@@ -69,6 +72,23 @@ def _agency_out(db: Session, agency: Agency) -> AgencyAdminOut:
     )
 
 
+def _agency_snapshot(agency: Agency) -> dict:
+    return {
+        "plan": getattr(agency.plan, "value", agency.plan),
+        "seat_limit": agency.seat_limit,
+        "billing_model": getattr(agency.billing_model, "value", agency.billing_model),
+        "status": getattr(agency.status, "value", agency.status),
+    }
+
+
+def _recruiter_snapshot(r: Recruiter) -> dict:
+    return {
+        "full_name": r.full_name,
+        "role": getattr(r.role, "value", r.role),
+        "is_active": r.is_active,
+    }
+
+
 def _recruiter_out(recruiter: Recruiter) -> RecruiterAdminOut:
     return RecruiterAdminOut(
         id=recruiter.id,
@@ -99,11 +119,18 @@ def agency_usage(agency_id: int, month: str | None = None, db: Session = Depends
 
 
 @router.patch("/agencies/{agency_id}", response_model=AgencyAdminOut)
-def update_agency_plan(agency_id: int, payload: AgencyPlanUpdate, db: Session = Depends(get_db)):
+def update_agency_plan(
+    agency_id: int,
+    payload: AgencyPlanUpdate,
+    request: Request,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
     """Change an agency's plan (and optional per-agency seat override)."""
     agency = db.get(Agency, agency_id)
     if agency is None:
         raise HTTPException(status_code=404, detail="Agency not found")
+    before = _agency_snapshot(agency)
     agency.plan = payload.plan
     # An explicit seat_limit overrides the plan default; otherwise reset to
     # plan-default behaviour (stored NULL → effective limit follows the plan).
@@ -112,6 +139,10 @@ def update_agency_plan(agency_id: int, payload: AgencyPlanUpdate, db: Session = 
         agency.billing_model = payload.billing_model
     db.commit()
     db.refresh(agency)
+    b, a = diff(before, _agency_snapshot(agency))
+    if b or a:
+        log_admin_action(db, admin, "admin.agency.plan_update", "rec_agency", agency.id,
+                         before=b, after=a, metadata={"agency": agency.name}, request=request)
     return _agency_out(db, agency)
 
 
@@ -132,7 +163,14 @@ def billing_summary(db: Session = Depends(get_db)):
         if a.subscription_status == "active":
             active_subs += 1
     seats_used = int(db.query(func.count(Recruiter.id)).scalar() or 0)
+    now = datetime.utcnow()
+    soon = now + timedelta(days=7)
+    trials_ending_soon = sum(
+        1 for a in agencies
+        if a.trial_ends_at is not None and now <= a.trial_ends_at <= soon and a.status != AgencyStatus.suspended
+    )
     return BillingSummaryOut(
+        trials_ending_soon=trials_ending_soon,
         agencies_total=len(agencies),
         by_status=by_status,
         by_plan=by_plan,
@@ -144,37 +182,65 @@ def billing_summary(db: Session = Depends(get_db)):
 
 
 @router.post("/agencies/{agency_id}/approve", response_model=AgencyAdminOut)
-def approve_agency(agency_id: int, db: Session = Depends(get_db)):
+def approve_agency(
+    agency_id: int,
+    request: Request,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
     """Approve a pending self-serve signup so its owner can log in (Phase 5.6)."""
     agency = db.get(Agency, agency_id)
     if agency is None:
         raise HTTPException(status_code=404, detail="Agency not found")
+    was = getattr(agency.status, "value", agency.status)
     agency.status = AgencyStatus.active
     db.commit()
     db.refresh(agency)
+    log_admin_action(db, admin, "admin.agency.approve", "rec_agency", agency.id,
+                     before={"status": was}, after={"status": "active"},
+                     metadata={"agency": agency.name}, request=request)
     return _agency_out(db, agency)
 
 
 @router.patch("/agencies/{agency_id}/status", response_model=AgencyAdminOut)
-def set_agency_status(agency_id: int, payload: AgencyStatusUpdate, db: Session = Depends(get_db)):
+def set_agency_status(
+    agency_id: int,
+    payload: AgencyStatusUpdate,
+    request: Request,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
     """Operator lifecycle control: approve, suspend, or reactivate an agency."""
     agency = db.get(Agency, agency_id)
     if agency is None:
         raise HTTPException(status_code=404, detail="Agency not found")
+    was = getattr(agency.status, "value", agency.status)
     agency.status = payload.status
     db.commit()
     db.refresh(agency)
+    now = getattr(agency.status, "value", agency.status)
+    if was != now:
+        log_admin_action(db, admin, "admin.agency.status", "rec_agency", agency.id,
+                         before={"status": was}, after={"status": now},
+                         metadata={"agency": agency.name}, request=request)
     return _agency_out(db, agency)
 
 
 @router.post("/agencies", response_model=AgencyAdminOut, status_code=status.HTTP_201_CREATED)
-def create_agency(payload: AgencyCreate, db: Session = Depends(get_db)):
+def create_agency(
+    payload: AgencyCreate,
+    request: Request,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
     if db.query(Agency).filter(Agency.slug == payload.slug).first():
         raise HTTPException(status_code=409, detail="An agency with this slug already exists")
     agency = Agency(name=payload.name, slug=payload.slug)
     db.add(agency)
     db.commit()
     db.refresh(agency)
+    log_admin_action(db, admin, "admin.agency.create", "rec_agency", agency.id,
+                     after={"name": agency.name, "slug": agency.slug}, request=request)
     return _agency_out(db, agency)
 
 
@@ -195,7 +261,12 @@ def list_recruiters(
 
 
 @router.post("/recruiters", response_model=RecruiterAdminOut, status_code=status.HTTP_201_CREATED)
-def create_recruiter(payload: RecruiterCreate, db: Session = Depends(get_db)):
+def create_recruiter(
+    payload: RecruiterCreate,
+    request: Request,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
     agency = db.get(Agency, payload.agency_id)
     if agency is None:
         raise HTTPException(status_code=404, detail="Agency not found")
@@ -223,6 +294,9 @@ def create_recruiter(payload: RecruiterCreate, db: Session = Depends(get_db)):
     db.add(recruiter)
     db.commit()
     db.refresh(recruiter)
+    log_admin_action(db, admin, "admin.recruiter.create", "rec_recruiter", recruiter.id,
+                     after={"email": recruiter.email, "role": getattr(recruiter.role, "value", recruiter.role)},
+                     metadata={"agency": agency.name}, request=request)
     return _recruiter_out(recruiter)
 
 
@@ -250,10 +324,17 @@ def _guard_last_owner(db: Session, recruiter: Recruiter) -> None:
 
 
 @router.patch("/recruiters/{recruiter_id}", response_model=RecruiterAdminOut)
-def update_recruiter(recruiter_id: int, payload: RecruiterUpdate, db: Session = Depends(get_db)):
+def update_recruiter(
+    recruiter_id: int,
+    payload: RecruiterUpdate,
+    request: Request,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
     recruiter = db.get(Recruiter, recruiter_id)
     if recruiter is None:
         raise HTTPException(status_code=404, detail="Recruiter not found")
+    before = _recruiter_snapshot(recruiter)
     demoting = payload.role is not None and payload.role != RecruiterSeatRole.owner
     deactivating = payload.is_active is False
     if demoting or deactivating:
@@ -266,25 +347,46 @@ def update_recruiter(recruiter_id: int, payload: RecruiterUpdate, db: Session = 
         recruiter.role = payload.role
     db.commit()
     db.refresh(recruiter)
+    b, a = diff(before, _recruiter_snapshot(recruiter))
+    if b or a:
+        log_admin_action(db, admin, "admin.recruiter.update", "rec_recruiter", recruiter.id,
+                         before=b, after=a, metadata={"email": recruiter.email}, request=request)
     return _recruiter_out(recruiter)
 
 
 @router.post("/recruiters/{recruiter_id}/reset-password", response_model=RecruiterAdminOut)
-def reset_password(recruiter_id: int, payload: RecruiterPasswordReset, db: Session = Depends(get_db)):
+def reset_password(
+    recruiter_id: int,
+    payload: RecruiterPasswordReset,
+    request: Request,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
     recruiter = db.get(Recruiter, recruiter_id)
     if recruiter is None:
         raise HTTPException(status_code=404, detail="Recruiter not found")
     recruiter.password_hash = hash_password(payload.password)
     db.commit()
     db.refresh(recruiter)
+    # Never log the password itself.
+    log_admin_action(db, admin, "admin.recruiter.reset_password", "rec_recruiter", recruiter.id,
+                     metadata={"email": recruiter.email}, request=request)
     return _recruiter_out(recruiter)
 
 
 @router.delete("/recruiters/{recruiter_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_recruiter(recruiter_id: int, db: Session = Depends(get_db)):
+def delete_recruiter(
+    recruiter_id: int,
+    request: Request,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
     recruiter = db.get(Recruiter, recruiter_id)
     if recruiter is None:
         raise HTTPException(status_code=404, detail="Recruiter not found")
     _guard_last_owner(db, recruiter)
+    snapshot = {"email": recruiter.email, "agency_id": recruiter.agency_id, **_recruiter_snapshot(recruiter)}
     db.delete(recruiter)
     db.commit()
+    log_admin_action(db, admin, "admin.recruiter.delete", "rec_recruiter", recruiter_id,
+                     before=snapshot, request=request)
