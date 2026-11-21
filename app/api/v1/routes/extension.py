@@ -6,6 +6,8 @@ ApplyForge Job Clipper — browser extension API.
   POST /extension/jobs/save           -> save a scored job into the pipeline
   POST /extension/events              -> record an extension product event
   POST /extension/promo/dismiss       -> dismiss the in-app extension promo
+  GET  /extension/settings            -> Job Hunting preferences for the extension
+  PUT  /extension/settings            -> partial update of those preferences
 
 All endpoints require an authenticated ApplyForge user. Anonymous scoring or
 saving is not permitted.
@@ -21,6 +23,8 @@ from app.models.models import User
 from app.schemas.extension import (
     ExtensionEventIn,
     ExtensionScorePreviewOut,
+    ExtensionSettingsOut,
+    ExtensionSettingsUpdate,
     ExtensionStatusOut,
     SaveJobIn,
     SaveJobOut,
@@ -29,9 +33,12 @@ from app.schemas.extension import (
 )
 from app.services.analytics.service import ProductEventService
 from app.services.applications.service import ApplicationService
+from app.models.enums import ApplicationStatus
 from app.services.extension.service import (
     ExtensionService,
     frontend_base_url,
+    is_excluded_company,
+    must_haves,
     score_confidence,
 )
 from app.services.scoring.service import (
@@ -87,10 +94,19 @@ def score_preview(
     co = payload.company
     role = payload.title
 
-    fit_score = 50.0  # neutral until full profile match runs post-save
+    svc = ExtensionService(db, user.id)
+    cfg = svc.get_settings()
+    insights = JDInsightExtractor.extract(jd, co, role)
+
+    # Quick fit against the chosen resume (neutral 50 if there's no resume or
+    # quick_fit is off). The full RAG-grounded match still runs after save.
+    qf = svc.quick_fit(cfg, jd, role, insights["key_skills"])
+    fit_score = qf["fit_score"]
     competition = CompetitionScorer.score(jd, co)
     composed = PriorityScorer.compose(fit_score, competition)
-    insights = JDInsightExtractor.extract(jd, co, role)
+    mh_found, mh_missing = must_haves(cfg.must_have_keywords, jd)
+    excluded = is_excluded_company(co, cfg.excluded_companies)
+    saved = svc.find_saved(payload.source_url) if cfg.warn_duplicates else None
 
     reply_prob, reply_label, reply_reasoning = ReplyPredictor.predict(
         competition_score=competition,
@@ -104,7 +120,7 @@ def score_preview(
     opportunity = round(100 - competition, 2)
 
     # Mark the extension as active/connected on real usage.
-    ExtensionService(db, user.id).mark_seen(connect=True)
+    svc.mark_seen(connect=True)
     ProductEventService(db).track(
         "extension_job_scored",
         user_id=user.id,
@@ -137,6 +153,16 @@ def score_preview(
             work_type=insights["work_type"],
             contract_type=insights["contract_type"],
         ),
+        fit_source=qf["fit_source"],
+        fit_breakdown=qf["fit_breakdown"],
+        resume_id=qf["resume"].id if qf["resume"] else None,
+        resume_label=svc.resume_label(qf["resume"]),
+        matched_skills=qf["matched_skills"],
+        missing_skills=qf["missing_skills"],
+        must_have_found=mh_found,
+        must_have_missing=mh_missing,
+        excluded_company=excluded,
+        already_saved_application_id=str(saved.id) if saved else None,
     )
 
 
@@ -147,16 +173,22 @@ def save_job(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    svc = ExtensionService(db, user.id)
+    cfg = svc.get_settings()
+    resume = svc.resume_by_setting(cfg)
     app = ApplicationService(db, user.id).create(
         {
             "company_name": payload.company or "Unknown Company",
             "role_title": payload.title or "Unknown Role",
             "job_description": payload.description or f"{payload.title} at {payload.company}",
             "jd_link": payload.source_url or None,
+            "status": ApplicationStatus(cfg.default_save_status),
+            # Pin the resume chosen in Job Hunting settings (None = latest).
+            "selected_resume_id": resume.id if resume else None,
         }
     )
 
-    ExtensionService(db, user.id).mark_seen(connect=True)
+    svc.mark_seen(connect=True)
     ProductEventService(db).track(
         "extension_job_saved",
         user_id=user.id,
@@ -203,3 +235,35 @@ def dismiss_promo(
         "extension_promo_dismissed", user_id=user.id, request=request
     )
     return {"ok": True, "promo_dismissed_at": state.promo_dismissed_at}
+
+
+def _settings_out(svc: ExtensionService, cfg) -> ExtensionSettingsOut:
+    resume = svc.resolve_resume(cfg)
+    return ExtensionSettingsOut(**cfg.model_dump(), default_resume_label=svc.resume_label(resume))
+
+
+@router.get("/settings", response_model=ExtensionSettingsOut)
+def get_settings(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    svc = ExtensionService(db, user.id)
+    return _settings_out(svc, svc.get_settings())
+
+
+@router.put("/settings", response_model=ExtensionSettingsOut)
+def update_settings(
+    payload: ExtensionSettingsUpdate,
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    svc = ExtensionService(db, user.id)
+    cfg = svc.update_settings(payload)
+    ProductEventService(db).track(
+        "extension_settings_updated",
+        user_id=user.id,
+        properties={"fields": sorted(payload.model_dump(exclude_unset=True).keys())},
+        request=request,
+    )
+    return _settings_out(svc, cfg)

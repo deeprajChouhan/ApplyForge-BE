@@ -506,6 +506,10 @@ class UserExtensionState(Base, TimestampMixin):
     connected_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     promo_dismissed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Job Hunting → Extension preferences (resume to score against, sites,
+    # must-haves, excluded companies, widget placement…). Validated by
+    # app.schemas.extension.ExtensionSettings; NULL = all defaults.
+    settings_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
 
 class SupportTicketMessage(Base):

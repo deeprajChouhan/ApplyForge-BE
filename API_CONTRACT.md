@@ -597,6 +597,65 @@ a second call.
 
 ---
 
+## EXTENSION — Job Clipper (consumer)
+
+All endpoints require a consumer access token. Every query is filtered by `user_id`.
+(Previously undocumented here; the existing endpoints are listed for completeness.)
+
+### `GET /extension/status`
+`{connected, connected_at, last_seen_at, promo_dismissed_at, chrome_store_url}`
+
+### `GET /extension/settings` *(new 2026-11-21)*
+Job Hunting → Extension preferences. Defaults are returned when nothing is saved.
+```json
+{
+  "enabled": true,
+  "enabled_sites": ["linkedin", "indeed", "glassdoor", "other"],
+  "default_resume_id": null,
+  "default_resume_label": "cv.pdf · 01 Nov 2026",
+  "auto_score": true,
+  "quick_fit": true,
+  "show_card_labels": true,
+  "widget_position": "inline",
+  "must_have_keywords": [],
+  "excluded_companies": [],
+  "default_save_status": "draft",
+  "open_after_save": false,
+  "warn_duplicates": true
+}
+```
+- `enabled_sites` ⊆ `linkedin | indeed | glassdoor | other` (`other` = Beta JSON-LD sites). Unknown keys are dropped.
+- `widget_position`: `inline | top-right | top-left | bottom-right | bottom-left`.
+- `default_save_status`: `draft | ready | applied`.
+- `default_resume_id`: a `ParsedResumeData.id` owned by the user; `null` = latest resume. An archived pinned resume reads back as `null`.
+- `default_resume_label`: resume actually used (pinned or latest); `null` if the user has none.
+
+### `PUT /extension/settings` *(new)*
+Partial update — any subset of the fields above. Extra field `clear_default_resume: true` resets to "latest".
+Lists are trimmed, de-duplicated (case-insensitive), capped at 30 items × 60 chars.
+`404` if `default_resume_id` is not the user's. `422` on invalid enum values. Returns the full settings object.
+
+### `POST /extension/jobs/score-preview`
+Body `{title, company, location, description, source_url, source_site}`. Stores nothing (marks the extension seen).
+Response (existing fields unchanged) plus, new:
+| Field | Meaning |
+|---|---|
+| `fit_source` | `resume_quick` (FitScorer on the chosen resume's skills + profile experience/education, JD skills from the regex extractor — no LLM) or `neutral` (fit = 50: no resume, or `quick_fit` off) |
+| `fit_breakdown` | 8-signal breakdown when `resume_quick`, else `{}` |
+| `resume_id`, `resume_label` | Resume the preview used |
+| `matched_skills`, `missing_skills` | JD skills present / absent on the resume (word-boundary match, so `JavaScript` ≠ `java`) |
+| `must_have_found`, `must_have_missing` | User's must-have keywords found / not found in the JD |
+| `excluded_company` | Company matches the user's excluded list |
+| `already_saved_application_id` | Existing application with the same `jd_link` (trailing slash ignored) when `warn_duplicates` is on |
+
+### `POST /extension/jobs/save`
+Body `{title, company, location, description, source_url, source_site, priority_score, score_confidence}` →
+`{success, application_id, open_url}`. Now also applies settings: status = `default_save_status`, and
+`selected_resume_id` = `default_resume_id` when one is pinned (otherwise `null` = latest, unchanged behaviour).
+
+### `POST /extension/events` · `POST /extension/promo/dismiss`
+Unchanged.
+
 ## Common Error Responses
 
 - `400` Bad Request (validation/business rule)
