@@ -361,30 +361,48 @@ class CompetitionScorer:
     _YOE_RE = re.compile(r'(\d+)\+?\s*(?:to\s*\d+\s*)?years?', re.IGNORECASE)
 
     @classmethod
-    def score(cls, jd_text: str, company_name: str = "") -> float:
-        text    = jd_text.lower()
-        company = company_name.lower()
-        base    = 40.0
+    def breakdown(cls, jd_text: str, company_name: str = "") -> list[dict]:
+        """
+        The signals behind score(), in order: base, then each adjustment that
+        fired, with the JD evidence for it. A final 'clamp' row appears only
+        when the total had to be pulled into 0–100. Sum of deltas == score().
+        """
+        text = (jd_text or "").lower()
+        company = (company_name or "").lower()
+        rows: list[dict] = [{"signal": "base", "delta": 40.0, "evidence": None}]
 
-        for level, delta in sorted(
-            cls._SENIORITY.items(), key=lambda x: -len(x[0])
-        ):
+        for level, delta in sorted(cls._SENIORITY.items(), key=lambda x: -len(x[0])):
             if level in text:
-                base += delta
+                rows.append({"signal": "seniority", "delta": float(delta), "evidence": f"\"{level}\" in the posting"})
                 break
 
         yoe_match = cls._YOE_RE.search(text)
         if yoe_match:
-            years  = int(yoe_match.group(1))
-            base  += min(years * 3.0, 25.0)
+            years = int(yoe_match.group(1))
+            rows.append({
+                "signal": "required_yoe",
+                "delta": min(years * 3.0, 25.0),
+                "evidence": f"{years}+ years asked",
+            })
 
-        if any(sig in company for sig in cls._BIG_COMPANIES):
-            base += 20.0
+        big = next((sig for sig in cls._BIG_COMPANIES if sig in company), None)
+        if big:
+            rows.append({"signal": "big_name_employer", "delta": 20.0, "evidence": company_name})
 
-        if any(sig in text for sig in cls._URGENCY):
-            base -= 10.0
+        urgency = next((sig for sig in cls._URGENCY if sig in text), None)
+        if urgency:
+            rows.append({"signal": "urgency_markers", "delta": -10.0, "evidence": f"\"{urgency}\""})
 
-        return round(max(0.0, min(base, 100.0)), 1)
+        total = sum(r["delta"] for r in rows)
+        clamped = max(0.0, min(total, 100.0))
+        if clamped != total:
+            rows.append({"signal": "clamp", "delta": round(clamped - total, 1), "evidence": "kept within 0–100"})
+        return rows
+
+    @classmethod
+    def score(cls, jd_text: str, company_name: str = "") -> float:
+        total = sum(r["delta"] for r in cls.breakdown(jd_text, company_name))
+        return round(max(0.0, min(total, 100.0)), 1)
 
 
 # ── Priority Scorer (composer) ────────────────────────────────────────────────

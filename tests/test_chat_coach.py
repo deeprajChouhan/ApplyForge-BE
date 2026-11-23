@@ -97,7 +97,7 @@ def test_prompt_contains_jd_analysis_and_evidence(client, rag_calls, prompts):
     assert "Never invent" in system
     assert JD in user
     assert "Kubernetes in production" in user  # unsupported gap carried into the prompt
-    assert "[E1] Built payments services" in user
+    assert "[E1] (Resume · excerpt 1)\nBuilt payments services" in user
     assert "Question: Am I a fit?" in user
 
 

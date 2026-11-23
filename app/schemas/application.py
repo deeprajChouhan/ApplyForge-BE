@@ -116,6 +116,8 @@ class ScoreResponse(BaseModel):
     fit_score: float
     competition_score: float
     fit_breakdown: dict[str, float] = {}
+    # [{signal, delta, evidence}] behind competition_score; sums to it. Empty on preview routes.
+    competition_breakdown: list[dict] = []
     recommendation: str
     label: str
     # Enriched preview fields (populated by /utils/score-preview)

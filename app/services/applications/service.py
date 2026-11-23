@@ -523,6 +523,7 @@ class ApplicationService:
         )
         comp     = CompetitionScorer.score(app.job_description, app.company_name)
         composed = PriorityScorer.compose(fit, comp, fit_breakdown)
+        composed["competition_breakdown"] = CompetitionScorer.breakdown(app.job_description, app.company_name)
 
         app.fit_score         = composed["fit_score"]
         app.competition_score = composed["competition_score"]
