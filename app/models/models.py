@@ -215,6 +215,8 @@ class JobApplication(Base, TimestampMixin):
     resume_template_id: Mapped[int | None] = mapped_column(
         ForeignKey("resume_templates.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    # Free-text notes the user keeps on this application (migration 0042).
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class GeneratedDocument(Base, TimestampMixin):
@@ -234,18 +236,35 @@ class GeneratedDocument(Base, TimestampMixin):
 
 
 class ApplicationChat(Base, TimestampMixin):
+    """A Coach chat thread. An application can have several (migration 0043)."""
     __tablename__ = "application_chats"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
-    application_id: Mapped[int] = mapped_column(ForeignKey("job_applications.id", ondelete="CASCADE"), unique=True)
+    application_id: Mapped[int] = mapped_column(ForeignKey("job_applications.id", ondelete="CASCADE"), index=True)
+    title: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    last_message_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    __table_args__ = (Index("ix_application_chats_user_app_last", "user_id", "application_id", "last_message_at"),)
 
 
 class ApplicationChatMessage(Base, TimestampMixin):
     __tablename__ = "application_chat_messages"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     chat_id: Mapped[int] = mapped_column(ForeignKey("application_chats.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     sender_role: Mapped[str] = mapped_column(String(20))
     content: Mapped[str] = mapped_column(Text)
+    # streaming | complete | stopped | error
+    status: Mapped[str] = mapped_column(String(12), default="complete", server_default="complete")
+    citations_json: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    proposed_edit_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    context_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    applied_document_id: Mapped[int | None] = mapped_column(
+        ForeignKey("generated_documents.id", ondelete="SET NULL"), nullable=True
+    )
+    tokens_in: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    tokens_out: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    model: Mapped[str | None] = mapped_column(String(60), nullable=True)
 
 
 class ApplicationStatusHistory(Base, TimestampMixin):

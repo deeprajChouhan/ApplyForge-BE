@@ -119,14 +119,24 @@ def score_preview(
     confidence = score_confidence(payload.description, payload.source_site)
     opportunity = round(100 - competition, 2)
 
-    # Mark the extension as active/connected on real usage.
-    svc.mark_seen(connect=True)
-    ProductEventService(db).track(
-        "extension_job_scored",
-        user_id=user.id,
-        properties={"source_site": payload.source_site, "confidence": confidence},
-        request=request,
-    )
+    if payload.source == "web":
+        # The web app's New application sheet reuses this preview. It is not
+        # extension activity: don't mark the extension seen or connected.
+        ProductEventService(db).track(
+            "web_job_scored",
+            user_id=user.id,
+            properties={"confidence": confidence},
+            request=request,
+        )
+    else:
+        # Mark the extension as active/connected on real usage.
+        svc.mark_seen(connect=True)
+        ProductEventService(db).track(
+            "extension_job_scored",
+            user_id=user.id,
+            properties={"source_site": payload.source_site, "confidence": confidence},
+            request=request,
+        )
 
     return ExtensionScorePreviewOut(
         priority_score=composed["priority_score"],

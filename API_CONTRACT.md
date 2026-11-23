@@ -340,11 +340,20 @@ Request (partial):
 {
   "company_name": "NewCo",
   "role_title": "Principal Engineer",
-  "job_description": "updated jd"
+  "job_description": "updated jd",
+  "jd_link": "https://…",
+  "notes": "Recruiter: Sam. Call Thursday."
 }
 ```
 
+`notes` *(new 2026-11-23)*: free text, max 20 000 characters (`422` above that). Omitted or `null`
+leaves it unchanged; `""` clears it. Every field is optional; only the ones sent are changed.
+
 Response: `ApplicationOut`.
+
+`ApplicationOut` *(2026-11-23)* now also returns `notes: string | null` and `updated_at: datetime`.
+It does **not** return `date_applied` or `status_changed_at`; status changes live in
+`application_status_history`, which no endpoint exposes yet.
 
 ### `POST /applications/{app_id}/status`
 Protected.
@@ -469,6 +478,14 @@ Coverage is weighted (required 3, keyword 2, preferred 1) and counts only **exac
 (word-boundary, hyphen/space and plural tolerant) — what a literal ATS keyword filter sees.
 `is_stale` is true when the selected resume, the JD text, or the applied suggestions changed after tailoring.
 
+### `PATCH /applications/{app_id}/documents/{doc_type}` *(documented 2026-11-23; live before that)*
+Protected (feature `applications`). Saves a manual edit to the current document **in place**: no version
+bump, so it overwrites the highest non-deleted version. (Chat's `apply-edit` creates a new version instead.)
+
+Request: `{ "content": "…" }` → Response: `GeneratedDocumentOut`.
+
+Errors: `400` unknown `doc_type` · `404` application not owned, or no document of that type generated yet.
+
 ### `POST /applications/{app_id}/export/cover-letter`
 Protected (feature `applications`). Exports the newest non-deleted `cover_letter` document.
 
@@ -493,45 +510,128 @@ Errors: `400` bad `export_format` · `404` app not owned / no cover letter gener
 
 ---
 
-## CHAT
+## CHAT — Coach *(2026-11-23)*
 
-### `POST /chat/{application_id}/messages`
-Protected.
+All endpoints are protected, require feature `chat`, and filter by `user_id`. An application, thread or
+message that isn't the caller's returns `404`. Each application can have several threads.
 
-Request:
-```json
+Every reply is grounded: evidence is numbered `[E1]..[En]` across resume chunks (retrieval scoped to the
+application's `selected_resume_id`, falling back to all the user's chunks, the same as `/generate`), the JD
+and the current written documents. Only `[En]` markers that map to real evidence are kept, as citations;
+unverifiable ones are removed from the text. Every AI call is budget-checked first and recorded after
+(`UsageTracker`, feature `chat`).
+
+**Budget:** when the monthly token budget would be exceeded, the send endpoints return the standard
+`429` body (`{"error": "token_budget_exceeded", "used", "budget", "message"}`) **before** anything is stored or
+streamed. The streaming endpoint never opens a stream in that case.
+
+### Schemas
+
+```jsonc
+// ChatMessageOut
 {
-  "content": "How should I prepare for this role?"
+  "id": 412, "thread_id": 31, "sender_role": "user" | "assistant",
+  "status": "streaming" | "complete" | "stopped" | "error",
+  "content": "Lead with the Ledgerly payments work [E1]…",
+  "citations": [Citation],
+  "proposed_edit": ProposedEdit | null,
+  "applied_document_id": null,
+  "context": { "intent": "qa" | "score" | "edit", "score"?: ScoreTable, "doc_type"?: "cover_letter" } | null,
+  "usage": { "tokens_in": 980, "tokens_out": 240 } | null,
+  "created_at": "…"
 }
+
+// Citation: quote is always a verbatim slice of its source
+{ "id": "c1", "source": "resume" | "jd" | "document" | "score", "label": "Resume · excerpt 1",
+  "quote": "Built payment services…", "chunk_id": 5531 | null,
+  "doc_type": "cover_letter" | null, "doc_version": 2 | null, "char_start": 0, "char_end": 92 }
+
+// ProposedEdit (written documents only: cover_letter, cold_email, cold_message)
+{ "doc_type": "cover_letter", "base_document_id": 88, "base_version": 2,
+  "new_content": "…full text…",
+  "diff": [ { "op": "keep" | "del" | "add", "text": "one sentence" } ],
+  "word_count": { "before": 142, "after": 98 },
+  "unsupported_claims": [ { "claim", "claim_type", "reason", "confidence", "context" } ],  // HallucinationChecker ≥ 0.6
+  "reverted_numbers": ["300%"] }   // sentences with numbers not in the resume, current doc or JD were removed
+
+// ScoreTable (context.score, intent "score"): numbers come from the scorer, the LLM only phrases them
+{ "priority_score", "fit_score", "competition_score", "fit_breakdown": {…}, "competition_breakdown": [CompetitionRow] }
+
+// ChatThreadOut
+{ "id": 31, "application_id": 12, "title": "Shorten the cover letter", "last_message_at": "…" | null,
+  "message_count": 6, "created_at": "…" }
+
+// ChatContextOut: drives the "Knows" chips
+{ "resume": { "id": 7, "label": "backend.pdf · 21 Nov 2026", "parse_confidence": 0.92 } | null,
+  "jd": { "present": true, "analysed": true },
+  "documents": [ { "doc_type": "resume", "version": 3 }, { "doc_type": "cover_letter", "version": 2 } ],
+  "priority_score": 78.0 | null }
 ```
 
-Response 200:
-```json
-{
-  "ok": true
-}
+### Endpoints
+
+| Method | Path | Body | Response |
+|---|---|---|---|
+| `GET` | `/chat/{application_id}/context` | — | `ChatContextOut` |
+| `GET` | `/chat/{application_id}/threads` | — | `ChatThreadOut[]`, newest activity first, archived excluded |
+| `POST` | `/chat/{application_id}/threads` | `{ "title"?: str ≤120 }` | `201 ChatThreadOut` |
+| `PATCH` | `/chat/threads/{thread_id}` | `{ "title"?: str ≤120, "archived"?: bool }` | `ChatThreadOut` |
+| `GET` | `/chat/threads/{thread_id}/messages` | — | `ChatMessageOut[]`, oldest first |
+| `POST` | `/chat/threads/{thread_id}/messages` | `{ "content": str 1–4000 }` | `text/event-stream`, below |
+| `POST` | `/chat/messages/{message_id}/stop` | — | `ChatMessageOut` (`status: "stopped"` if it was streaming) |
+| `POST` | `/chat/messages/{message_id}/apply-edit` | `{ "base_version": int ≥1 }` | `GeneratedDocumentOut`, a **new version** |
+
+Threads are auto-titled from their first user message (≤60 chars, no LLM) unless a title was given.
+
+**Intent routing** (keywords/regex, no LLM call):
+- `edit`: a written-document mention (cover letter, cold email, LinkedIn note) plus a rewrite verb
+  (shorten, rewrite, tighten, make it more direct, …) and that document exists. The reply is a short
+  summary plus `proposed_edit`. Resume edit requests are answered as `qa` (resume changes go through
+  tailoring and Suggestions). Asking to edit a document that doesn't exist yet is answered as `qa`.
+- `score`: mentions of score, priority, fit, competition or reply likelihood, when the JD is analysed.
+  `context.score` carries the scorer's table; a `score` citation is always attached.
+- `qa`: everything else.
+
+**`apply-edit`:** creates `GeneratedDocument` with `version = current + 1`, same doc type, same
+`resume_template_id`; earlier versions are kept. The claims are re-checked at apply time.
+Errors:
+- `404` message not owned, or it has no `proposed_edit`
+- `409 {"error": "already_applied", "document_id": N}`
+- `409 {"error": "stale_base", "current_version": N}`: the document moved on since the proposal
+- `422 {"error": "unsupported_claims", "flags": […]}`: the re-check still flags claims
+
+### Stream events (`POST /chat/threads/{thread_id}/messages`)
+
+Each event is `event: <name>` + `data: <json>`. Headers: `Cache-Control: no-cache`, `X-Accel-Buffering: no`.
+
+```
+event: message.created   data: {"user_message": ChatMessageOut, "assistant_message_id": 412}
+event: status            data: {"phase": "generating" | "checking"}
+event: delta             data: {"text": "…"}           // qa/score: streamed text; edit: the summary, once
+event: citation          data: Citation                // after the text, validated
+event: proposed_edit     data: ProposedEdit            // edit intent only
+event: done              data: {"message": ChatMessageOut}   // status "complete" or "stopped"
+event: error             data: {"error": "provider_unavailable" | "internal", "message": str}
 ```
 
-### `GET /chat/{application_id}/messages`
-Protected.
+- The user message is stored and announced in `message.created` before any text; clients append it only
+  then (non-optimistic).
+- `done.message.content` is the cleaned text (unverifiable `[En]` markers removed): clients should
+  replace the streamed text with it.
+- **Stop:** `POST /chat/messages/{id}/stop` marks a streaming message `stopped`. The stream checks between
+  chunks, keeps the partial text and ends with `done` (`status: "stopped"`). If the client disconnects,
+  the partial reply is saved as `stopped` the same way. Tokens actually spent are always recorded.
+- The provider is never retried mid-stream (that would duplicate text and double-charge tokens).
+- Usage: real `prompt_tokens`/`completion_tokens` from the provider when it reports them
+  (`stream_options.include_usage`), otherwise estimated. Recorded as endpoint `chat.stream`.
 
-Response 200:
-```json
-[
-  {
-    "id": 1,
-    "sender_role": "user",
-    "content": "...",
-    "created_at": "2026-04-22T00:00:00"
-  },
-  {
-    "id": 2,
-    "sender_role": "assistant",
-    "content": "...",
-    "created_at": "2026-04-22T00:00:00"
-  }
-]
-```
+### Legacy (deprecated): kept until the old drawer and the extension move to threads
+
+- `POST /chat/{application_id}/messages` `{ "content" }` → `{"ok": true}`. Writes to the application's most
+  recent thread, creating one if needed. Not streamed. Same grounding, budget and usage rules
+  (endpoint `chat.send`).
+- `GET /chat/{application_id}/messages` → `ChatMessageOut[]` of the most recent thread (`[]` if none). The old
+  fields (`id`, `sender_role`, `content`, `created_at`) are unchanged; the rest are additions.
 
 ---
 
@@ -718,8 +818,30 @@ Partial update — any subset of the fields above. Extra field `clear_default_re
 Lists are trimmed, de-duplicated (case-insensitive), capped at 30 items × 60 chars.
 `404` if `default_resume_id` is not the user's. `422` on invalid enum values. Returns the full settings object.
 
+### Score responses: `competition_breakdown` *(2026-11-23)*
+`ScoreResponse` (returned by `POST /applications/{app_id}/score`) gains `competition_breakdown`, the signals
+behind `competition_score`. The deltas sum to it, so the inspector and the Coach show the same numbers:
+```json
+"competition_breakdown": [
+  {"signal": "base", "delta": 40.0, "evidence": null},
+  {"signal": "seniority", "delta": 15.0, "evidence": "\"senior\" in the posting"},
+  {"signal": "required_yoe", "delta": 15.0, "evidence": "5+ years asked"},
+  {"signal": "big_name_employer", "delta": 20.0, "evidence": "Google"},
+  {"signal": "urgency_markers", "delta": -10.0, "evidence": "\"immediate start\""},
+  {"signal": "clamp", "delta": -5.0, "evidence": "kept within 0–100"}
+]
+```
+Only signals that fired are listed; `clamp` appears only when the total had to be pulled into 0–100.
+`[]` on the preview routes (`/utils/score-preview`, `/extension/jobs/score-preview`).
+
 ### `POST /extension/jobs/score-preview`
-Body `{title, company, location, description, source_url, source_site}`. Stores nothing (marks the extension seen).
+Body `{title, company, location, description, source_url, source_site, source?}`. Stores nothing.
+
+`source` *(new 2026-11-23)*: `"extension"` (default) or `"web"`. Any other value → `422`.
+- `extension`: marks the extension seen and connected, and logs `extension_job_scored`. Unchanged.
+- `web`: the consumer web app's New application sheet. Does **not** touch the extension state
+  (`connected_at` / `last_seen_at` stay as they were) and logs `web_job_scored` instead.
+  The response is identical.
 Response (existing fields unchanged) plus, new:
 | Field | Meaning |
 |---|---|

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 import hashlib
 import time
+from typing import Iterator
 
 import structlog
 from openai import (
@@ -24,10 +26,21 @@ from app.services.ai.exceptions import (
 logger = structlog.get_logger(__name__)
 
 
+@dataclass
+class StreamChunk:
+    """One piece of a streamed reply. `usage` arrives once, on the last chunk, when the provider reports it."""
+    text: str = ""
+    usage: dict[str, int] | None = field(default=None)  # {"in": prompt_tokens, "out": completion_tokens}
+
+
 class LLMProvider(ABC):
     @abstractmethod
     def generate(self, system_prompt: str, user_prompt: str) -> str:
         raise NotImplementedError
+
+    def stream(self, system_prompt: str, user_prompt: str) -> Iterator[StreamChunk]:
+        """Stream a reply. Default: one chunk from generate(), no usage (callers estimate)."""
+        yield StreamChunk(text=self.generate(system_prompt, user_prompt))
 
 
 class EmbeddingProvider(ABC):
@@ -39,6 +52,13 @@ class EmbeddingProvider(ABC):
 class MockLLMProvider(LLMProvider):
     def generate(self, system_prompt: str, user_prompt: str) -> str:
         return f"[MOCK_GENERATION]\n{user_prompt[:1000]}"
+
+    def stream(self, system_prompt: str, user_prompt: str) -> Iterator[StreamChunk]:
+        text = self.generate(system_prompt, user_prompt)
+        step = 24
+        for i in range(0, len(text), step):
+            yield StreamChunk(text=text[i : i + step])
+        yield StreamChunk(usage={"in": max(1, len(user_prompt) // 4), "out": max(1, len(text) // 4)})
 
 
 class MockEmbeddingProvider(EmbeddingProvider):
@@ -80,6 +100,43 @@ class OpenAILLMProvider(LLMProvider):
             return content
 
         return self._run_with_retries("chat.completions", _request)
+
+    def stream(self, system_prompt: str, user_prompt: str) -> Iterator[StreamChunk]:
+        """
+        Streamed chat completion. Only opening the stream is retried; once text
+        has been sent to the user a failure is raised, never silently replayed
+        (a replay would duplicate output and double-charge tokens).
+        Wire-compatible with Azure OpenAI (stream_options.include_usage).
+        """
+        def _open():
+            return self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                stream=True,
+                stream_options={"include_usage": True},
+            )
+
+        response = self._run_with_retries("chat.completions.stream", _open)
+        try:
+            for event in response:
+                choices = getattr(event, "choices", None) or []
+                if choices:
+                    delta = getattr(choices[0], "delta", None)
+                    text = getattr(delta, "content", None) if delta is not None else None
+                    if text:
+                        yield StreamChunk(text=text)
+                usage = getattr(event, "usage", None)
+                if usage is not None:
+                    yield StreamChunk(usage={"in": usage.prompt_tokens or 0, "out": usage.completion_tokens or 0})
+        except (APITimeoutError, APIConnectionError, RateLimitError, APIError) as exc:
+            raise AIProviderTransientError("OpenAI stream interrupted") from exc
+        finally:
+            close = getattr(response, "close", None)
+            if callable(close):
+                close()
 
     def _run_with_retries(self, operation: str, func):
         last_error: Exception | None = None

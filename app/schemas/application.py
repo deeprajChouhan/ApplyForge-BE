@@ -1,5 +1,5 @@
 from datetime import datetime
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from app.models.enums import ApplicationStatus, DocumentType
 
 
@@ -23,6 +23,8 @@ class ApplicationUpdate(BaseModel):
     role_title: str | None = None
     job_description: str | None = None
     jd_link: str | None = None
+    # Send "" to clear. Omitted / null leaves the notes unchanged.
+    notes: str | None = Field(default=None, max_length=20000)
 
 
 class ApplicationOut(BaseModel):
@@ -49,7 +51,9 @@ class ApplicationOut(BaseModel):
     # because manually-created applications may not have them).
     location: str | None = None
     work_type: str | None = None
+    notes: str | None = None
     created_at: datetime
+    updated_at: datetime | None = None
 
     model_config = {"from_attributes": True}
 
@@ -112,6 +116,8 @@ class ScoreResponse(BaseModel):
     fit_score: float
     competition_score: float
     fit_breakdown: dict[str, float] = {}
+    # [{signal, delta, evidence}] behind competition_score; sums to it. Empty on preview routes.
+    competition_breakdown: list[dict] = []
     recommendation: str
     label: str
     # Enriched preview fields (populated by /utils/score-preview)

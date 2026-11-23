@@ -22,6 +22,9 @@ class ScorePreviewIn(BaseModel):
     description: str = ""
     source_url: str = ""
     source_site: str = ""
+    # Who is asking. "web" is the consumer web app's New application sheet:
+    # it must not mark the extension connected or count as extension usage.
+    source: Literal["extension", "web"] = "extension"
 
 
 class ScorePreviewMeta(BaseModel):

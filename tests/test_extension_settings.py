@@ -1,7 +1,7 @@
 """Job Hunting → Extension settings and the settings-aware score-preview / save."""
 import json
 
-from app.models.models import JobApplication, ParsedResumeData, User
+from app.models.models import JobApplication, ParsedResumeData, ProductEvent, User
 from tests.conftest import TestingSessionLocal, auth_headers
 
 API = "/api/v1/extension"
@@ -135,3 +135,40 @@ def test_no_resume_stays_neutral(client):
     body = res.json()
     assert body["fit_source"] == "neutral"
     assert body["fit_score"] == 50.0
+
+
+def test_web_preview_is_not_extension_activity(client):
+    """The web app's New application sheet must not mark the extension connected."""
+    h = auth_headers(client, email="web@example.com")
+    _add_resume("web@example.com", ["Python", "FastAPI"])
+    res = client.post(
+        f"{API}/jobs/score-preview",
+        headers=h,
+        json={"title": "Backend Engineer", "company": "X", "description": JD, "source": "web"},
+    )
+    assert res.status_code == 200, res.text
+    assert res.json()["fit_source"] == "resume_quick"
+
+    status = client.get(f"{API}/status", headers=h).json()
+    assert status["connected"] is False
+    assert status["last_seen_at"] is None
+
+    db = TestingSessionLocal()
+    try:
+        names = [e.event_name for e in db.query(ProductEvent).all()]
+    finally:
+        db.close()
+    assert "web_job_scored" in names
+    assert "extension_job_scored" not in names
+
+
+def test_extension_preview_still_marks_connected(client):
+    h = auth_headers(client, email="ext@example.com")
+    client.post(f"{API}/jobs/score-preview", headers=h, json={"title": "Engineer", "company": "X", "description": JD})
+    assert client.get(f"{API}/status", headers=h).json()["connected"] is True
+
+
+def test_preview_rejects_unknown_source(client):
+    h = auth_headers(client, email="bad@example.com")
+    res = client.post(f"{API}/jobs/score-preview", headers=h, json={"title": "E", "company": "X", "source": "mobile"})
+    assert res.status_code == 422

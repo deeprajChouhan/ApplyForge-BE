@@ -287,6 +287,31 @@ class TracedLLMProvider:
                     error=error_msg,
                 )
 
+    def stream(self, system_prompt: str, user_prompt: str):
+        """Stream with LangSmith tracing: one run, ended with the joined output."""
+        run_id: Optional[str] = None
+        if self._client is not None:
+            run_id = _create_run(
+                self._client,
+                name=f"{self._run_name}_stream",
+                inputs={"system_prompt": system_prompt[:500], "user_prompt": user_prompt[:500]},
+                tags=list(self._tags),
+                metadata={},
+            )
+        parts: list[str] = []
+        error_msg: Optional[str] = None
+        try:
+            for chunk in self._provider.stream(system_prompt, user_prompt):
+                if getattr(chunk, "text", ""):
+                    parts.append(chunk.text)
+                yield chunk
+        except Exception as exc:
+            error_msg = str(exc)
+            raise
+        finally:
+            if self._client is not None and run_id is not None:
+                _end_run(self._client, run_id, outputs={"output": "".join(parts)[:500]}, error=error_msg)
+
     # Proxy any other attributes to the underlying provider
     def __getattr__(self, name: str) -> Any:
         return getattr(self._provider, name)
