@@ -215,6 +215,8 @@ class JobApplication(Base, TimestampMixin):
     resume_template_id: Mapped[int | None] = mapped_column(
         ForeignKey("resume_templates.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    # Free-text notes the user keeps on this application (migration 0042).
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class GeneratedDocument(Base, TimestampMixin):

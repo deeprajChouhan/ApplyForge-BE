@@ -340,11 +340,20 @@ Request (partial):
 {
   "company_name": "NewCo",
   "role_title": "Principal Engineer",
-  "job_description": "updated jd"
+  "job_description": "updated jd",
+  "jd_link": "https://…",
+  "notes": "Recruiter: Sam. Call Thursday."
 }
 ```
 
+`notes` *(new 2026-11-23)*: free text, max 20 000 characters (`422` above that). Omitted or `null`
+leaves it unchanged; `""` clears it. Every field is optional; only the ones sent are changed.
+
 Response: `ApplicationOut`.
+
+`ApplicationOut` *(2026-11-23)* now also returns `notes: string | null` and `updated_at: datetime`.
+It does **not** return `date_applied` or `status_changed_at`; status changes live in
+`application_status_history`, which no endpoint exposes yet.
 
 ### `POST /applications/{app_id}/status`
 Protected.
