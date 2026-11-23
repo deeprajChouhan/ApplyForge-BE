@@ -719,7 +719,13 @@ Lists are trimmed, de-duplicated (case-insensitive), capped at 30 items × 60 ch
 `404` if `default_resume_id` is not the user's. `422` on invalid enum values. Returns the full settings object.
 
 ### `POST /extension/jobs/score-preview`
-Body `{title, company, location, description, source_url, source_site}`. Stores nothing (marks the extension seen).
+Body `{title, company, location, description, source_url, source_site, source?}`. Stores nothing.
+
+`source` *(new 2026-11-23)*: `"extension"` (default) or `"web"`. Any other value → `422`.
+- `extension`: marks the extension seen and connected, and logs `extension_job_scored`. Unchanged.
+- `web`: the consumer web app's New application sheet. Does **not** touch the extension state
+  (`connected_at` / `last_seen_at` stay as they were) and logs `web_job_scored` instead.
+  The response is identical.
 Response (existing fields unchanged) plus, new:
 | Field | Meaning |
 |---|---|
