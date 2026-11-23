@@ -317,6 +317,35 @@ class ApplicationCustomization(Base, TimestampMixin):
     customizations_json: Mapped[str] = mapped_column(Text, default="{}")
 
 
+class ApplicationTailoring(Base, TimestampMixin):
+    """
+    Evidence-mapped, verified ATS tailoring of the resume for one application.
+
+    tailored_json — overlay applied on top of the source resume by the preview
+                    and the PDF/DOCX exporter: {headline, summary, skills[],
+                    experiences[{ref, role, company, description}],
+                    projects[{ref, name, description}]}
+    report_json   — keyword map: per-term status/evidence/placement, coverage
+                    before/after, gaps the pipeline refused to fake, warnings.
+    enabled       — False = show the original resume without deleting the work.
+    """
+    __tablename__ = "application_tailorings"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    application_id: Mapped[int] = mapped_column(
+        ForeignKey("job_applications.id", ondelete="CASCADE"), unique=True, index=True
+    )
+    source_resume_id: Mapped[int | None] = mapped_column(
+        ForeignKey("parsed_resume_data.id", ondelete="SET NULL"), nullable=True
+    )
+    generated_document_id: Mapped[int | None] = mapped_column(
+        ForeignKey("generated_documents.id", ondelete="SET NULL"), nullable=True
+    )
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    tailored_json: Mapped[str] = mapped_column(Text, default="{}")
+    report_json: Mapped[str] = mapped_column(Text, default="{}")
+
+
 # LinkedIn Connections (Phase 2 -- LinkedIn CSV ingestion)
 
 class LinkedInConnection(Base, TimestampMixin):

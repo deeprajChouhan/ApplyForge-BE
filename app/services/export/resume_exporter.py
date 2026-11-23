@@ -37,6 +37,7 @@ from sqlalchemy.orm import Session
 
 from app.models.models import (
     ApplicationCustomization,
+    ApplicationTailoring,
     Certification,
     Education,
     JobApplication,
@@ -325,6 +326,50 @@ class _ResumeData:
                 seen.add(k)
                 certs.append(c)
         self.certifications = certs
+
+        # Evidence-mapped ATS tailoring (application_tailorings) — applied last so
+        # the export matches the preview exactly. Skipped when switched off.
+        if app is not None:
+            self._apply_tailoring(db, user_id, app.id)
+
+    def _apply_tailoring(self, db: Session, user_id: int, app_id: int) -> None:
+        row = (
+            db.query(ApplicationTailoring)
+            .filter_by(user_id=user_id, application_id=app_id)
+            .first()
+        )
+        if row is None or not row.enabled:
+            return
+        try:
+            t = json.loads(row.tailored_json or "{}")
+        except (json.JSONDecodeError, TypeError):
+            return
+        if not isinstance(t, dict):
+            return
+        if t.get("headline"):
+            self.headline = str(t["headline"])
+        if t.get("summary"):
+            self.summary = str(t["summary"])
+        if isinstance(t.get("skills"), list) and t["skills"]:
+            levels = {_norm(s.get("name")): s.get("level") for s in self.skills}
+            self.skills = [{"name": str(n), "level": levels.get(_norm(n))} for n in t["skills"] if str(n).strip()]
+        by_rc = {
+            f"{_norm(e.get('role'))}::{_norm(e.get('company'))}": e
+            for e in t.get("experiences") or [] if isinstance(e, dict)
+        }
+        self.experiences = [
+            {**e, "description": by_rc[k]["description"]}
+            if (k := f"{_norm(e.get('role'))}::{_norm(e.get('company'))}") in by_rc and by_rc[k].get("description")
+            else e
+            for e in self.experiences
+        ]
+        by_name = {_norm(p.get("name")): p for p in t.get("projects") or [] if isinstance(p, dict)}
+        self.projects = [
+            {**p, "description": by_name[_norm(p.get("name"))]["description"]}
+            if _norm(p.get("name")) in by_name and by_name[_norm(p.get("name"))].get("description")
+            else p
+            for p in self.projects
+        ]
 
     def matches_jd(self, name: Any) -> bool:
         """Mirror of the frontend isKeywordMatch()."""

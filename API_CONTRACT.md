@@ -408,6 +408,89 @@ Response 200:
 ]
 ```
 
+**Resume generation (2026-11-23):** `doc_types` containing `"resume"` now runs the evidence-mapped
+tailoring pipeline below (same as `POST /applications/{app_id}/tailoring`) and returns its plain-text
+document; it falls back to the legacy single prompt only if the pipeline errors. Other doc types now use
+RAG scoped to the application's `selected_resume_id` plus the stored JD analysis (strengths to lead with,
+JD terms to use, gaps not to claim).
+
+### Resume tailoring — `/applications/{app_id}/tailoring` *(new 2026-11-23)*
+Protected (feature `jd_analyze`). One row per application in `application_tailorings` (user-scoped,
+`ON DELETE CASCADE`). The source resume, profile and accepted suggestions are never mutated — the
+tailored resume is an **overlay** applied by the preview and by the PDF/DOCX exporter.
+
+Pipeline: JD analysis (auto-run if missing) → **MAP** (LLM: atomic ATS terms in the JD's exact spelling +
+evidence refs into the resume) → **VALIDATE** (no LLM: every evidence quote must exist in the resume,
+alias table `aliases.py`; unverifiable → `absent`) → **WRITE** (LLM: headline/summary/skills/bullets per
+placement plan, XYZ rules) → **VERIFY** (no LLM: invented numbers revert to the original bullet, unsupported
+skills dropped, stuffing > 4 repeats, regex hallucination checker) → **REPAIR** (≤ 1 LLM pass, kept only if
+coverage does not drop). 2–3 LLM calls (+1 if the JD analysis had to run).
+
+| Method | Body | Response |
+|---|---|---|
+| `GET` | — | `TailoringOut` or `null` if never tailored |
+| `POST` | — | `TailoringOut` (runs the pipeline; also stores a new `resume` GeneratedDocument version). `422` if no resume/profile data |
+| `PATCH` | `{"enabled": bool}` | `TailoringOut` — switch between tailored and original resume |
+| `DELETE` | — | `204` |
+
+`TailoringOut`:
+```json
+{
+  "application_id": 12, "enabled": true, "source_resume_id": 7, "generated_document_id": 88,
+  "is_stale": false, "stale_reasons": [],
+  "tailored": {
+    "headline": "Backend Engineer | Python, AI agents, Postgres",
+    "summary": "...",
+    "skills": ["Python", "AI agents", "Postgres", "FastAPI", "PostgreSQL"],
+    "experiences": [{"ref": "E1", "role": "Backend Engineer", "company": "Acme", "description": "• ...\n• ..."}],
+    "projects": [{"ref": "P1", "name": "ApplyForge", "description": "• ..."}]
+  },
+  "report": {
+    "version": 1, "aliases_version": "2026-11-23.1", "target_title": "AI Engineer",
+    "plan_source": "llm | deterministic", "repair_pass": false, "llm_calls": 2, "rejected_evidence": 1,
+    "source": {"resume_id": 7, "parse_confidence": 0.91, "jd_hash": "..."},
+    "coverage": {
+      "before": {"weighted_pct": 41, "matched": 5, "total": 14, "required_matched": 2, "required_total": 6},
+      "after":  {"weighted_pct": 83, "matched": 11, "total": 14, "required_matched": 5, "required_total": 6}
+    },
+    "terms": [{"term": "Postgres", "importance": "required", "status": "explicit|implicit|adjacent|absent",
+               "found_before": false, "found_after": true, "count_after": 2,
+               "placed_in": ["Skills", "Backend Engineer @ Acme"],
+               "evidence": [{"ref": "E1.2", "label": "Backend Engineer @ Acme · bullet 2", "quote": "Designed PostgreSQL schemas"}],
+               "note": ""}],
+    "gaps": [{"term": "Kubernetes", "importance": "required", "note": "No evidence in your resume — not added. ..."}],
+    "warnings": [{"kind": "invented_number|unsupported_skill|missing_section|hallucination_check|generation_failed",
+                  "where": "Backend Engineer @ Acme", "detail": "..."}],
+    "hallucination_flags": [], "open_issues": [], "generated_at": "2026-11-23T07:00:00Z"
+  }
+}
+```
+Coverage is weighted (required 3, keyword 2, preferred 1) and counts only **exact** JD-term matches
+(word-boundary, hyphen/space and plural tolerant) — what a literal ATS keyword filter sees.
+`is_stale` is true when the selected resume, the JD text, or the applied suggestions changed after tailoring.
+
+### `POST /applications/{app_id}/export/cover-letter`
+Protected (feature `applications`). Exports the newest non-deleted `cover_letter` document.
+
+Request:
+```json
+{
+  "recipient_name": "Hiring Manager",
+  "recipient_title": null,
+  "company_address": null,
+  "export_format": "pdf"
+}
+```
+
+Response 200: binary body. `application/pdf` or
+`application/vnd.openxmlformats-officedocument.wordprocessingml.document`, with
+`Content-Disposition: attachment; filename="<Name>_<Company>_cover_letter.<ext>"`.
+The sender block (name, email, phone, location, LinkedIn) comes from parsed resume → profile.
+Known `[placeholder]` tokens in the body are substituted; unknown ones are left visible.
+Body text is otherwise unchanged (it is the grounded, hallucination-checked content).
+
+Errors: `400` bad `export_format` · `404` app not owned / no cover letter generated yet.
+
 ---
 
 ## CHAT

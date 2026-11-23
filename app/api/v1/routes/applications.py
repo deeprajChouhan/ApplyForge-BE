@@ -31,8 +31,12 @@ from app.schemas.profile import LinkedInConnectionOut
 from app.schemas.suggestions import ApplySuggestionRequest, CustomizationOut, SuggestionsResponse
 from app.services.linkedin.service import LinkedInService
 from app.services.applications.service import ApplicationService
+from app.services.resume_tailoring.service import ResumeTailoringService
+from app.schemas.tailoring import TailoringOut, TailoringToggleRequest
 from app.services.suggestions.service import SuggestionService
 from app.services.export.resume_exporter import ResumeExporter
+from app.services.export.cover_letter_exporter import CoverLetterExporter
+from app.schemas.application import CoverLetterExportRequest
 from app.services.templates import ResumeTemplateResolver, ResumeTemplateService
 from app.schemas.resume_templates import SetApplicationTemplateRequest
 
@@ -121,6 +125,33 @@ def generate(app_id: int, payload: GenerateRequest, user: User = Depends(get_cur
         status="completed",
         documents=[GeneratedDocumentOut.model_validate(doc) for doc in docs],
     )
+
+
+# ── Evidence-mapped ATS resume tailoring ────────────────────────────────────
+
+@router.get("/{app_id}/tailoring", response_model=TailoringOut | None, dependencies=[_need_jd])
+def get_tailoring(app_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Current tailoring (overlay + keyword/evidence report) or null if never tailored."""
+    return ResumeTailoringService(db, user.id).get(app_id)
+
+
+@router.post("/{app_id}/tailoring", response_model=TailoringOut, dependencies=[_need_jd])
+def run_tailoring(app_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Run the pipeline: JD analysis -> evidence map -> placement plan -> rewrite -> verify.
+    Also stores a new resume GeneratedDocument version (plain ATS text)."""
+    out, _doc = ResumeTailoringService(db, user.id).tailor(app_id)
+    return out
+
+
+@router.patch("/{app_id}/tailoring", response_model=TailoringOut, dependencies=[_need_jd])
+def toggle_tailoring(app_id: int, payload: TailoringToggleRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Switch between the tailored and the original resume without losing either."""
+    return ResumeTailoringService(db, user.id).set_enabled(app_id, payload.enabled)
+
+
+@router.delete("/{app_id}/tailoring", status_code=204, dependencies=[_need_jd])
+def delete_tailoring(app_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    ResumeTailoringService(db, user.id).delete(app_id)
 
 
 @router.patch(
@@ -285,6 +316,33 @@ def export_resume_docx(app_id: int, user: User = Depends(get_current_user), db: 
         content=docx_bytes,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.post("/{app_id}/export/cover-letter", dependencies=[_need_apps])
+def export_cover_letter(
+    app_id: int,
+    payload: CoverLetterExportRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Download the current cover letter as PDF or DOCX with sender + recipient blocks filled."""
+    from fastapi import HTTPException
+
+    fmt = (payload.export_format or "pdf").lower()
+    if fmt not in ("pdf", "docx"):
+        raise HTTPException(status_code=400, detail="export_format must be 'pdf' or 'docx'")
+    ApplicationService(db, user.id).get(app_id)  # ownership → 404
+    exporter = CoverLetterExporter(db, user, app_id, payload)
+    if fmt == "pdf":
+        content, media = exporter.as_pdf(), "application/pdf"
+    else:
+        content = exporter.as_docx()
+        media = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    return Response(
+        content=content,
+        media_type=media,
+        headers={"Content-Disposition": f'attachment; filename="{exporter.filename(fmt)}"'},
     )
 
 

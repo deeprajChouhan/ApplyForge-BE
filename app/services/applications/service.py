@@ -24,10 +24,10 @@ from app.services.usage.service import UsageTracker
 
 
 class ApplicationService:
-    def __init__(self, db: Session, user_id: int):
+    def __init__(self, db: Session, user_id: int, llm=None):
         self.db = db
         self.user_id = user_id
-        self.llm = get_llm_provider()
+        self.llm = llm or get_llm_provider()
 
     # ── CRUD ──────────────────────────────────────────────────────────────
 
@@ -180,7 +180,17 @@ class ApplicationService:
 
     # ── Profile builder ───────────────────────────────────────────────────
 
-    def _build_structured_profile(self) -> str:
+    def _rag_evidence(self, app: JobApplication, query: str, top_k: int) -> list[str]:
+        """RAG search scoped to the resume pinned to this application, falling back to all chunks."""
+        rag = RAGService(self.db, self.user_id)
+        hits = []
+        if app.selected_resume_id:
+            hits = rag.search(query, top_k=top_k, parsed_resume_id=app.selected_resume_id)
+        if not hits:
+            hits = rag.search(query, top_k=top_k)
+        return [c.content for c, _ in hits]
+
+    def _build_structured_profile(self, app: JobApplication | None = None) -> str:
         """
         Build structured profile block for LLM resume generation.
         Priority: DB profile tables > latest parsed resume structured_json (fallback).
@@ -196,14 +206,18 @@ class ApplicationService:
         projs   = self.db.query(Project).filter_by(user_id=self.user_id).all()
         certs   = self.db.query(Certification).filter_by(user_id=self.user_id).all()
 
-        # Parsed resume as fallback for any missing sections
-        parsed = (
+        # Parsed resume as fallback for any missing sections — the one pinned to
+        # this application when set, else the newest.
+        parsed_q = (
             self.db.query(ParsedResumeData)
             .filter_by(user_id=self.user_id)
             .filter(ParsedResumeData.deleted_at.is_(None))
-            .order_by(ParsedResumeData.created_at.desc())
-            .first()
         )
+        parsed = None
+        if app is not None and app.selected_resume_id:
+            parsed = parsed_q.filter(ParsedResumeData.id == app.selected_resume_id).first()
+        if parsed is None:
+            parsed = parsed_q.order_by(ParsedResumeData.created_at.desc()).first()
         rd: dict = {}
         if parsed:
             try:
@@ -333,8 +347,7 @@ class ApplicationService:
     # ── JD Analysis ───────────────────────────────────────────────────────
 
     def analyze_jd(self, app_id: int, jd: str) -> dict:
-        rag = RAGService(self.db, self.user_id)
-        evidence_chunks = [c.content for c, _ in rag.search(jd, top_k=6)]
+        evidence_chunks = self._rag_evidence(self.get(app_id), jd, top_k=6)
         evidence_text = "\n\n".join(evidence_chunks) if evidence_chunks else "No resume evidence available."
 
         system_prompt = (
@@ -520,18 +533,55 @@ class ApplicationService:
     # ── Document generation ───────────────────────────────────────────────
 
     def generate_docs(self, app_id: int, doc_types: List) -> List[GeneratedDocument]:
+        def _key(dt) -> str:
+            return dt.value if hasattr(dt, "value") else str(dt)
+
+        # The resume goes through the evidence-mapped tailoring pipeline
+        # (JD analysis -> evidence map -> placement plan -> rewrite -> verify).
+        # It falls back to the legacy single-prompt path only if the pipeline errors.
+        tailored_docs: dict[str, GeneratedDocument] = {}
+        if any(_key(dt) == "resume" for dt in doc_types):
+            from app.services.resume_tailoring.service import ResumeTailoringService
+            try:
+                _, doc = ResumeTailoringService(self.db, self.user_id, llm=self.llm).tailor(app_id)
+                tailored_docs["resume"] = doc
+            except HTTPException:
+                raise
+            except Exception as exc:  # pragma: no cover - defensive fallback
+                import structlog
+                structlog.get_logger(__name__).warning("resume_tailoring_fallback", app_id=app_id, error=str(exc)[:300])
+                self.db.rollback()
+        doc_types = [dt for dt in doc_types if _key(dt) not in tailored_docs]
+        if not doc_types:
+            return list(tailored_docs.values())
+
         # Phase 1: Fetch all needed data from DB quickly
         app = self.get(app_id)
         job_description = app.job_description
         application_id  = app.id
 
-        # RAG evidence for non-resume docs
-        rag = RAGService(self.db, self.user_id)
-        evidence = "\n\n".join(c.content for c, _ in rag.search(job_description, top_k=8))
+        # RAG evidence for non-resume docs — scoped to the resume pinned to this application
+        evidence = "\n\n".join(self._rag_evidence(app, job_description, top_k=8))
         evidence_block = evidence if evidence else "No profile evidence found. Use general best practices."
 
+        # JD analysis context so cover letters / outreach lead with verified strengths,
+        # use the JD's vocabulary, and never claim the unsupported gaps.
+        try:
+            _jda = json.loads(app.jd_analysis_json) if app.jd_analysis_json else {}
+        except (json.JSONDecodeError, TypeError):
+            _jda = {}
+        if _jda:
+            ctx = []
+            if _jda.get("strengths"):
+                ctx.append("Verified strengths to lead with: " + "; ".join(map(str, _jda["strengths"][:6])))
+            if _jda.get("suggested_keywords"):
+                ctx.append("Use these JD terms where the evidence supports them: " + ", ".join(map(str, _jda["suggested_keywords"][:12])))
+            if _jda.get("unsupported_gaps"):
+                ctx.append("Do NOT claim experience with: " + "; ".join(map(str, _jda["unsupported_gaps"][:8])))
+            evidence_block += "\n\n=== JD ANALYSIS (verified against the resume) ===\n" + "\n".join(ctx)
+
         # Full structured profile for the resume (real data, no placeholders)
-        structured_profile = self._build_structured_profile()
+        structured_profile = self._build_structured_profile(app)
 
         # Version counts
         prior_counts = {
@@ -642,7 +692,7 @@ class ApplicationService:
         self.db.commit()
         for row in out:
             self.db.refresh(row)
-        return out
+        return list(tailored_docs.values()) + out
 
     # ── One-click application package ─────────────────────────────────────
 
