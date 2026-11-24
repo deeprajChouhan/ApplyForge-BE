@@ -13,6 +13,8 @@ block FastAPI's async event loop.
 """
 from __future__ import annotations
 
+from app.models.enums import FeatureFlag
+from app.services.usage.metering import usage_scope
 import logging
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -45,7 +47,9 @@ def _run_all_crawlers() -> None:
             for cfg in enabled_configs:
                 try:
                     svc = CrawlerService(db, cfg.user_id)
-                    result = svc.run_crawl()
+                    # Attribute (and quota-check) the crawler's AI calls to this user.
+                    with usage_scope(cfg.user_id, "crawler.scheduled", FeatureFlag.job_crawler):
+                        result = svc.run_crawl()
                     logger.info(
                         "scheduler_crawl_user user_id=%d found=%d added=%d",
                         cfg.user_id, result["jobs_found"], result["jobs_added"],

@@ -79,7 +79,8 @@ def _stream_text(monkeypatch, pieces, usage=None, after_first=None, fail_after=N
         if usage:
             yield StreamChunk(usage=usage)
 
-    monkeypatch.setattr(provider, "stream", fake_stream)
+    # Patch the raw provider inside the usage meter so metering still runs.
+    monkeypatch.setattr(getattr(provider, "inner", provider), "stream", fake_stream)
 
 
 def _events(body: str):
@@ -160,7 +161,7 @@ def test_stream_qa_events_citations_and_usage(client, monkeypatch):
     db = TestingSessionLocal()
     try:
         e = db.query(UsageEvent).filter_by(user_id=user_id).one()
-        assert (e.endpoint, e.tokens_in, e.tokens_out) == ("chat.stream", 900, 40)
+        assert (e.endpoint, e.tokens_in, e.tokens_out) == ("POST /chat/threads/{id}/messages", 900, 40)
         assert all(m.user_id == user_id for m in db.query(ApplicationChatMessage).all())
     finally:
         db.close()
@@ -232,7 +233,8 @@ def test_score_answer_uses_scorer_numbers(client, monkeypatch):
         seen["prompt"] = user_prompt
         yield StreamChunk(text="It starts at 40 and moves with the posting's signals [E3].")
 
-    monkeypatch.setattr(provider, "stream", fake_stream)
+    # Patch the raw provider inside the usage meter so metering still runs.
+    monkeypatch.setattr(getattr(provider, "inner", provider), "stream", fake_stream)
     ev = _events(client.post(f"/api/v1/chat/threads/{tid}/messages", json={"content": "Why is my competition score high?"}, headers=h).text)
     done = ev[-1][1]["message"]
     table = done["context"]["score"]

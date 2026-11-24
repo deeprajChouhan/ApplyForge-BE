@@ -38,8 +38,9 @@ def _count_tokens_approx(text: str, model: str = "gpt-4o-mini") -> int:
         except KeyError:
             enc = tiktoken.get_encoding("cl100k_base")
         return len(enc.encode(text))
-    except ImportError:
-        # Fallback: ~0.75 words per token is a reasonable approximation
+    except Exception:
+        # No tiktoken (or its encoding files can't be fetched offline):
+        # ~0.75 words per token is a reasonable approximation.
         return int(len(text.split()) * 1.3)
 
 
@@ -61,33 +62,11 @@ class UsageTracker:
 
     def check_budget(self, estimated_tokens: int = 0) -> None:
         """
-        Raise HTTP 429 if the user has exceeded their monthly token budget.
-        Optionally pass an estimated token count for the upcoming call.
+        Raise HTTP 429 if the user is out of monthly or rolling-24h allowance.
+        Delegates to QuotaService so pre-checks and the provider meter agree.
         """
-        user = self.db.get(User, self.user_id)
-        if not user:
-            return  # defensive — auth dep already handles this
-
-        # Admins are exempt from budget limits
-        from app.models.enums import UserRole
-        if user.role == UserRole.admin:
-            return
-
-        month = _current_month()
-        ledger = self.db.query(UsageLedger).filter_by(user_id=self.user_id, month_year=month).first()
-        used = ledger.tokens_used if ledger else 0
-        budget = user.token_budget_monthly
-
-        if used + estimated_tokens > budget:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail={
-                    "error": "token_budget_exceeded",
-                    "used": used,
-                    "budget": budget,
-                    "message": f"You have used {used:,} of your {budget:,} monthly tokens. Upgrade your plan for more.",
-                },
-            )
+        from app.services.usage.quota import QuotaService
+        QuotaService(self.db).enforce(self.user_id, estimated_tokens)
 
     def record(
         self,
@@ -97,7 +76,9 @@ class UsageTracker:
         tokens_out: int,
     ) -> None:
         """
-        Record token usage after a successful AI call.
+        Record token usage for work that did NOT go through get_llm_provider().
+        Provider calls are metered automatically (MeteredLLMProvider) — calling
+        this for them would double-count.
         Updates the monthly ledger (upsert) and writes a granular event row.
         Failures here are logged but never propagate to the user.
         """

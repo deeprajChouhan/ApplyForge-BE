@@ -12,6 +12,14 @@ PLAN_TOKEN_BUDGETS: dict[str, int] = {
     PlanTier.enterprise: 5_000_000,
 }
 
+# Default rolling-24h token limits per plan tier (users.token_budget_daily overrides).
+# Sized so a heavy day can use ~20% of the month without one user draining it.
+PLAN_DAILY_TOKEN_LIMITS: dict[str, int] = {
+    PlanTier.free: 20_000,
+    PlanTier.pro: 100_000,
+    PlanTier.enterprise: 1_000_000,
+}
+
 # Features automatically granted per plan on registration
 PLAN_DEFAULT_FEATURES: dict[str, list] = {
     PlanTier.free: [FeatureFlag.jd_analyze, FeatureFlag.applications, FeatureFlag.resume, FeatureFlag.package_generation],
@@ -42,6 +50,10 @@ class User(Base, TimestampMixin):
     plan: Mapped[PlanTier] = mapped_column(Enum(PlanTier), default=PlanTier.free, index=True)
     subscription_status: Mapped[SubscriptionStatus] = mapped_column(Enum(SubscriptionStatus), default=SubscriptionStatus.active)
     token_budget_monthly: Mapped[int] = mapped_column(Integer, default=PLAN_TOKEN_BUDGETS[PlanTier.free])
+    # NULL = plan default (PLAN_DAILY_TOKEN_LIMITS). Rolling 24h window.
+    token_budget_daily: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Admin "reset 24h usage": only usage after this moment counts toward the daily limit.
+    usage_window_reset_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class RefreshToken(Base, TimestampMixin):
@@ -304,8 +316,12 @@ class UsageLedger(Base):
 class UsageEvent(Base):
     """Granular per-API-call token usage log. Used for admin analytics and billing."""
     __tablename__ = "usage_events"
+    __table_args__ = (Index("ix_usage_events_user_created", "user_id", "created_at"),)
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    # NULL = not attributable to a user (anonymous preview, system jobs).
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=True)
+    # "llm" counts toward quotas; "embedding" is priced but not counted.
+    kind: Mapped[str] = mapped_column(String(20), default="llm", server_default="llm", index=True)
     feature: Mapped[FeatureFlag | None] = mapped_column(Enum(FeatureFlag), nullable=True, index=True)
     endpoint: Mapped[str] = mapped_column(String(100))
     tokens_in: Mapped[int] = mapped_column(Integer, default=0)

@@ -40,7 +40,8 @@ def test_factory_uses_mock_provider_when_explicitly_enabled():
 
     provider = get_llm_provider()
 
-    assert isinstance(provider, MockLLMProvider)
+    # The factory wraps every provider in the usage meter; the mock sits inside.
+    assert isinstance(getattr(provider, "inner", provider), MockLLMProvider)
 
 
 def test_factory_requires_openai_key_for_runtime_provider():

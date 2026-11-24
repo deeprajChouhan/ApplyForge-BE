@@ -116,8 +116,16 @@ class CostByFeature(CostTotals):
 
 
 class CostByUser(CostTotals):
-    user_id: int
+    user_id: Optional[int] = None  # None = anonymous preview / system job
     email: Optional[str] = None
+
+
+class CostByOperation(CostTotals):
+    operation: str  # "POST /applications/{id}/tailor", "crawler.scheduled", …
+
+
+class CostByKind(CostTotals):
+    kind: str  # "llm" | "embedding"
 
 
 class CostByDay(CostTotals):
@@ -139,6 +147,8 @@ class AdminCostsOut(BaseModel):
     )
     by_model: List[CostByModel]
     by_feature: List[CostByFeature]
+    by_operation: List[CostByOperation] = Field(default_factory=list)
+    by_kind: List[CostByKind] = Field(default_factory=list)
     top_users: List[CostByUser]
     by_day: List[CostByDay]
 

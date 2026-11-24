@@ -78,6 +78,15 @@ def cost_breakdown(db: Session, start: datetime, end: datetime, top_users: int =
         key = getattr(feat, "value", feat) or "other"
         by_feature[key].add(model, t_in, t_out, calls)
 
+    by_operation: dict[str, Bucket] = defaultdict(Bucket)
+    for ep, model, t_in, t_out, calls in _grouped(db, start, end, UsageEvent.endpoint):
+        key = (ep or "unknown").split(" ×", 1)[0]  # embedding batches carry a call count suffix
+        by_operation[key].add(model, t_in, t_out, calls)
+
+    by_kind: dict[str, Bucket] = defaultdict(Bucket)
+    for kind, model, t_in, t_out, calls in _grouped(db, start, end, UsageEvent.kind):
+        by_kind[kind or "llm"].add(model, t_in, t_out, calls)
+
     by_user: dict[int, Bucket] = defaultdict(Bucket)
     for uid, model, t_in, t_out, calls in _grouped(db, start, end, UsageEvent.user_id):
         by_user[uid].add(model, t_in, t_out, calls)
@@ -98,9 +107,11 @@ def cost_breakdown(db: Session, start: datetime, end: datetime, top_users: int =
         cur += timedelta(days=1)
 
     top = sorted(by_user.items(), key=lambda kv: kv[1].cost_usd, reverse=True)[:top_users]
-    emails = dict(db.query(User.id, User.email).filter(User.id.in_([u for u, _ in top])).all()) if top else {}
+    ids = [u for u, _ in top if u is not None]
+    emails = dict(db.query(User.id, User.email).filter(User.id.in_(ids)).all()) if ids else {}
+    emails[None] = "Anonymous / system"
 
-    active_users = len(by_user)
+    active_users = len([u for u in by_user if u is not None])
     return {
         "total": total.as_dict(),
         "active_users": active_users,
@@ -111,6 +122,12 @@ def cost_breakdown(db: Session, start: datetime, end: datetime, top_users: int =
         ),
         "by_feature": sorted(
             ({"feature": k, **v.as_dict()} for k, v in by_feature.items()), key=lambda r: r["cost_usd"], reverse=True
+        ),
+        "by_operation": sorted(
+            ({"operation": k, **v.as_dict()} for k, v in by_operation.items()), key=lambda r: r["cost_usd"], reverse=True
+        )[:25],
+        "by_kind": sorted(
+            ({"kind": k, **v.as_dict()} for k, v in by_kind.items()), key=lambda r: r["cost_usd"], reverse=True
         ),
         "top_users": [{"user_id": uid, "email": emails.get(uid), **b.as_dict()} for uid, b in top],
         "by_day": days,

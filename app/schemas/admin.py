@@ -60,6 +60,9 @@ class AdminUserOut(BaseModel):
     plan: PlanTier
     subscription_status: SubscriptionStatus
     token_budget_monthly: int
+    # Effective rolling-24h limit (plan default unless overridden).
+    token_budget_daily: int = 0
+    daily_limit_is_custom: bool = False
     is_active: bool
     created_at: datetime
     last_seen_at: Optional[datetime] = None
@@ -73,7 +76,9 @@ class AdminUserUpdate(BaseModel):
     role: Optional[UserRole] = None
     plan: Optional[PlanTier] = None
     subscription_status: Optional[SubscriptionStatus] = None
-    token_budget_monthly: Optional[int] = None
+    token_budget_monthly: Optional[int] = Field(default=None, ge=0)
+    # Send a number to override the plan's 24h limit, or null to go back to the plan default.
+    token_budget_daily: Optional[int] = Field(default=None, ge=0)
     is_active: Optional[bool] = None
 
 

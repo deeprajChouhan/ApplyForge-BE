@@ -10,6 +10,12 @@ logger = logging.getLogger(__name__)
 setup_logging()
 app = FastAPI(title=settings.app_name)
 
+# Attributes every AI call to the requesting user (see services/usage/metering.py).
+# Added first → innermost, so CORSMiddleware wraps it and exposes X-Usage-Limited.
+from app.services.usage.metering import UsageContextMiddleware  # noqa: E402
+
+app.add_middleware(UsageContextMiddleware)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origin_list,
@@ -25,7 +31,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
     # Paginated admin lists return their total row count in this header.
-    expose_headers=["X-Total-Count", "Content-Disposition"],
+    expose_headers=["X-Total-Count", "Content-Disposition", "X-Usage-Limited"],
 )
 
 # Partner API: per-key CORS (no credentials), security headers, request log.

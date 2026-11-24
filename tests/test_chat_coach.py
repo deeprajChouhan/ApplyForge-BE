@@ -77,7 +77,8 @@ def prompts(monkeypatch):
         seen.append((system_prompt, user_prompt))
         return "Lead with the Ledgerly payments work [E1]. Kubernetes isn't in your resume."
 
-    monkeypatch.setattr(provider, "generate", fake_generate)
+    # Patch the raw provider inside the usage meter so metering still runs.
+    monkeypatch.setattr(getattr(provider, "inner", provider), "generate", fake_generate)
     return seen
 
 
@@ -134,7 +135,8 @@ def test_usage_is_recorded_against_the_chat_feature(client, rag_calls, prompts):
     try:
         ev = db.query(UsageEvent).filter_by(user_id=user_id).one()
         assert ev.feature == FeatureFlag.chat
-        assert ev.endpoint == "chat.send"
+        assert ev.endpoint == "POST /chat/{id}/messages"
+        assert ev.kind == "llm"
         assert ev.tokens_in > 0 and ev.tokens_out > 0
         ledger = db.query(UsageLedger).filter_by(user_id=user_id).one()
         assert ledger.tokens_used == ev.tokens_in + ev.tokens_out

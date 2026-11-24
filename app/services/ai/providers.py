@@ -86,7 +86,11 @@ class OpenAILLMProvider(LLMProvider):
         self.retry_backoff_seconds = retry_backoff_seconds
 
     def generate(self, system_prompt: str, user_prompt: str) -> str:
-        def _request() -> str:
+        return self.generate_with_usage(system_prompt, user_prompt)[0]
+
+    def generate_with_usage(self, system_prompt: str, user_prompt: str) -> tuple[str, dict[str, int] | None]:
+        """Like generate(), plus the provider-reported token usage for metering."""
+        def _request():
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
@@ -97,7 +101,12 @@ class OpenAILLMProvider(LLMProvider):
             content = response.choices[0].message.content if response.choices else None
             if not content:
                 raise AIProviderResponseError("OpenAI returned an empty generation")
-            return content
+            usage = getattr(response, "usage", None)
+            reported = (
+                {"in": usage.prompt_tokens or 0, "out": usage.completion_tokens or 0}
+                if usage is not None else None
+            )
+            return content, reported
 
         return self._run_with_retries("chat.completions", _request)
 
@@ -184,11 +193,15 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
         self.retry_backoff_seconds = retry_backoff_seconds
 
     def embed(self, text: str) -> list[float]:
-        def _request() -> list[float]:
+        return self.embed_with_usage(text)[0]
+
+    def embed_with_usage(self, text: str) -> tuple[list[float], int | None]:
+        def _request():
             response = self.client.embeddings.create(model=self.model, input=text)
             if not response.data:
                 raise AIProviderResponseError("OpenAI returned no embedding vectors")
-            return response.data[0].embedding
+            usage = getattr(response, "usage", None)
+            return response.data[0].embedding, (usage.prompt_tokens if usage is not None else None)
 
         return self._run_with_retries("embeddings", _request)
 
@@ -217,3 +230,82 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
             except BadRequestError as exc:
                 raise AIProviderResponseError("OpenAI rejected embedding request") from exc
         raise AIProviderTransientError(f"OpenAI {operation} failed") from last_error
+
+
+class MeteredLLMProvider(LLMProvider):
+    """
+    Wraps any LLMProvider: quota check before the call, usage_events row after.
+    See app/services/usage/metering.py. Installed by the factory, so every
+    get_llm_provider() caller is metered without changes.
+    """
+
+    def __init__(self, inner: LLMProvider, model: str):
+        self.inner = inner
+        self.model = model
+
+    def __getattr__(self, name):  # keep provider-specific attributes reachable
+        return getattr(self.inner, name)
+
+    def generate(self, system_prompt: str, user_prompt: str, *args, **kwargs) -> str:
+        from app.services.usage import metering
+
+        metering.enforce_current()
+        usage = None
+        if hasattr(self.inner, "generate_with_usage") and not args and not kwargs:
+            text, usage = self.inner.generate_with_usage(system_prompt, user_prompt)
+        else:
+            text = self.inner.generate(system_prompt, user_prompt, *args, **kwargs)
+        if usage:
+            t_in, t_out = usage.get("in", 0), usage.get("out", 0)
+        else:
+            t_in = metering._count_tokens(system_prompt + "\n" + user_prompt, self.model)
+            t_out = metering._count_tokens(text or "", self.model)
+        metering.record_llm(self.model, t_in, t_out)
+        return text
+
+    def stream(self, system_prompt: str, user_prompt: str) -> Iterator[StreamChunk]:
+        from app.services.usage import metering
+
+        metering.enforce_current()
+        ctx = metering.current()  # captured now: the generator may be closed from another context
+        parts: list[str] = []
+        usage: dict[str, int] | None = None
+        try:
+            for chunk in self.inner.stream(system_prompt, user_prompt):
+                if chunk.usage:
+                    usage = chunk.usage
+                if chunk.text:
+                    parts.append(chunk.text)
+                yield chunk
+        finally:
+            # Record even when the user stops mid-stream: those tokens were spent.
+            if parts or usage:
+                if usage:
+                    t_in, t_out = usage.get("in", 0), usage.get("out", 0)
+                else:
+                    t_in = metering._count_tokens(system_prompt + "\n" + user_prompt, self.model)
+                    t_out = metering._count_tokens("".join(parts), self.model)
+                metering.record_llm(self.model, t_in, t_out, ctx=ctx)
+
+
+class MeteredEmbeddingProvider(EmbeddingProvider):
+    """Wraps any EmbeddingProvider; embedding tokens are summed per request (not quota-counted)."""
+
+    def __init__(self, inner: EmbeddingProvider, model: str):
+        self.inner = inner
+        self.model = model
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+    def embed(self, text: str) -> list[float]:
+        from app.services.usage import metering
+
+        if hasattr(self.inner, "embed_with_usage"):
+            vector, tokens = self.inner.embed_with_usage(text)
+        else:
+            vector, tokens = self.inner.embed(text), None
+        if tokens is None:
+            tokens = metering._count_tokens(text or "")
+        metering.add_embedding(self.model, tokens)
+        return vector

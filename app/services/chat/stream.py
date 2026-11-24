@@ -96,8 +96,7 @@ def stream_reply(
         svc.touch(thread)
         db.commit()
         db.refresh(msg)
-        if raw:  # tokens were spent, even if the user stopped early
-            tracker.record(FeatureFlag.chat, "chat.stream", t_in, t_out)
+        # Spend is recorded by the metered provider (even on early stop).
         return msg
 
     if base_document_id is not None:

@@ -1,6 +1,7 @@
 from fastapi import APIRouter
 from app.api.v1.routes import admin, admin_insights, applications, auth, chat, documents, ephemeral, knowledge, profile, utils
 from app.api.v1.routes import evaluation
+from app.api.v1.routes import usage as usage_routes
 from app.api.v1.routes import crawler
 from app.api.v1.routes import files
 from app.api.v1.routes import jobs
@@ -36,6 +37,7 @@ api_router.include_router(files.router)
 api_router.include_router(jobs.router)
 api_router.include_router(interview.router)
 api_router.include_router(plans.router)
+api_router.include_router(usage_routes.router)
 api_router.include_router(analytics.router)
 api_router.include_router(support.router)
 api_router.include_router(extension.router)

@@ -1308,6 +1308,10 @@ Estimated LLM spend priced from `usage_events` (model + tokens per call) using `
 `unpriced_models` lists models charged at the default rate — add them to the price table.
 Invalid month → `422`. `projected_month_end_usd` is `null` for past months.
 
+**2026-11-24:** also returns `by_operation` (top 25, `{"operation": "POST /applications/{id}/tailor", ...totals}`)
+and `by_kind` (`"llm"` | `"embedding"`). `top_users[].user_id` may be `null` = anonymous preview / system job
+(`email: "Anonymous / system"`); `active_users` counts real users only.
+
 ### `GET /admin/quality?days=30`
 ```json
 {
@@ -1349,6 +1353,77 @@ Body: `{ "feature": "chat", "enabled": true, "plan": "free", "user_ids": null, "
 
 ### `GET /recruiter/admin/billing/summary`
 Gains `trials_ending_soon` — agencies (not suspended) whose `trial_ends_at` is within the next 7 days.
+
+---
+
+## AI USAGE METERING + QUOTAS (2026-11-24)
+
+Every LLM and embedding call made through `get_llm_provider()` / `get_embedding_provider()` is metered
+centrally (`app/services/usage/metering.py`), not just Coach chat. Attribution comes from the request's
+Bearer token (middleware, no DB hit); calls are labelled `METHOD /templated/path`. Recruiter and partner
+paths are not metered here (data wall — recruiter metering is Phase 5 step 2). Scheduled crawler runs are
+attributed to their user (`crawler.scheduled`). Calls with no user are kept as anonymous/system spend.
+
+`usage_events` gains `kind` (`llm` | `embedding`); `user_id` becomes nullable. Embeddings are summed per
+request into one row and priced, but never count toward quotas. Migration `0044_usage_metering_quotas`.
+
+**Allowances** — enforced before every LLM call; admins exempt.
+- Monthly: `users.token_budget_monthly` (unchanged).
+- Rolling 24h: `users.token_budget_daily`, `NULL` = plan default (Free 20K · Pro 100K · Enterprise 1M).
+  Admin reset moves `users.usage_window_reset_at` to now; only later usage counts.
+
+**Refusal** — `429`:
+```json
+{"detail": {"error": "daily_token_limit_exceeded" | "token_budget_exceeded", "scope": "daily" | "monthly",
+            "used": 104200, "budget": 100000, "resets_at": "2026-11-25T09:12:00", "message": "..."}}
+```
+Where a service swallows the refusal and returns non-AI fallback output (2xx), the response carries
+`X-Usage-Limited: daily|monthly` (exposed via CORS) so the UI can still explain the missing AI output.
+
+### `GET /usage/me` (any signed-in user)
+```json
+{"plan": "pro", "exempt": false, "blocked": null,
+ "daily":   {"used": 12000, "limit": 100000, "remaining": 88000, "pct": 12.0, "exhausted": false,
+             "resets_at": "2026-11-25T08:01:00", "window_hours": 24, "custom_limit": false, "reset_at": null},
+ "monthly": {"used": 210000, "limit": 500000, "remaining": 290000, "pct": 42.0, "exhausted": false,
+             "resets_at": "2026-12-01T00:00:00"},
+ "packages_used_this_month": 4, "monthly_package_limit": -1}
+```
+Daily `resets_at`: when exhausted, the time enough old usage ages out to get back under the limit;
+otherwise when the oldest counted usage drops off. `pct` can exceed 100.
+
+### `PATCH /admin/users/{id}` — gains `token_budget_daily`
+Number (≥0) overrides the plan's 24h limit; explicit `null` returns to the plan default. `AdminUserOut`
+gains `token_budget_daily` (effective) and `daily_limit_is_custom`. Audited (`admin.user.update`).
+
+### `POST /admin/users/{id}/usage/reset-daily`
+Starts a fresh 24h window. Monthly usage and cost history untouched. Returns the `/usage/me`-shaped quota
+status (without plan/package fields). Audited as `admin.user.usage_reset_daily` with before/after.
+
+### `GET /admin/users/{id}/insights?days=30` (7–90)
+Read-only, consumer tables only, filtered by `user_id`.
+```json
+{"user_id": 14, "window_days": 30,
+ "quota": {"...": "same as /usage/me quota fields"},
+ "spend": {"month_cost_usd": 0.41, "month_tokens": 820000, "month_calls": 311,
+           "all_time_cost_usd": 0.52, "all_time_tokens": 1040000, "all_time_calls": 402,
+           "last_ai_call_at": "...", "tracked_since_note": "..."},
+ "by_operation": [{"operation": "POST /applications/{id}/tailor", "kind": "llm", "calls": 120, "tokens": 400000, "cost_usd": 0.2}],
+ "daily_usage":  [{"date": "2026-10-27", "tokens": 0, "cost_usd": 0}],
+ "search": {"declared_target_roles": [], "preferred_locations": [], "current_role": null, "headline": null,
+            "location": null, "salary_expectation": null,
+            "top_titles": [{"label": "AI Engineer", "count": 41}], "role_families": [], "seniority": [],
+            "top_companies": [], "sites": [{"label": "LinkedIn", "count": 200}], "extension_sites": [],
+            "status_counts": {"applied": 150}, "funnel": {"saved": 269, "applied": 150, "interview": 6, "offer": 0},
+            "avg_priority_score": 63.4, "last_application_at": "...", "added_last_7d": 4, "added_last_30d": 20,
+            "weekly_added": [{"date": "2026-09-07", "value": 3}]},
+ "documents": {"resumes_uploaded": 3, "resumes_parsed": 2, "avg_parse_confidence": 0.88, "tailored_resumes": 140,
+               "generated_by_type": {"cover_letter": 30}, "generated_total": 60, "applications_with_documents": 40,
+               "chat_threads": 5, "chat_messages_sent": 22, "answer_library_entries": 14, "interview_sessions": 0}}
+```
+`sites` is derived from each application's `jd_link` host (no link → "No link (pasted JD)");
+`extension_sites` from `extension_job_scored` / `extension_job_saved` events. Role families and seniority
+are keyword buckets over saved titles — indicative, not a taxonomy.
 
 ---
 

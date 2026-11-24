@@ -223,7 +223,7 @@ class ChatService:
         self.db.add(reply)
         self.touch(thread, content)
         self.db.commit()
-        tracker.record(FeatureFlag.chat, "chat.send", tokens_in, tokens_out)
+        # Spend is recorded by the metered provider; no tracker.record here.
         return reply
 
     def history(self, application_id: int) -> list[ApplicationChatMessage]:

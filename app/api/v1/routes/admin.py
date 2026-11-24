@@ -8,6 +8,8 @@ Endpoints:
   POST /admin/users/{id}/features — grant or revoke a feature
   GET  /admin/usage              — platform-wide usage stats
   (overview / costs / quality / spot-check live in admin_insights.py)
+  GET  /admin/users/{id}/insights   — job search, documents, AI usage + cost for one user
+  POST /admin/users/{id}/usage/reset-daily — clear the rolling 24h usage window
   POST /admin/users/{id}/activate   — re-enable a disabled user
   POST /admin/users/{id}/deactivate — disable a user
   GET  /admin/crawled-jobs/cleanup/preview — count jobs older than N hours
@@ -53,6 +55,8 @@ from app.schemas.admin import (
 from app.schemas.plans import PlanCreate, PlanOut, PlanUpdate
 from app.schemas.support import AdminTicketUpdate, TicketListItem, TicketMessageCreate, TicketMessageOut, TicketOut
 from app.services.admin.audit import diff, log_admin_action
+from app.services.admin.user_insights import user_insights
+from app.services.usage.quota import QuotaService, daily_limit_for
 from app.services.audit.service import AuditService
 from app.services.crawler.cleanup import CrawledJobsCleanupService
 from app.services.plans.service import PlanService
@@ -128,6 +132,8 @@ def _build_admin_users(users: List[User], db: Session, include_usage: bool = Tru
                 plan=user.plan,
                 subscription_status=user.subscription_status,
                 token_budget_monthly=user.token_budget_monthly,
+                token_budget_daily=daily_limit_for(user),
+                daily_limit_is_custom=user.token_budget_daily is not None,
                 is_active=user.is_active,
                 created_at=user.created_at,
                 last_seen_at=last_seen.get(user.id),
@@ -147,6 +153,7 @@ def _user_snapshot(user: User) -> dict:
         "role": getattr(user.role, "value", user.role),
         "plan": getattr(user.plan, "value", user.plan),
         "token_budget_monthly": user.token_budget_monthly,
+        "token_budget_daily": user.token_budget_daily,
         "subscription_status": getattr(user.subscription_status, "value", user.subscription_status),
         "is_active": user.is_active,
     }
@@ -308,6 +315,45 @@ def get_user_detail(
     )
 
 
+@router.get("/users/{user_id}/insights")
+def get_user_insights(
+    user_id: int,
+    days: int = Query(30, ge=7, le=90),
+    _admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Job search (roles, sites, companies, funnel), documents, and AI usage/cost for one user."""
+    user = db.get(User, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user_insights(db, user, days=days)
+
+
+@router.post("/users/{user_id}/usage/reset-daily")
+def reset_user_daily_usage(
+    user_id: int,
+    request: Request,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Start a fresh 24h window: usage before now no longer counts toward the daily limit.
+    Monthly usage and the cost history are untouched."""
+    user = db.get(User, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    svc = QuotaService(db)
+    before = svc.daily(user)
+    reset_at = svc.reset_daily(user)
+    log_admin_action(
+        db, admin, "admin.user.usage_reset_daily", "user", user.id,
+        before={"daily_used": before.used, "daily_limit": before.limit},
+        after={"daily_used": 0, "reset_at": reset_at.isoformat()},
+        metadata={"email": user.email},
+        request=request,
+    )
+    return svc.status(user)
+
+
 @router.patch("/users/{user_id}", response_model=AdminUserOut)
 def update_user(
     user_id: int,
@@ -348,6 +394,8 @@ def update_user(
                 granted.append(feature.value)
     if payload.token_budget_monthly is not None:
         user.token_budget_monthly = payload.token_budget_monthly
+    if "token_budget_daily" in payload.model_fields_set:
+        user.token_budget_daily = payload.token_budget_daily  # None → plan default
     if payload.subscription_status is not None:
         user.subscription_status = payload.subscription_status
     if payload.is_active is not None:

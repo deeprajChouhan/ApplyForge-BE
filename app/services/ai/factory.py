@@ -9,6 +9,8 @@ from app.services.ai.exceptions import AIProviderConfigError
 from app.services.ai.providers import (
     EmbeddingProvider,
     LLMProvider,
+    MeteredEmbeddingProvider,
+    MeteredLLMProvider,
     MockEmbeddingProvider,
     MockLLMProvider,
     OpenAIEmbeddingProvider,
@@ -51,11 +53,11 @@ def get_llm_provider() -> LLMProvider:
             retry_backoff_seconds=settings.ai_retry_backoff_seconds,
             base_url=settings.openai_base_url,
         )
-        return _wrap_with_tracing(raw)
+        return _wrap_with_tracing(MeteredLLMProvider(raw, model=settings.llm_model))
 
     if provider == "mock" and settings.ai_allow_mock_providers:
         logger.warning("ai_mock_provider_selected", capability="llm")
-        return _wrap_with_tracing(MockLLMProvider(), run_name="mock_generate")
+        return _wrap_with_tracing(MeteredLLMProvider(MockLLMProvider(), model="mock"), run_name="mock_generate")
 
     raise AIProviderConfigError(
         "Invalid LLM provider configuration. Use LLM_PROVIDER=openai for runtime or set "
@@ -68,7 +70,7 @@ def get_embedding_provider() -> EmbeddingProvider:
     provider = settings.embedding_provider.lower()
     if provider == "openai":
         logger.info("ai_provider_selected", provider="openai", capability="embedding", model=settings.embedding_model)
-        return OpenAIEmbeddingProvider(
+        raw = OpenAIEmbeddingProvider(
             api_key=settings.ai_api_key_value,
             model=settings.embedding_model,
             timeout_seconds=settings.ai_request_timeout_seconds,
@@ -76,10 +78,11 @@ def get_embedding_provider() -> EmbeddingProvider:
             retry_backoff_seconds=settings.ai_retry_backoff_seconds,
             base_url=settings.openai_base_url,
         )
+        return MeteredEmbeddingProvider(raw, model=settings.embedding_model)
 
     if provider == "mock" and settings.ai_allow_mock_providers:
         logger.warning("ai_mock_provider_selected", capability="embedding")
-        return MockEmbeddingProvider()
+        return MeteredEmbeddingProvider(MockEmbeddingProvider(), model="mock-embedding")
 
     raise AIProviderConfigError(
         "Invalid embedding provider configuration. Use EMBEDDING_PROVIDER=openai for runtime or set "
