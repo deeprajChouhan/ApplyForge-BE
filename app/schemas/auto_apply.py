@@ -12,6 +12,7 @@ AutoApplyStage = Literal[
     "failed",
     "declined",
     "needs_answer",
+    "cancelled",
 ]
 
 

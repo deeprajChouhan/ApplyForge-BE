@@ -17,12 +17,32 @@ import structlog
 from celery import shared_task
 from sqlalchemy import select
 
+from app.core import config as app_config
 from app.db.session import SessionLocal
 from app.models.auto_apply import AutoApplySettings
-from app.models.models import JobApplication
+from app.models.models import JobApplication, User
 from app.services.auto_apply.events import emit
 
 logger = structlog.get_logger(__name__)
+
+
+def _auto_apply_stop_reason(db, user_id: int) -> str | None:
+    """Return why auto-apply must not proceed for this user, or None if it may."""
+    if not app_config.settings.auto_apply_enabled:
+        return "auto_apply_disabled_globally"
+    user = db.get(User, user_id)
+    if user is None or not getattr(user, "is_active", False):
+        return "user_inactive"
+    s = (
+        db.execute(select(AutoApplySettings).where(AutoApplySettings.user_id == user_id))
+        .scalars()
+        .first()
+    )
+    if s is None or not getattr(s, "is_active", False):
+        return "auto_apply_off"
+    if getattr(s, "paused_at", None) is not None:
+        return "auto_apply_paused"
+    return None
 
 
 @shared_task(name="app.services.auto_apply.dispatcher.prepare_application")
@@ -36,6 +56,16 @@ def prepare_application(app_id: int) -> Dict[str, Any]:
 
             if ja.auto_apply_stage not in (None, "queued"):
                 return {"skipped": True, "reason": "wrong_stage", "app_id": app_id, "stage": ja.auto_apply_stage}
+
+            # Re-check consent at execution time: items queued before a
+            # pause/deactivation/kill-switch must not burn LLM tokens.
+            stop_reason = _auto_apply_stop_reason(db, ja.user_id)
+            if stop_reason:
+                ja.auto_apply_stage = "cancelled"
+                db.add(ja)
+                db.commit()
+                emit(db, ja.id, "cancelled", {"reason": stop_reason})
+                return {"skipped": True, "reason": stop_reason, "app_id": app_id}
 
             ja.auto_apply_stage = "preparing"
             db.add(ja)

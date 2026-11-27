@@ -21,9 +21,11 @@ import structlog
 from celery import shared_task
 from sqlalchemy import select
 
+from app.core import config as app_config
 from app.db.session import SessionLocal
 from app.models.auto_apply import AutoApplySettings
 from app.models.job import Job
+from app.models.models import User
 from app.services.ats.greenhouse import BOOTSTRAP_SLUGS, GreenhouseProvider
 from app.services.ats.tasks import upsert_company, upsert_job
 from app.schemas.ats import NormalizedCompany
@@ -96,8 +98,13 @@ def search_for_user(user_id: int) -> Dict[str, Any]:
     Insert any new ones and immediately trigger the orchestrator so
     matches get queued within seconds.
     """
+    if not app_config.settings.auto_apply_enabled:
+        return {"skipped": True, "reason": "auto_apply_disabled_globally", "user_id": user_id}
     try:
         with SessionLocal() as db:
+            user = db.get(User, user_id)
+            if user is None or not getattr(user, "is_active", False):
+                return {"skipped": True, "reason": "user_inactive", "user_id": user_id}
             settings = (
                 db.execute(select(AutoApplySettings).where(AutoApplySettings.user_id == user_id))
                 .scalars()
@@ -149,13 +156,18 @@ def _trigger_tick_user(user_id: int) -> None:
 @shared_task(name="app.services.discovery.live_search.search_for_all_users")
 def search_for_all_users() -> Dict[str, Any]:
     """Fan out `search_for_user` for every active, unpaused user."""
+    if not app_config.settings.auto_apply_enabled:
+        return {"queued": 0, "skipped": True, "reason": "auto_apply_disabled_globally"}
     try:
         with SessionLocal() as db:
             user_ids = (
                 db.execute(
-                    select(AutoApplySettings.user_id).where(
+                    select(AutoApplySettings.user_id)
+                    .join(User, User.id == AutoApplySettings.user_id)
+                    .where(
                         AutoApplySettings.is_active == True,  # noqa: E712
                         AutoApplySettings.paused_at.is_(None),
+                        User.is_active == True,  # noqa: E712
                     )
                 )
                 .scalars()

@@ -16,8 +16,9 @@ from typing import Any, Dict, List
 
 import structlog
 from celery import shared_task
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 
+from app.core import config as app_config
 from app.db.session import SessionLocal
 from app.models.auto_apply import AutoApplyRun, AutoApplySettings
 from app.models.job import Job
@@ -63,6 +64,10 @@ def tick_user(user_id: int) -> Dict[str, Any]:
             user = db.get(User, user_id)
             if user is None:
                 return {"error": "user_not_found", "user_id": user_id}
+            if not app_config.settings.auto_apply_enabled:
+                return {"skipped": True, "reason": "auto_apply_disabled_globally", "user_id": user_id}
+            if not getattr(user, "is_active", False):
+                return {"skipped": True, "reason": "user_inactive", "user_id": user_id}
 
             settings = (
                 db.execute(select(AutoApplySettings).where(AutoApplySettings.user_id == user_id))
@@ -81,39 +86,42 @@ def tick_user(user_id: int) -> Dict[str, Any]:
             db.commit()
             db.refresh(run)
 
-            today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-            todays_queued_or_submitted = (
-                db.execute(
-                    select(JobApplication).where(
-                        JobApplication.user_id == user_id,
-                        JobApplication.auto_apply_stage.in_(["queued", "submitted"]),
-                    )
+            # Count EVERY auto-created application, whatever stage it has moved
+            # on to. The previous version only counted "queued"/"submitted",
+            # so rows that advanced to preparing/awaiting_review/failed fell
+            # out of the count and the cap never tripped (users got 20 new
+            # applications every tick, i.e. hundreds per day).
+            now = datetime.utcnow()
+            today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            week_start = now - timedelta(days=7)
+            today_count = db.execute(
+                select(func.count(JobApplication.id)).where(
+                    JobApplication.user_id == user_id,
+                    JobApplication.auto_apply_stage.isnot(None),
+                    JobApplication.created_at >= today_start,
                 )
-                .scalars()
-                .all()
-            )
-            # Restrict to today where a created_at timestamp is available; if the
-            # model doesn't expose one, fall back to counting all matching rows.
-            today_count = len(
-                [
-                    ja
-                    for ja in todays_queued_or_submitted
-                    if getattr(ja, "created_at", None) is None
-                    or getattr(ja, "created_at") >= today_start
-                ]
-            )
+            ).scalar_one()
+            week_count = db.execute(
+                select(func.count(JobApplication.id)).where(
+                    JobApplication.user_id == user_id,
+                    JobApplication.auto_apply_stage.isnot(None),
+                    JobApplication.created_at >= week_start,
+                )
+            ).scalar_one()
 
             daily_cap = getattr(settings, "daily_cap", 0) or 0
-            if today_count >= daily_cap:
+            weekly_cap = getattr(settings, "weekly_cap", 0) or 0
+            if today_count >= daily_cap or week_count >= weekly_cap:
                 run.finished_at = datetime.utcnow()
                 _set_run_counters(run, jobs_considered=0, jobs_queued=0, jobs_skipped=0)
                 db.add(run)
                 db.commit()
                 return {
                     "skipped": True,
-                    "reason": "daily_cap_reached",
+                    "reason": "cap_reached",
                     "user_id": user_id,
                     "today_count": today_count,
+                    "week_count": week_count,
                 }
 
             already_applied_subq = (
@@ -144,7 +152,7 @@ def tick_user(user_id: int) -> Dict[str, Any]:
             )
 
             min_match_score = getattr(settings, "min_match_score", 60) or 60
-            remaining_slots = max(0, daily_cap - today_count)
+            remaining_slots = max(0, min(daily_cap - today_count, weekly_cap - week_count))
 
             jobs_considered = 0
             jobs_queued = 0
@@ -235,14 +243,19 @@ def prepare_application_delay(app_id: int) -> None:
 
 @shared_task(name="app.services.auto_apply.orchestrator.tick_all")
 def tick_all() -> Dict[str, Any]:
-    """Enqueue tick_user for every user with active, unpaused auto-apply settings."""
+    """Enqueue tick_user for every active user with active, unpaused auto-apply settings."""
+    if not app_config.settings.auto_apply_enabled:
+        return {"queued": 0, "skipped": True, "reason": "auto_apply_disabled_globally"}
     try:
         with SessionLocal() as db:
             user_ids = (
                 db.execute(
-                    select(AutoApplySettings.user_id).where(
+                    select(AutoApplySettings.user_id)
+                    .join(User, User.id == AutoApplySettings.user_id)
+                    .where(
                         AutoApplySettings.is_active == True,  # noqa: E712
                         AutoApplySettings.paused_at.is_(None),
+                        User.is_active == True,  # noqa: E712
                     )
                 )
                 .scalars()

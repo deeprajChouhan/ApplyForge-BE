@@ -18,6 +18,7 @@ from app.api.v1.routes import application_actions
 from app.api.v1.routes import resume_templates
 from app.api.v1.routes import email as email_routes
 from app.api.v1.routes import email_admin
+from app.api.v1.routes import admin_auto_apply
 from app.recruiter.api.router import recruiter_router
 
 api_router = APIRouter()
@@ -29,6 +30,7 @@ api_router.include_router(chat.router)
 api_router.include_router(documents.router)
 api_router.include_router(admin.router)
 api_router.include_router(admin_insights.router)
+api_router.include_router(admin_auto_apply.router)
 api_router.include_router(ephemeral.router)
 api_router.include_router(utils.router)
 api_router.include_router(evaluation.router)

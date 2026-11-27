@@ -473,6 +473,16 @@ def _set_active(user_id: int, active: bool, request: Request, admin: User, db: S
         raise HTTPException(status_code=400, detail="You can't deactivate your own account")
     was = user.is_active
     user.is_active = active
+    if not active:
+        # Deactivated users must stop auto-applying immediately. Turn the
+        # setting off (not just paused) so reactivation doesn't silently
+        # resume it — the user has to opt back in.
+        from app.models.auto_apply import AutoApplySettings
+
+        aas = db.query(AutoApplySettings).filter(AutoApplySettings.user_id == user.id).first()
+        if aas is not None:
+            aas.is_active = False
+            aas.paused_at = datetime.utcnow()
     db.commit()
     if was != active:
         log_admin_action(

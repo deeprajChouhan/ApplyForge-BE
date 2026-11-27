@@ -34,6 +34,12 @@ class Settings(BaseSettings):
     ai_retry_backoff_seconds: float = 0.5
     ai_allow_mock_providers: bool = False
 
+    # Global kill switch for the auto-apply pipeline (live search, orchestrator
+    # ticks, dispatcher prep/submit). OFF by default: auto-apply was being
+    # silently enabled at onboarding and ran unbounded. Set
+    # AUTO_APPLY_ENABLED=true only once per-user opt-in is confirmed.
+    auto_apply_enabled: bool = False
+
     google_client_id: str | None = None
     google_client_secret: str | None = None
 

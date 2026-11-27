@@ -1351,6 +1351,40 @@ Body: `{ "feature": "chat", "enabled": true, "plan": "free", "user_ids": null, "
 { "feature": "chat", "enabled": true, "matched_users": 40, "changed": 28, "dry_run": true }
 ```
 
+### Auto-apply controls (added 2026-11-26)
+Global kill switch: env `AUTO_APPLY_ENABLED` (default `false`). While false, live search, orchestrator
+ticks and dispatcher prep all no-op; queued items are moved to stage `cancelled`. New stage value
+`cancelled` is part of `AutoApplyStage`.
+
+#### `GET /admin/auto-apply/users?status=on|off|all&q=&limit=200`
+Users with an `auto_apply_settings` row (default `status=on`), sorted by applications created in the last 7 days.
+```json
+{ "global_enabled": false, "total": 12, "running": 9,
+  "items": [{ "user_id": 7, "email": "a@x.com", "user_is_active": false, "is_active": true,
+    "paused_at": null, "fully_automatic": false, "daily_cap": 10, "weekly_cap": 50,
+    "target_titles": ["AI Engineer"], "settings_updated_at": "…",
+    "counts": { "total": 272, "submitted": 0, "unsent": 272, "in_flight": 3,
+                "last_24h": 40, "last_7d": 210, "last_created_at": "…" } }] }
+```
+`submitted` = reached an employer. `unsent` = queued/preparing/awaiting_review/needs_answer/failed/cancelled.
+Soft-deleted applications are excluded.
+
+#### `GET /admin/users/{id}/auto-apply`
+`{ "global_enabled": bool, "has_settings": bool, "user": <item above> | null }`
+
+#### `POST /admin/users/{id}/auto-apply/disable`
+Body: `{ "cancel_in_flight": true, "remove_unsent_drafts": false }` →
+`{ "users_disabled": 1, "in_flight_cancelled": 3, "drafts_removed": 0 }`.
+Sets `is_active=false` + `paused_at=now` (user must re-enable it themselves). `cancel_in_flight` moves
+queued/preparing to `cancelled`. `remove_unsent_drafts` soft-deletes (`deleted_at`) unsent auto-created
+applications. Submitted applications are never touched. Audited as `admin.user.auto_apply_disable`.
+
+#### `POST /admin/auto-apply/disable`
+Body: same options plus `{ "user_ids": [1,2] }` (≤5000) or `{ "all": true }` (every user with it on).
+`400` if no users resolve. Same response shape. Audited as `admin.auto_apply.bulk_disable`.
+
+Also: `POST /admin/users/{id}/deactivate` now turns the user's auto-apply off as well.
+
 ### `GET /recruiter/admin/billing/summary`
 Gains `trials_ending_soon` — agencies (not suspended) whose `trial_ends_at` is within the next 7 days.
 
